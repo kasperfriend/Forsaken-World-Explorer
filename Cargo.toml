@@ -3,18 +3,38 @@ name = "forsaken-world-explorer"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
-description = "Forsaken World client discovery and asset inventory"
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-walkdir = "2"
+flate2 = "1"
+png = "0.17"
+minifb = { version = "0.27", default-features = false, features = ["x11"] }
+encoding_rs = "0.8"
+image = { version = "0.25", default-features = false, features = ["dds", "bmp", "tga", "png", "jpeg"] }
+wgpu = "0.19"
+winit = "0.29"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+glam = "0.27"
+goblin = "0.8"
+sha2 = "0.10"
+egui = "0.27"
+egui-winit = { version = "0.27", default-features = false, features = ["x11", "clipboard"] }
+egui-wgpu = { version = "0.27", default-features = false }
 
-[dev-dependencies]
-tempfile = "3"
+[target.'cfg(windows)'.dependencies]
+rodio = { version = "0.17", default-features = false, features = ["mp3", "vorbis", "wav"] }
+# Direct FFI surface for the AMD FidelityFX integration in src/gpu.rs. Both
+# crates are already in Cargo.lock as transitive dependencies of wgpu, so no
+# new packages are introduced; versions are pinned to the locked ones.
+# `d3d12` is the low-level D3D12 wrapper (ComPtr + vtables); `wgpu-hal`
+# exposes the native handles of the wgpu device/textures via as_hal().
+d3d12 = "0.19.0"
+wgpu-hal = "0.19.5"
+winapi = { version = "0.3", features = ["std", "winbase", "libloaderapi", "windef", "minwindef", "d3d12", "unknwnbase", "dxgiformat", "dxgitype", "winerror", "dxgi", "dxgi1_2", "dxgi1_3", "dxgi1_4", "dxgi1_5", "dxgi1_6"] }
+raw-window-handle = "0.6"
 
-[[bin]]
-name = "fw-explorer"
-path = "src/main.rs"
+# Optimize the distributed viewer as a whole; keep debug/test profiles unchanged.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

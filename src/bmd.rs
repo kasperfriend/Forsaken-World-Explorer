@@ -1,0 +1,580 @@
+//! Binary A3DLitModel reader for world BMDs from this client.
+//! Layout informed by GameForge's GPL-2.0-or-later Angelica importer.
+#[derive(Clone)]
+pub struct Vertex {
+    pub position: [f32; 3],
+    pub uv: [f32; 2],
+    pub normal: [f32; 3],
+    pub diffuse: u32,
+    pub day_diffuse: u32,
+    pub night_diffuse: u32,
+}
+#[derive(Clone, Debug)]
+pub struct Material {
+    pub name: String,
+    pub ambient: [f32; 4],
+    pub diffuse: [f32; 4],
+    pub emissive: [f32; 4],
+    pub specular: [f32; 4],
+    pub power: f32,
+    pub two_sided: bool,
+}
+pub struct Mesh {
+    pub name: String,
+    pub version: u32,
+    pub material: Option<Material>,
+    pub texture: String,
+    pub vertices: Vec<Vertex>,
+    pub indices: Vec<u16>,
+}
+pub struct Model {
+    pub scale: [f32; 3],
+    pub direction: [f32; 3],
+    pub up: [f32; 3],
+    pub position: [f32; 3],
+    pub meshes: Vec<Mesh>,
+    /// Native `CELBrushBuilding` convex collision brushes stored after the
+    /// lit-model meshes. These are world-baked just like the BMD vertices.
+    pub collision: Vec<CollisionBrush>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrushSide {
+    pub normal: [f32; 3],
+    pub distance: f32,
+    pub bevel: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollisionBrush {
+    pub center: [f32; 3],
+    pub extents: [f32; 3],
+    pub flags: u32,
+    pub sides: Vec<BrushSide>,
+}
+
+impl CollisionBrush {
+    /// `CHBasedCD::CCDBrush::Load`: A3DAABB (four vectors), flags, side
+    /// count, then 17-byte plane/bevel records. Sharing this reader with TBH
+    /// tree collision keeps both native containers on the same layout.
+    pub fn read(b: &[u8], p: &mut usize) -> Result<Self, String> {
+        let center = v3(b, *p)?;
+        let extents = v3(b, *p + 12)?;
+        let _mins = v3(b, *p + 24)?;
+        let _maxs = v3(b, *p + 36)?;
+        if extents.iter().any(|v| *v < 0.0) {
+            return Err("negative collision-brush extent".into());
+        }
+        *p = p.checked_add(48).ok_or("collision-brush overflow")?;
+        let flags = u(b, *p)?;
+        *p += 4;
+        let count = u(b, *p)? as usize;
+        *p += 4;
+        if count == 0 || count > 200 {
+            return Err(format!("invalid collision-brush side count {count}"));
+        }
+        let mut sides = Vec::with_capacity(count);
+        for _ in 0..count {
+            let normal = v3(b, *p)?;
+            let distance = f(b, *p + 12)?;
+            if normal.iter().map(|v| v * v).sum::<f32>() < 1e-12 {
+                return Err("zero collision-plane normal".into());
+            }
+            let bevel = *b.get(*p + 16).ok_or("truncated collision plane")? != 0;
+            *p = p.checked_add(17).ok_or("collision-plane overflow")?;
+            sides.push(BrushSide {
+                normal,
+                distance,
+                bevel,
+            });
+        }
+        Ok(Self {
+            center,
+            extents,
+            flags,
+            sides,
+        })
+    }
+}
+fn u(b: &[u8], p: usize) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(
+        b.get(p..p.checked_add(4).ok_or("overflow")?)
+            .ok_or("truncated BMD")?
+            .try_into()
+            .unwrap(),
+    ))
+}
+fn f(b: &[u8], p: usize) -> Result<f32, String> {
+    let v = f32::from_bits(u(b, p)?);
+    if !v.is_finite() {
+        return Err("non-finite BMD float".into());
+    }
+    Ok(v)
+}
+fn v3(b: &[u8], p: usize) -> Result<[f32; 3], String> {
+    Ok([f(b, p)?, f(b, p + 4)?, f(b, p + 8)?])
+}
+fn fixed(b: &[u8], p: usize, n: usize) -> Result<String, String> {
+    let s = b
+        .get(p..p.checked_add(n).ok_or("overflow")?)
+        .ok_or("truncated string")?;
+    let end = s.iter().position(|&c| c == 0).unwrap_or(n);
+    let (t, _, bad) = encoding_rs::GBK.decode(&s[..end]);
+    if bad {
+        return Err("invalid GBK in BMD".into());
+    }
+    Ok(t.replace('\\', "/"))
+}
+impl Model {
+    /// Mirrors the retail loaders exactly:
+    /// - file magic "MOXB" (u32 0x42584f4d) is the AFileImage binary marker,
+    ///   sniffed by AFileImage::Open at 0x76da7c;
+    /// - the optional chunk tag 0x80000001 plus one flag byte is read by the
+    ///   scenery loader 0x64e200 (0x64e261/0x64e278); the byte is stored but
+    ///   never used (corpus values: 0 and 1 only);
+    /// - A3DLitModel::Load (0x7bb380) accepts model versions 0x10000001
+    ///   (0x7bb3de) and 0x10000002 (0x7bb58b) with an identical header and
+    ///   logs "A3DLitModel::Load(), Wrong version!" for anything else;
+    /// - A3DLitMesh::Load (0x7ba070) implements mesh versions 0x10000002
+    ///   (0x7ba0b8), 0x10000003 (0x7ba30d), 0x10000004 (0x7ba573) and
+    ///   0x10000005 (0x7ba7a7). v2/v3 use 28-byte vertex records and have no
+    ///   material tail; v3 carries the same two packed per-vertex light arrays
+    ///   as v4/v5, which v2 does not. The normal block (n*12) is separate and
+    ///   present in every version. These advance sizes are the same ones
+    ///   `src/bin/bmd-corpus-census.rs` walks, so the two cannot drift apart.
+    ///   Version 0x10000001 returns false without logging (0x7baa64); any
+    ///   other version logs "Unknown version [%x]!" (0x7baa51).
+    ///
+    ///   Corpus status: v2/v3 have zero occurrences in `litmodels.pck`,
+    ///   `building.pck` and `models.pck` (the last contains no BMDs at all),
+    ///   so their handling is specified from the client's advance sizes and
+    ///   covered by synthetic tests rather than by real data. That is stated
+    ///   here so the distinction between "implemented" and "seen in the wild"
+    ///   stays visible.
+    /// - After the last mesh, `CELBrushBuilding::Load` reads its native convex
+    ///   collision trailer: u32 hull count, then per hull [u32 n][n u32 mesh
+    ///   ids], followed by one `CCDBrush` per hull. Each brush is an A3DAABB
+    ///   (48 bytes), flags, side count, and 17-byte plane/bevel records. This
+    ///   is the same layout previously misidentified as scenery light groups;
+    ///   `EL_BrushBuilding.cpp` and `CHBasedCD/aabbcd.cpp` establish its real
+    ///   purpose. Old BMDs without even a hull-count word remain valid.
+    pub fn parse(b: &[u8]) -> Result<Self, String> {
+        if u(b, 0)? != 0x42584f4d {
+            return Err("not a binary AFile (missing MOXB marker, client sniff 0x76da7c)".into());
+        }
+        let mut p = 4;
+        let mut version = u(b, p)?;
+        if version == 0x80000001 {
+            p += 5;
+            version = u(b, p)?
+        }
+        if version != 0x10000001 && version != 0x10000002 {
+            return Err(format!(
+                "A3DLitModel::Load(), Wrong version! (model version {version:#x}, client 0x7bb79e)"
+            ));
+        }
+        p += 4;
+        let scale = v3(b, p)?;
+        let direction = v3(b, p + 12)?;
+        let up = v3(b, p + 24)?;
+        let position = v3(b, p + 36)?;
+        p += 48;
+        let count = u(b, p)? as usize;
+        p += 4;
+        if count > 4096 {
+            return Err("too many meshes".into());
+        }
+        let mut meshes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let ver = u(b, p)?;
+            p += 4;
+            match ver {
+                0x10000004 | 0x10000005 => {}
+                // v2 (0x7ba0b8) and v3 (0x7ba30d) are older layouts: 28-byte
+                // vertex records and no normal array. The advance sizes are
+                // recorded in `src/bin/bmd-corpus-census.rs`, which walks these
+                // same versions, so the shape is known rather than guessed.
+                0x10000002 | 0x10000003 => {}
+                0x10000001 => {
+                    return Err(
+                        "mesh version 0x10000001: client A3DLitMesh::Load rejects it without logging (0x7baa64)".into(),
+                    )
+                }
+                other => {
+                    return Err(format!(
+                        "A3DLitMesh::Load(), Unknown version [{other:x}]! (client 0x7baa51)"
+                    ))
+                }
+            }
+            let name = fixed(b, p, 64)?;
+            let texture = fixed(b, p + 64, 256)?;
+            p += 320;
+            let n = u(b, p)? as usize;
+            let faces = u(b, p + 4)? as usize;
+            p += 8;
+            if n > 1_000_000 || faces > 2_000_000 {
+                return Err("invalid BMD mesh size".into());
+            }
+            // v2/v3 use 28-byte vertex records; v4/v5 use 24-byte records plus
+            // a trailing normal array. v3 additionally carries two packed
+            // per-vertex light arrays, exactly like v4/v5.
+            let stride: usize = if ver >= 0x10000004 { 24 } else { 28 };
+            let light_arrays = ver != 0x10000002;
+            let mut needed = n
+                .checked_mul(stride)
+                .and_then(|v| v.checked_add(faces * 6))
+                .and_then(|v| v.checked_add(n * 12))
+                .and_then(|v| v.checked_add(48))
+                .ok_or("BMD size overflow")?;
+            if light_arrays {
+                needed = needed
+                    .checked_add(n * 4)
+                    .and_then(|v| v.checked_add(n * 4))
+                    .ok_or("BMD size overflow")?;
+            }
+            if p.checked_add(needed).is_none_or(|e| e > b.len()) {
+                return Err("truncated BMD mesh data".into());
+            }
+            let mut vertices = Vec::with_capacity(n);
+            for i in 0..n {
+                let q = p + i * stride;
+                vertices.push(Vertex {
+                    position: v3(b, q)?,
+                    diffuse: u(b, q + 12)?,
+                    day_diffuse: 0,
+                    night_diffuse: 0,
+                    uv: [f(b, q + 16)?, f(b, q + 20)?],
+                    normal: [0.; 3],
+                });
+            }
+            p += n * stride;
+            let mut indices = Vec::with_capacity(faces * 3);
+            for _ in 0..faces * 3 {
+                let s = b.get(p..p + 2).ok_or("truncated BMD indices")?;
+                let i = u16::from_le_bytes([s[0], s[1]]);
+                if i as usize >= n {
+                    return Err("BMD vertex index out of range".into());
+                }
+                indices.push(i);
+                p += 2;
+            }
+            // The normal array is present in every version (n*12 bytes); the
+            // 28-byte v2/v3 record simply has no room for one inline, so the
+            // block is where it always is. This matches the advance sizes in
+            // `src/bin/bmd-corpus-census.rs` for all four versions.
+            for v in &mut vertices {
+                v.normal = v3(b, p)?;
+                p += 12;
+            }
+            // The client loads two packed vertex-light arrays into mesh
+            // members +0x284/+0x288 and blends them at 0x7b9bc0. v2 has
+            // neither; v3 has both.
+            if light_arrays {
+                for v in &mut vertices {
+                    v.day_diffuse = u(b, p)?;
+                    p += 4;
+                }
+                for v in &mut vertices {
+                    v.night_diffuse = u(b, p)?;
+                    p += 4;
+                }
+            }
+            p += 48;
+            let material = if ver >= 0x10000005 {
+                let tail = b.get(p..).ok_or("truncated material")?;
+                let len = tail
+                    .iter()
+                    .position(|&c| c == 0)
+                    .ok_or("unterminated material name")?;
+                if len > 4096 {
+                    return Err("oversized BMD material name".into());
+                }
+                let name = fixed(b, p, len)?;
+                p = p.checked_add(len + 1).ok_or("material overflow")?;
+                let color = |off| -> Result<[f32; 4], String> {
+                    Ok([f(b, off)?, f(b, off + 4)?, f(b, off + 8)?, f(b, off + 12)?])
+                };
+                let m = Material {
+                    name,
+                    ambient: color(p)?,
+                    diffuse: color(p + 16)?,
+                    emissive: color(p + 32)?,
+                    specular: color(p + 48)?,
+                    power: f(b, p + 64)?,
+                    two_sided: *b.get(p + 68).ok_or("truncated material")? != 0,
+                };
+                p = p.checked_add(69).ok_or("material overflow")?;
+                Some(m)
+            } else {
+                None
+            };
+            meshes.push(Mesh {
+                name,
+                version: ver,
+                material,
+                texture,
+                vertices,
+                indices,
+            });
+        }
+        let mut collision = Vec::new();
+        // CELBrushBuilding accepts old files whose stream ends before the
+        // hull-count word, but a partially present native trailer is an error.
+        if p < b.len() {
+            let hull_count = u(b, p)? as usize;
+            p += 4;
+            if hull_count > 65_536 {
+                return Err(format!("BMD collision-hull limit exceeded: {hull_count}"));
+            }
+            for _ in 0..hull_count {
+                let count = u(b, p)? as usize;
+                p += 4;
+                if count > 1_000_000 {
+                    return Err(format!("BMD collision mesh-list limit exceeded: {count}"));
+                }
+                let bytes = count.checked_mul(4).ok_or("BMD collision list overflow")?;
+                p = p.checked_add(bytes).ok_or("BMD collision list overflow")?;
+                if p > b.len() {
+                    return Err("truncated BMD collision mesh list".into());
+                }
+            }
+            for _ in 0..hull_count {
+                collision.push(CollisionBrush::read(b, &mut p)?);
+            }
+        }
+        Ok(Self {
+            scale,
+            direction,
+            up,
+            position,
+            meshes,
+            collision,
+        })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_short_file() {
+        assert!(Model::parse(&[0; 8]).is_err());
+    }
+    #[test]
+    fn reads_both_baked_light_arrays() {
+        let mut b = Vec::new();
+        let u = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        u(&mut b, 0x42584f4d);
+        u(&mut b, 0x10000002);
+        b.extend_from_slice(&[0; 48]);
+        u(&mut b, 1);
+        u(&mut b, 0x10000004);
+        b.extend_from_slice(&[0; 320]);
+        u(&mut b, 2);
+        u(&mut b, 0);
+        b.extend_from_slice(&[0; 48]); // two vertex records
+        b.extend_from_slice(&[0; 24]); // two normals
+        u(&mut b, 0xff123456);
+        u(&mut b, 0xff789abc);
+        u(&mut b, 0xfffedcba);
+        u(&mut b, 0xff654321);
+        b.extend_from_slice(&[0; 48]);
+        let m = Model::parse(&b).unwrap();
+        let v = &m.meshes[0].vertices;
+        assert_eq!(
+            (v[0].day_diffuse, v[0].night_diffuse),
+            (0xff123456, 0xfffedcba)
+        );
+        assert_eq!(
+            (v[1].day_diffuse, v[1].night_diffuse),
+            (0xff789abc, 0xff654321)
+        );
+    }
+    #[test]
+    fn reads_version_five_material_and_rejects_truncation() {
+        let mut b = Vec::new();
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        put(&mut b, 0x42584f4d);
+        put(&mut b, 0x10000002);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, 1);
+        put(&mut b, 0x10000005);
+        b.extend_from_slice(&[0; 320]);
+        put(&mut b, 0);
+        put(&mut b, 0);
+        b.extend_from_slice(&[0; 48]);
+        b.extend_from_slice(b"MATERIAL: \0");
+        for x in 0..17 {
+            put(&mut b, (x as f32 / 16.0).to_bits());
+        }
+        b.push(1);
+        let model = Model::parse(&b).unwrap();
+        let m = model.meshes[0].material.as_ref().unwrap();
+        assert_eq!(m.name, "MATERIAL: ");
+        assert_eq!(m.diffuse, [0.25, 0.3125, 0.375, 0.4375]);
+        assert_eq!(m.power, 1.0);
+        assert!(m.two_sided);
+        b.pop();
+        assert!(Model::parse(&b).is_err());
+    }
+    #[test]
+    fn rejects_nan_geometry() {
+        assert!(f(&f32::NAN.to_le_bytes(), 0).is_err());
+    }
+    fn model_skeleton(model_version: u32, mesh_version: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        put(&mut b, 0x42584f4d);
+        put(&mut b, model_version);
+        b.extend_from_slice(&[0; 48]);
+        put(&mut b, 1);
+        put(&mut b, mesh_version);
+        b.extend_from_slice(&[0; 320]);
+        put(&mut b, 0);
+        put(&mut b, 0);
+        b.extend_from_slice(&[0; 48]);
+        b
+    }
+    fn parse_err(b: &[u8]) -> String {
+        match Model::parse(b) {
+            Ok(_) => panic!("expected a parse error"),
+            Err(e) => e,
+        }
+    }
+    /// v2 (0x7ba0b8) and v3 (0x7ba30d) use 28-byte vertex records and no
+    /// separate normal array; v3 adds the two packed light arrays. The sizes
+    /// below are the same ones `src/bin/bmd-corpus-census.rs` walks, so this
+    /// test and that tool cannot drift apart silently.
+    #[test]
+    fn parses_mesh_v2_and_v3_with_their_own_strides() {
+        let build = |mesh_version: u32, n: u32, faces: u32| {
+            let mut b = Vec::new();
+            let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+            put(&mut b, 0x42584f4d);
+            put(&mut b, 0x10000002);
+            b.extend_from_slice(&[0; 48]);
+            put(&mut b, 1);
+            put(&mut b, mesh_version);
+            b.extend_from_slice(&[0; 320]);
+            put(&mut b, n);
+            put(&mut b, faces);
+            let stride = if mesh_version >= 0x10000004 { 24 } else { 28 };
+            b.extend_from_slice(&vec![0u8; (n * stride) as usize]);
+            b.extend_from_slice(&vec![0u8; (faces * 6) as usize]);
+            // Normals are a separate block for every version.
+            b.extend_from_slice(&vec![0u8; (n * 12) as usize]);
+            if mesh_version != 0x10000002 {
+                b.extend_from_slice(&vec![0u8; (n * 4) as usize]);
+                b.extend_from_slice(&vec![0u8; (n * 4) as usize]);
+            }
+            // The 48-byte block comes first; v5 then adds a material tail of a
+            // NUL-terminated name plus 4x16 bytes of colours, a float and a
+            // two-sided flag. Order matters: the parser advances past the 48
+            // bytes before it looks for a name.
+            b.extend_from_slice(&[0; 48]);
+            if mesh_version >= 0x10000005 {
+                b.extend_from_slice(b"mat\0");
+                b.extend_from_slice(&[0u8; 69]);
+            }
+            b
+        };
+        for v in [0x10000002u32, 0x10000003] {
+            let m = Model::parse(&build(v, 4, 2)).unwrap();
+            assert_eq!(m.meshes.len(), 1, "v{v:#x}");
+            assert_eq!(m.meshes[0].version, v);
+            assert_eq!(m.meshes[0].vertices.len(), 4);
+            assert_eq!(m.meshes[0].indices.len(), 6);
+            // v2/v3 carry no material tail; `material` is an Option, so absence
+            // is None rather than an empty value.
+            assert!(m.meshes[0].material.is_none(), "v{v:#x}");
+        }
+        // v4/v5 must be untouched by the v2/v3 handling: same input shape
+        // still parses and still records the version it read.
+        for v in [0x10000004u32, 0x10000005] {
+            let m = Model::parse(&build(v, 4, 2)).unwrap();
+            assert_eq!(m.meshes[0].version, v);
+            assert_eq!(m.meshes[0].vertices.len(), 4);
+            // v4 stops before the material; v5 must consume the tail it added.
+            if v == 0x10000005 {
+                assert_eq!(
+                    m.meshes[0].material.as_ref().map(|x| x.name.as_str()),
+                    Some("mat")
+                );
+            } else {
+                assert!(m.meshes[0].material.is_none(), "v{v:#x}");
+            }
+        }
+        // Truncating one byte must still be caught rather than misread.
+        let mut short = build(0x10000002, 4, 2);
+        short.pop();
+        assert!(Model::parse(&short).is_err());
+    }
+    #[test]
+    fn accepts_both_client_model_versions() {
+        // A3DLitModel::Load reads the identical header for 0x10000001
+        // (0x7bb3de) and 0x10000002 (0x7bb58b).
+        for mv in [0x10000001u32, 0x10000002] {
+            let m = Model::parse(&model_skeleton(mv, 0x10000004)).unwrap();
+            assert_eq!(m.meshes.len(), 1);
+        }
+        let err = parse_err(&model_skeleton(0x10000003, 0x10000004));
+        assert!(err.contains("Wrong version"), "{err}");
+    }
+    #[test]
+    fn names_every_unsupported_mesh_version() {
+        let err = parse_err(&model_skeleton(0x10000002, 0x10000001));
+        assert!(err.contains("without logging"), "{err}");
+        let err = parse_err(&model_skeleton(0x10000002, 0x10000006));
+        assert!(err.contains("Unknown version [10000006]"), "{err}");
+    }
+    #[test]
+    fn accepts_chunk_wrapper_flag_bytes() {
+        // Scenery loader 0x64e200: tag 0x80000001 then one flag byte that is
+        // stored but never read; corpus histogram: {0: 7943, 1: 119}.
+        for flag in [0u8, 1] {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0x42584f4du32.to_le_bytes());
+            b.extend_from_slice(&0x80000001u32.to_le_bytes());
+            b.push(flag);
+            let mut rest = model_skeleton(0x10000002, 0x10000004);
+            b.extend_from_slice(&rest.split_off(4));
+            assert_eq!(Model::parse(&b).unwrap().meshes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn reads_native_collision_hulls_after_lit_meshes() {
+        let mut b = model_skeleton(0x10000002, 0x10000004);
+        assert!(Model::parse(&b).unwrap().collision.is_empty());
+        let put = |b: &mut Vec<u8>, value: u32| b.extend_from_slice(&value.to_le_bytes());
+        put(&mut b, 1); // hull count
+        put(&mut b, 2); // mesh ids associated with this hull
+        put(&mut b, 3);
+        put(&mut b, 7);
+        for value in [
+            10.0f32, 20.0, 30.0, // center
+            1.0, 2.0, 3.0, // extents
+            9.0, 18.0, 27.0, // mins
+            11.0, 22.0, 33.0, // maxs
+        ] {
+            put(&mut b, value.to_bits());
+        }
+        put(&mut b, 4); // CHDATA_SKIP_COLLISION
+        put(&mut b, 1); // one side is enough to verify the serialized layout
+        for value in [0.0f32, 1.0, 0.0, 12.5] {
+            put(&mut b, value.to_bits());
+        }
+        b.push(1); // bevel bool
+        let model = Model::parse(&b).unwrap();
+        assert_eq!(model.collision.len(), 1);
+        let brush = &model.collision[0];
+        assert_eq!(brush.center, [10.0, 20.0, 30.0]);
+        assert_eq!(brush.extents, [1.0, 2.0, 3.0]);
+        assert_eq!(brush.flags, 4);
+        assert_eq!(brush.sides.len(), 1);
+        assert_eq!(brush.sides[0].normal, [0.0, 1.0, 0.0]);
+        assert_eq!(brush.sides[0].distance, 12.5);
+        assert!(brush.sides[0].bevel);
+        b.pop();
+        assert!(Model::parse(&b).is_err());
+    }
+}
