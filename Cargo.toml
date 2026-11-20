@@ -1,0 +1,20 @@
+[package]
+name = "forsaken-world-explorer"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Forsaken World client discovery and asset inventory"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "fw-explorer"
+path = "src/main.rs"
