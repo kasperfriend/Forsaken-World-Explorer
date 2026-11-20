@@ -1,0 +1,1899 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded adler2 v2.0.1
+  Downloaded ab_glyph v0.2.32
+  Downloaded ahash v0.8.12
+  Downloaded ab_glyph_rasterizer v0.1.10
+  Downloaded allocator-api2 v0.2.21
+  Downloaded crypto-common v0.1.7
+  Downloaded crc32fast v1.5.3
+  Downloaded arboard v3.7.0
+  Downloaded gpu-descriptor-types v0.1.2
+  Downloaded hexf-parse v0.2.1
+  Downloaded khronos-egl v6.0.0
+  Downloaded generic-array v0.14.7
+  Downloaded proc-macro2 v1.0.107
+  Downloaded multiversion_no_op v1.0.0
+  Downloaded gpu-alloc-types v0.3.1
+  Downloaded owned_ttf_parser v0.25.1
+  Downloaded plain v0.2.3
+  Downloaded cpufeatures v0.2.17
+  Downloaded gethostname v1.1.0
+  Downloaded dlib v0.5.3
+  Downloaded ecolor v0.27.2
+  Downloaded cfg-if v1.0.5
+  Downloaded percent-encoding v2.3.2
+  Downloaded profiling v1.0.18
+  Downloaded nohash-hasher v0.2.0
+  Downloaded bit-set v0.5.3
+  Downloaded calloop-wayland-source v0.2.0
+  Downloaded errno v0.3.14
+  Downloaded as-raw-xcb-connection v1.0.1
+  Downloaded byteorder-lite v0.1.0
+  Downloaded downcast-rs v1.2.1
+  Downloaded simd-adler32 v0.3.10
+  Downloaded smallvec v1.16.4
+  Downloaded cfg_aliases v0.1.1
+  Downloaded document-features v0.2.12
+  Downloaded raw-window-handle v0.6.2
+  Downloaded calloop-wayland-source v0.4.1
+  Downloaded renderdoc-sys v1.1.0
+  Downloaded arrayref v0.3.9
+  Downloaded cursor-icon v1.2.0
+  Downloaded block-buffer v0.10.4
+  Downloaded slab v0.4.12
+  Downloaded gpu-descriptor v0.2.4
+  Downloaded pollster v0.3.0
+  Downloaded simdutf8 v0.1.5
+  Downloaded lock_api v0.4.14
+  Downloaded gpu-alloc v0.6.2
+  Downloaded pin-project-lite v0.2.17
+  Downloaded pkg-config v0.3.34
+  Downloaded bytemuck_derive v1.12.1
+  Downloaded litrs v1.0.1
+  Downloaded rustc-hash v1.1.0
+  Downloaded bit-vec v0.6.3
+  Downloaded emath v0.27.2
+  Downloaded digest v0.10.7
+  Downloaded equivalent v1.0.3
+  Downloaded egui-wgpu v0.27.2
+  Downloaded egui-winit v0.27.2
+  Downloaded find-msvc-tools v0.1.15
+  Downloaded libloading v0.7.4
+  Downloaded scroll v0.12.0
+  Downloaded quote v1.0.47
+  Downloaded libloading v0.8.9
+  Downloaded once_cell v1.21.4
+  Downloaded fdeflate v0.3.7
+  Downloaded bitflags v1.3.2
+  Downloaded jobserver v0.1.35
+  Downloaded parking_lot_core v0.9.12
+  Downloaded codespan-reporting v0.11.1
+  Downloaded core_detect v1.0.0
+  Downloaded memmap2 v0.9.12
+  Downloaded arrayvec v0.7.8
+  Downloaded autocfg v1.5.1
+  Downloaded log v0.4.35
+  Downloaded getrandom v0.3.4
+  Downloaded num-traits v0.2.19
+  Downloaded bitflags v2.13.2
+  Downloaded polling v3.11.0
+  Downloaded miniz_oxide v0.9.1
+  Downloaded calloop v0.12.4
+  Downloaded flate2 v1.1.10
+  Downloaded bytemuck v1.25.2
+  Downloaded parking_lot v0.12.5
+  Downloaded serde_core v1.0.229
+  Downloaded miniz_oxide v0.8.9
+  Downloaded calloop v0.14.5
+  Downloaded minifb v0.27.0
+  Downloaded indexmap v2.14.2
+  Downloaded memchr v2.8.3
+  Downloaded png v0.17.16
+  Downloaded web-time v0.2.4
+  Downloaded xcursor v0.3.11
+  Downloaded moxcms v0.8.1
+  Downloaded png v0.18.1
+  Downloaded scopeguard v1.2.0
+  Downloaded version_check v0.9.5
+  Downloaded wayland-csd-frame v0.3.0
+  Downloaded wayland-cursor v0.31.14
+  Downloaded wayland-protocols-misc v0.3.12
+  Downloaded glow v0.13.1
+  Downloaded hashbrown v0.14.5
+  Downloaded cc v1.10.0
+  Downloaded wayland-sys v0.31.11
+  Downloaded hashbrown v0.17.1
+  Downloaded goblin v0.8.2
+  Downloaded quick-xml v0.41.0
+  Downloaded egui v0.27.2
+  Downloaded image v0.25.10
+  Downloaded glam v0.27.0
+  Downloaded ash v0.37.3+1.3.251
+  Downloaded rustix v1.1.6
+  Downloaded naga v0.19.2
+  Downloaded encoding_rs v0.8.44
+  Downloaded strict-num v0.1.1
+  Downloaded xkbcommon-dl v0.4.2
+  Downloaded scroll_derive v0.12.1
+  Downloaded scoped-tls v1.0.1
+  Downloaded epaint v0.27.2
+  Downloaded unicode-xid v0.2.6
+  Downloaded libc v0.2.191
+  Downloaded pxfm v0.1.30
+  Downloaded type-map v0.5.1
+  Downloaded smol_str v0.2.2
+  Downloaded termcolor v1.4.1
+  Downloaded rustc-hash v2.1.3
+  Downloaded rustversion v1.0.23
+  Downloaded static_assertions v1.1.0
+  Downloaded thiserror v1.0.69
+  Downloaded thiserror-impl v1.0.69
+  Downloaded thiserror-impl v2.0.21
+  Downloaded wayland-protocols-wlr v0.3.12
+  Downloaded wayland-protocols-wlr v0.2.0
+  Downloaded sha2 v0.10.9
+  Downloaded shlex v2.0.1
+  Downloaded thiserror v2.0.21
+  Downloaded wayland-protocols-experimental v20250721.0.1
+  Downloaded zune-core v0.5.3
+  Downloaded unicode-ident v1.0.27
+  Downloaded spirv v0.3.0+sdk-1.3.268.0
+  Downloaded linux-raw-sys v0.4.15
+  Downloaded smithay-clipboard v0.7.3
+  Downloaded wayland-scanner v0.31.11
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded tracing-core v0.1.36
+  Downloaded wayland-protocols-plasma v0.2.0
+  Downloaded serde_derive v1.0.229
+  Downloaded tiny-skia-path v0.11.4
+  Downloaded wgpu-types v0.19.2
+  Downloaded sctk-adwaita v0.8.3
+  Downloaded wayland-backend v0.3.17
+  Downloaded wayland-client v0.31.15
+  Downloaded x11-dl v2.21.0
+  Downloaded zune-jpeg v0.5.15
+  Downloaded serde v1.0.229
+  Downloaded typenum v1.20.1
+  Downloaded xkeysym v0.2.1
+  Downloaded smithay-client-toolkit v0.18.1
+  Downloaded syn v2.0.119
+  Downloaded smithay-client-toolkit v0.20.0
+  Downloaded wayland-protocols v0.31.2
+  Downloaded wayland-protocols v0.32.13
+  Downloaded wgpu v0.19.4
+  Downloaded ttf-parser v0.25.1
+  Downloaded tiny-skia v0.11.4
+  Downloaded x11rb v0.13.2
+  Downloaded wgpu-core v0.19.4
+  Downloaded zlib-rs v0.6.8
+  Downloaded unicode-width v0.1.14
+  Downloaded syn v3.0.9
+  Downloaded wgpu-hal v0.19.5
+  Downloaded zerocopy v0.8.63
+  Downloaded rustix v0.38.44
+  Downloaded tracing v0.1.44
+  Downloaded x11rb-protocol v0.13.2
+  Downloaded winit v0.29.15
+   Compiling cfg-if v1.0.5
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling bitflags v2.13.2
+   Compiling log v0.4.35
+   Compiling once_cell v1.21.4
+   Compiling libloading v0.8.9
+   Compiling smallvec v1.16.4
+   Compiling rustix v1.1.6
+   Compiling linux-raw-sys v0.12.1
+   Compiling libc v0.2.191
+   Compiling pkg-config v0.3.34
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.15
+   Compiling cc v1.10.0
+   Compiling wayland-sys v0.31.11
+   Compiling dlib v0.5.3
+   Compiling version_check v0.9.5
+   Compiling downcast-rs v1.2.1
+   Compiling memchr v2.8.3
+   Compiling scoped-tls v1.0.1
+   Compiling wayland-client v0.31.15
+   Compiling quick-xml v0.41.0
+   Compiling syn v3.0.9
+   Compiling wayland-backend v0.3.17
+   Compiling syn v2.0.119
+   Compiling wayland-scanner v0.31.11
+   Compiling cfg_aliases v0.1.1
+   Compiling thiserror v1.0.69
+   Compiling zerocopy v0.8.63
+   Compiling getrandom v0.3.4
+   Compiling thiserror-impl v1.0.69
+   Compiling bytemuck_derive v1.12.1
+   Compiling ahash v0.8.12
+   Compiling bytemuck v1.25.2
+   Compiling scopeguard v1.2.0
+   Compiling parking_lot_core v0.9.12
+   Compiling polling v3.11.0
+   Compiling autocfg v1.5.1
+   Compiling lock_api v0.4.14
+   Compiling num-traits v0.2.19
+   Compiling parking_lot v0.12.5
+   Compiling rustix v0.38.44
+   Compiling arrayvec v0.7.8
+   Compiling ttf-parser v0.25.1
+   Compiling ab_glyph_rasterizer v0.1.10
+   Compiling raw-window-handle v0.6.2
+   Compiling simd-adler32 v0.3.10
+   Compiling xcursor v0.3.11
+   Compiling xkeysym v0.2.1
+   Compiling cursor-icon v1.2.0
+   Compiling linux-raw-sys v0.4.15
+   Compiling owned_ttf_parser v0.25.1
+   Compiling ab_glyph v0.2.32
+   Compiling wayland-csd-frame v0.3.0
+   Compiling wayland-cursor v0.31.14
+   Compiling wayland-protocols v0.32.13
+   Compiling wayland-protocols v0.31.2
+   Compiling memmap2 v0.9.12
+   Compiling generic-array v0.14.7
+   Compiling allocator-api2 v0.2.21
+   Compiling termcolor v1.4.1
+   Compiling adler2 v2.0.1
+   Compiling pin-project-lite v0.2.17
+   Compiling slab v0.4.12
+   Compiling unicode-width v0.1.14
+   Compiling equivalent v1.0.3
+   Compiling tracing-core v0.1.36
+   Compiling hashbrown v0.17.1
+   Compiling crc32fast v1.5.3
+   Compiling khronos-egl v6.0.0
+   Compiling bit-vec v0.6.3
+   Compiling ash v0.37.3+1.3.251
+   Compiling bit-set v0.5.3
+   Compiling indexmap v2.14.2
+   Compiling calloop v0.12.4
+   Compiling tracing v0.1.44
+   Compiling codespan-reporting v0.11.1
+   Compiling hashbrown v0.14.5
+   Compiling wgpu-hal v0.19.5
+   Compiling x11-dl v2.21.0
+   Compiling gpu-alloc-types v0.3.1
+   Compiling gpu-descriptor-types v0.1.2
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling libloading v0.7.4
+   Compiling hexf-parse v0.2.1
+   Compiling rustversion v1.0.23
+   Compiling smithay-client-toolkit v0.18.1
+   Compiling thiserror v2.0.21
+   Compiling strict-num v0.1.1
+   Compiling unicode-xid v0.2.6
+   Compiling typenum v1.20.1
+   Compiling rustc-hash v1.1.0
+   Compiling arrayref v0.3.9
+   Compiling tiny-skia-path v0.11.4
+   Compiling naga v0.19.2
+   Compiling gpu-descriptor v0.2.4
+   Compiling gpu-alloc v0.6.2
+   Compiling calloop v0.14.5
+   Compiling calloop-wayland-source v0.2.0
+   Compiling wayland-protocols-wlr v0.2.0
+   Compiling miniz_oxide v0.9.1
+   Compiling emath v0.27.2
+   Compiling ecolor v0.27.2
+   Compiling gethostname v1.1.0
+   Compiling wgpu-core v0.19.4
+   Compiling thiserror-impl v2.0.21
+   Compiling wgpu-types v0.19.2
+   Compiling profiling v1.0.18
+   Compiling as-raw-xcb-connection v1.0.1
+   Compiling renderdoc-sys v1.1.0
+   Compiling smithay-client-toolkit v0.20.0
+   Compiling nohash-hasher v0.2.0
+   Compiling x11rb-protocol v0.13.2
+   Compiling glow v0.13.1
+   Compiling epaint v0.27.2
+   Compiling flate2 v1.1.10
+   Compiling calloop-wayland-source v0.4.1
+   Compiling tiny-skia v0.11.4
+   Compiling wayland-protocols-misc v0.3.12
+   Compiling wayland-protocols-wlr v0.3.12
+   Compiling wayland-protocols-experimental v20250721.0.1
+   Compiling miniz_oxide v0.8.9
+   Compiling fdeflate v0.3.7
+   Compiling x11rb v0.13.2
+   Compiling wgpu v0.19.4
+   Compiling winit v0.29.15
+   Compiling percent-encoding v2.3.2
+   Compiling sctk-adwaita v0.8.3
+   Compiling encoding_rs v0.8.44
+   Compiling egui v0.27.2
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling wayland-protocols-plasma v0.2.0
+   Compiling xkbcommon-dl v0.4.2
+   Compiling scroll_derive v0.12.1
+   Compiling minifb v0.27.0
+   Compiling static_assertions v1.1.0
+   Compiling rustc-hash v2.1.3
+   Compiling pxfm v0.1.30
+   Compiling web-time v0.2.4
+   Compiling zune-core v0.5.3
+   Compiling litrs v1.0.1
+   Compiling smol_str v0.2.2
+   Compiling moxcms v0.8.1
+   Compiling document-features v0.2.12
+   Compiling zune-jpeg v0.5.15
+   Compiling type-map v0.5.1
+   Compiling scroll v0.12.0
+   Compiling digest v0.10.7
+   Compiling smithay-clipboard v0.7.3
+   Compiling arboard v3.7.0
+   Compiling png v0.18.1
+   Compiling bitflags v1.3.2
+   Compiling core_detect v1.0.0
+   Compiling cpufeatures v0.2.17
+   Compiling simdutf8 v0.1.5
+   Compiling multiversion_no_op v1.0.0
+   Compiling plain v0.2.3
+   Compiling byteorder-lite v0.1.0
+   Compiling goblin v0.8.2
+   Compiling image v0.25.10
+   Compiling egui-wgpu v0.27.2
+   Compiling sha2 v0.10.9
+   Compiling png v0.17.16
+   Compiling egui-winit v0.27.2
+   Compiling pollster v0.3.0
+   Compiling glam v0.27.0
+   Compiling forsaken-world-explorer v0.1.0 (/home/runner/work/Forsaken-World-Explorer/Forsaken-World-Explorer)
+warning: unused import: `std::collections::HashMap`
+  --> src/gfx_catalog.rs:36:5
+   |
+36 | use std::collections::HashMap;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: duplicated attribute
+    --> src/gfx_file.rs:3005:5
+     |
+3005 |     #[test]
+     |     ^^^^^^^
+     |
+     = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: unnecessary parentheses around closure body
+    --> src/gfx_player.rs:2989:30
+     |
+2989 |         .map(|(last, first)| (*last - *first))
+     |                              ^              ^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+2989 -         .map(|(last, first)| (*last - *first))
+2989 +         .map(|(last, first)| *last - *first)
+     |
+
+warning: duplicated attribute
+     --> src/gfx_player.rs:13301:5
+      |
+13301 |     #[test]
+      |     ^^^^^^^
+
+warning: duplicated attribute
+     --> src/gfx_player.rs:14329:5
+      |
+14329 |     #[test]
+      |     ^^^^^^^
+
+warning: unused import: `ffi::OsStr`
+ --> src/material.rs:7:5
+  |
+7 |     ffi::OsStr,
+  |     ^^^^^^^^^^
+
+warning: unnecessary parentheses around type
+    --> src/modules/walker/collision.rs:1495:28
+     |
+1495 |     fn model_with(quads: &[(([[f32; 3]; 3], [[f32; 3]; 3]))]) -> crate::bmd::Model {
+     |                            ^                              ^
+     |
+help: remove these parentheses
+     |
+1495 -     fn model_with(quads: &[(([[f32; 3]; 3], [[f32; 3]; 3]))]) -> crate::bmd::Model {
+1495 +     fn model_with(quads: &[([[f32; 3]; 3], [[f32; 3]; 3])]) -> crate::bmd::Model {
+     |
+
+warning: duplicated attribute
+   --> src/scene.rs:597:5
+    |
+597 |     #[test]
+    |     ^^^^^^^
+
+warning: unused import: `collections::HashMap`
+  --> src/weather_gpu.rs:17:11
+   |
+17 | use std::{collections::HashMap, fs::File, path::Path};
+   |           ^^^^^^^^^^^^^^^^^^^^
+
+warning: unreachable expression
+   --> src/scene.rs:617:26
+    |
+617 |                     _ => return panic!("valid_time {} is not an authored mode", e.valid_time),
+    |                          ^^^^^^^-------------------------------------------------------------
+    |                          |      |
+    |                          |      any code following this expression is unreachable
+    |                          unreachable expression
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `trailer`
+   --> src/angelica_pck.rs:184:13
+    |
+184 |         let trailer = out.len();
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_trailer`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/gfx_player.rs:8943:13
+     |
+8943 |         let mut name = |text: &str, out: &mut Vec<u8>| {
+     |             ----^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> src/gfx_player.rs:10106:13
+      |
+10106 |         let mut count = |half: Vec3| {
+      |             ----^^^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: unused variable: `sun`
+    --> src/gpu.rs:2702:13
+     |
+2702 |         let sun = [
+     |             ^^^ help: if this is intentional, prefix it with an underscore: `_sun`
+
+warning: unused variable: `camera`
+    --> src/gpu.rs:4841:5
+     |
+4841 |     camera: &Camera,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_camera`
+
+warning: unused variable: `changed`
+    --> src/gpu.rs:7101:465
+     |
+7101 | ...logging_dir.clone();let changed=crate::diagnostics::ui(ui,&mut mask,&mut directory);if mask!=settings.logging_mask{settings.log...
+     |                            ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_changed`
+
+warning: value captured by `applied_extent` is never read
+    --> src/gpu.rs:5630:21
+     |
+5630 |                     applied_extent = wanted_extent;
+     |                     ^^^^^^^^^^^^^^
+     |
+     = help: did you mean to capture by reference instead?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `action`
+   --> src/modules/populator/mod.rs:640:13
+    |
+640 |         let action = &source.model.actions[action_index];
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_action`
+
+warning: unused variable: `index`
+    --> src/modules/populator/mod.rs:2209:14
+     |
+2209 |         let (index, spawn) = population
+     |              ^^^^^ help: if this is intentional, prefix it with an underscore: `_index`
+
+warning: variable does not need to be mutable
+   --> src/pck.rs:173:9
+    |
+173 |     let mut direct_storage_done = vec![false; entries.len()];
+    |         ----^^^^^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused variable: `nv`
+   --> src/terrain_block.rs:107:9
+    |
+107 |     let nv = (grid + 1) * (grid + 1);
+    |         ^^ help: if this is intentional, prefix it with an underscore: `_nv`
+
+warning: variable does not need to be mutable
+  --> src/terrain_residency.rs:93:9
+   |
+93 |         mut build: B,
+   |         ----^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `y`
+   --> src/terrain_residency.rs:361:44
+    |
+361 |             .update(&second, |_, _| 3, |x, y, _| Ok(block(x as f32)))
+    |                                            ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+warning: unused variable: `y`
+   --> src/terrain_residency.rs:346:43
+    |
+346 |             .update(&first, |_, _| 3, |x, y, _| Ok(block(x as f32)))
+    |                                           ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+warning: unused variable: `y`
+   --> src/terrain_residency.rs:387:21
+    |
+387 |                 |x, y, level| {
+    |                     ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+warning: unused variable: `y`
+   --> src/terrain_residency.rs:381:41
+    |
+381 |             .update(&win, |_, _| 3, |x, y, _| Ok(block(x as f32)))
+    |                                         ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+warning: field `normals` is never read
+   --> src/main.rs:191:5
+    |
+175 | struct Terrain {
+    |        ------- field in this struct
+...
+191 |     normals: terrain_store::Normals,
+    |     ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `length_ms` and `compression` are never read
+  --> src/animation.rs:66:9
+   |
+62 | pub struct KeyTrack<const N: usize> {
+   |            -------- fields in this struct
+...
+66 |     pub length_ms: i32,
+   |         ^^^^^^^^^
+67 |     pub compression: i32,
+   |         ^^^^^^^^^^^
+   |
+   = note: `KeyTrack` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `version`, `start`, `end`, and `fps` are never read
+   --> src/animation.rs:229:9
+    |
+228 | pub struct TrackSet {
+    |            -------- fields in this struct
+229 |     pub version: u32,
+    |         ^^^^^^^
+230 |     pub start: i32,
+    |         ^^^^^
+231 |     pub end: i32,
+    |         ^^^
+232 |     pub fps: i32,
+    |         ^^^
+    |
+    = note: `TrackSet` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `diffuse` is never read
+ --> src/bmd.rs:8:9
+  |
+4 | pub struct Vertex {
+  |            ------ field in this struct
+...
+8 |     pub diffuse: u32,
+  |         ^^^^^^^
+  |
+  = note: `Vertex` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: fields `ambient`, `emissive`, and `specular` are never read
+  --> src/bmd.rs:15:9
+   |
+13 | pub struct Material {
+   |            -------- fields in this struct
+14 |     pub name: String,
+15 |     pub ambient: [f32; 4],
+   |         ^^^^^^^
+16 |     pub diffuse: [f32; 4],
+17 |     pub emissive: [f32; 4],
+   |         ^^^^^^^^
+18 |     pub specular: [f32; 4],
+   |         ^^^^^^^^
+   |
+   = note: `Material` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `flags` is never used
+  --> src/client_sun.rs:85:12
+   |
+63 | impl Visibility {
+   | --------------- method in this implementation
+...
+85 |     pub fn flags(&self) -> u32 {
+   |            ^^^^^
+
+warning: function `slug` is never used
+    --> src/effect_preview.rs:1044:4
+     |
+1044 | fn slug(text: &str) -> String {
+     |    ^^^^
+
+warning: method `raw_view` is never used
+   --> src/display_gamma.rs:143:12
+    |
+ 38 | impl DisplayGamma {
+    | ----------------- method in this implementation
+...
+143 |     pub fn raw_view(&self) -> wgpu::TextureView {
+    |            ^^^^^^^^
+
+warning: methods `begin_frame` and `render_submit_end` are never used
+   --> src/dlss.rs:288:16
+    |
+237 |     impl DlssFrameGeneration {
+    |     ------------------------ methods in this implementation
+...
+288 |         pub fn begin_frame(&mut self) {}
+    |                ^^^^^^^^^^^
+...
+308 |         pub fn render_submit_end(&mut self) {}
+    |                ^^^^^^^^^^^^^^^^^
+
+warning: function `dxt5_interpolates_alpha_and_keeps_the_endpoints` is never used
+   --> src/dxt.rs:300:8
+    |
+300 |     fn dxt5_interpolates_alpha_and_keeps_the_endpoints() {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `version` and `physique` are never read
+   --> src/ecmodel.rs:107:9
+    |
+106 | pub struct SkinModel {
+    |            --------- fields in this struct
+107 |     pub version: u32,
+    |         ^^^^^^^
+...
+110 |     pub physique: String,
+    |         ^^^^^^^^
+    |
+    = note: `SkinModel` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `joints` is never read
+   --> src/ecmodel.rs:123:9
+    |
+117 | pub struct Action {
+    |            ------ field in this struct
+...
+123 |     pub joints: Vec<JointAction>,
+    |         ^^^^^^
+    |
+    = note: `Action` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `joint`, `loops`, and `speed` are never read
+   --> src/ecmodel.rs:127:9
+    |
+126 | pub struct JointAction {
+    |            ----------- fields in this struct
+127 |     pub joint: i32,
+    |         ^^^^^
+...
+130 |     pub loops: i32,
+    |         ^^^^^
+131 |     pub speed: f32,
+    |         ^^^^^
+    |
+    = note: `JointAction` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `kind`, `name`, `target`, and `file` are never read
+   --> src/ecmodel.rs:135:9
+    |
+134 | pub struct Hanger {
+    |            ------ fields in this struct
+135 |     pub kind: i32,
+    |         ^^^^
+136 |     pub name: String,
+    |         ^^^^
+137 |     pub target: String,
+    |         ^^^^^^
+138 |     pub on_bone: bool,
+139 |     pub file: String,
+    |         ^^^^
+    |
+    = note: `Hanger` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `world_bounds` is never used
+  --> src/terrain_cutoff.rs:50:8
+   |
+50 | pub fn world_bounds(
+   |        ^^^^^^^^^^^^
+
+warning: associated function `aspect` is never used
+  --> src/fsr.rs:91:19
+   |
+89 | impl CameraLens {
+   | --------------- associated function in this implementation
+90 |     /// Aspect ratio helper (`view space width / height`), as DLSS-G wants it.
+91 |     pub(crate) fn aspect(width: u32, height: u32) -> f32 {
+   |                   ^^^^^^
+
+warning: method `wants_reset` is never used
+   --> src/fsr.rs:186:16
+    |
+121 |     impl FsrUpscaler {
+    |     ---------------- method in this implementation
+...
+186 |         pub fn wants_reset(&self) -> bool {
+    |                ^^^^^^^^^^^
+
+warning: field `name` is never read
+  --> src/gfx_decal.rs:24:9
+   |
+23 | pub struct Decal {
+   |            ----- field in this struct
+24 |     pub name: String,
+   |         ^^^^
+   |
+   = note: `Decal` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `logic_delta_ms`, `twilight`, `celestial_alpha`, `authored`, and `celestial` are never read
+  --> src/gpu.rs:73:5
+   |
+70 | struct FrameSnapshot {
+   |        ------------- fields in this struct
+...
+73 |     logic_delta_ms: u32,
+   |     ^^^^^^^^^^^^^^
+...
+76 |     twilight: f32,
+   |     ^^^^^^^^
+...
+93 |     celestial_alpha: f32,
+   |     ^^^^^^^^^^^^^^^
+94 |     authored: [f32; 3],
+   |     ^^^^^^^^
+95 |     celestial: [f32; 3],
+   |     ^^^^^^^^^
+   |
+   = note: `FrameSnapshot` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: method `celestial_status` is never used
+    --> src/gpu.rs:2569:12
+     |
+1975 | impl Renderer {
+     | ------------- method in this implementation
+...
+2569 |     pub fn celestial_status(&self, camera: &Camera) -> String {
+     |            ^^^^^^^^^^^^^^^^
+
+warning: method `fog_uniform` is never used
+    --> src/gpu.rs:4605:8
+     |
+4539 | impl Camera {
+     | ----------- method in this implementation
+...
+4605 |     fn fog_uniform(&self) -> ([f32; 4], [f32; 4]) {
+     |        ^^^^^^^^^^^
+
+warning: method `set_multi_draw` is never used
+   --> src/grass_instances.rs:346:12
+    |
+177 | impl Gpu {
+    | -------- method in this implementation
+...
+346 |     pub fn set_multi_draw(&mut self, multi_draw: bool) {
+    |            ^^^^^^^^^^^^^^
+
+warning: field `alpha_texture` is never read
+   --> src/model_draw_gpu.rs:188:5
+    |
+183 | struct Mesh {
+    |        ---- field in this struct
+...
+188 |     alpha_texture: bool,
+    |     ^^^^^^^^^^^^^
+
+warning: field `textures` is never read
+   --> src/model_draw_gpu.rs:208:5
+    |
+196 | pub struct Draw {
+    |            ---- field in this struct
+...
+208 |     textures: Vec<std::sync::Arc<wgpu::Texture>>,
+    |     ^^^^^^^^
+
+warning: methods `alpha_texture`, `mesh_count`, and `texture_count` are never used
+   --> src/model_draw_gpu.rs:707:12
+    |
+239 | impl Draw {
+    | --------- methods in this implementation
+...
+707 |     pub fn alpha_texture(&self, mesh: usize) -> Option<bool> {
+    |            ^^^^^^^^^^^^^
+...
+713 |     pub fn mesh_count(&self) -> usize {
+    |            ^^^^^^^^^^
+...
+716 |     pub fn texture_count(&self) -> usize {
+    |            ^^^^^^^^^^^^^
+
+warning: constant `WGSL` is never used
+  --> src/model_material.rs:67:11
+   |
+67 | pub const WGSL: &str = r#"
+   |           ^^^^
+
+warning: variant `Decoded` is never constructed
+  --> src/model_texture_gpu.rs:10:5
+   |
+ 8 | pub enum UploadMode {
+   |          ---------- variant in this enum
+ 9 |     Auto,
+10 |     Decoded,
+   |     ^^^^^^^
+   |
+   = note: `UploadMode` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: methods `walker_audio_status` and `walker_audio_diagnostic` are never used
+   --> src/modules/mod.rs:530:12
+    |
+ 58 | impl Modules {
+    | ------------ methods in this implementation
+...
+530 |     pub fn walker_audio_status(&self) -> &str {
+    |            ^^^^^^^^^^^^^^^^^^^
+...
+534 |     pub fn walker_audio_diagnostic(&self) -> Option<String> {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `equip_location` is never read
+  --> src/modules/designer/assembly.rs:31:9
+   |
+28 | pub struct EquipmentPart {
+   |            ------------- field in this struct
+...
+31 |     pub equip_location: i32,
+   |         ^^^^^^^^^^^^^^
+   |
+   = note: `EquipmentPart` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `base` is never read
+  --> src/modules/designer/assembly.rs:40:9
+   |
+37 | pub struct FaceTextureStage {
+   |            ---------------- field in this struct
+...
+40 |     pub base: String,
+   |         ^^^^
+   |
+   = note: `FaceTextureStage` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `face_neck` is never read
+   --> src/modules/designer/assembly.rs:177:5
+    |
+162 | pub struct Character {
+    |            --------- field in this struct
+...
+177 |     face_neck: usize,
+    |     ^^^^^^^^^
+
+warning: methods `action_pose` and `face_neck_bone` are never used
+   --> src/modules/designer/assembly.rs:627:12
+    |
+198 | impl Character {
+    | -------------- methods in this implementation
+...
+627 |     pub fn action_pose(
+    |            ^^^^^^^^^^^
+...
+787 |     pub fn face_neck_bone(&self) -> usize {
+    |            ^^^^^^^^^^^^^^
+
+warning: associated function `from_u32` is never used
+  --> src/modules/designer/catalog.rs:35:12
+   |
+18 | impl Gender {
+   | ----------- associated function in this implementation
+...
+35 |     pub fn from_u32(value: u32) -> Option<Self> {
+   |            ^^^^^^^^
+
+warning: method `default_fashion_skin` is never used
+   --> src/modules/designer/catalog.rs:230:12
+    |
+ 56 | impl Class {
+    | ---------- method in this implementation
+...
+230 |     pub fn default_fashion_skin(self, gender: Gender, slot: ArmorSlot) -> Option<String> {
+    |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: associated constant `ALL` is never used
+   --> src/modules/designer/catalog.rs:254:15
+    |
+253 | impl ArmorSlot {
+    | -------------- associated constant in this implementation
+254 |     pub const ALL: [Self; 5] = [
+    |               ^^^
+
+warning: field `action_type` is never read
+   --> src/modules/designer/catalog.rs:301:9
+    |
+292 | pub struct WeaponItem {
+    |            ---------- field in this struct
+...
+301 |     pub action_type: i32,
+    |         ^^^^^^^^^^^
+    |
+    = note: `WeaponItem` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `subtype` is never read
+   --> src/modules/designer/catalog.rs:306:9
+    |
+304 | pub struct ArmorItem {
+    |            --------- field in this struct
+305 |     pub id: u32,
+306 |     pub subtype: u32,
+    |         ^^^^^^^
+    |
+    = note: `ArmorItem` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `subtype`, `required_level`, `item_level`, and `dye_count` are never read
+   --> src/modules/designer/catalog.rs:320:9
+    |
+318 | pub struct FashionItem {
+    |            ----------- fields in this struct
+319 |     pub id: u32,
+320 |     pub subtype: u32,
+    |         ^^^^^^^
+...
+325 |     pub required_level: i32,
+    |         ^^^^^^^^^^^^^^
+326 |     pub item_level: i32,
+    |         ^^^^^^^^^^
+327 |     pub dye_count: i32,
+    |         ^^^^^^^^^
+    |
+    = note: `FashionItem` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `visualize` and `user_data` are never read
+   --> src/modules/designer/catalog.rs:341:9
+    |
+333 | pub struct FaceTexture {
+    |            ----------- fields in this struct
+...
+341 |     pub visualize: u32,
+    |         ^^^^^^^^^
+342 |     pub user_data: u32,
+    |         ^^^^^^^^^
+    |
+    = note: `FaceTexture` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `visualize` and `user_data` are never read
+   --> src/modules/designer/catalog.rs:353:9
+    |
+346 | pub struct FaceShape {
+    |            --------- fields in this struct
+...
+353 |     pub visualize: u32,
+    |         ^^^^^^^^^
+354 |     pub user_data: u32,
+    |         ^^^^^^^^^
+    |
+    = note: `FaceShape` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `model` and `visualize` are never read
+   --> src/modules/designer/catalog.rs:362:9
+    |
+358 | pub struct HairItem {
+    |            -------- fields in this struct
+...
+362 |     pub model: String,
+    |         ^^^^^
+...
+365 |     pub visualize: u32,
+    |         ^^^^^^^^^
+    |
+    = note: `HairItem` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `name`, `class_mask`, `gender`, `visualize`, and `facepill_only` are never read
+   --> src/modules/designer/catalog.rs:371:9
+    |
+369 | pub struct ExtraSkin {
+    |            --------- fields in this struct
+370 |     pub id: u32,
+371 |     pub name: String,
+    |         ^^^^
+372 |     pub path: String,
+373 |     pub class_mask: u32,
+    |         ^^^^^^^^^^
+374 |     pub gender: u32,
+    |         ^^^^^^
+375 |     pub visualize: u32,
+    |         ^^^^^^^^^
+376 |     pub facepill_only: u32,
+    |         ^^^^^^^^^^^^^
+    |
+    = note: `ExtraSkin` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `secondary_model`, `flight_time`, `time_per_element`, `mp_launch`, and `mp_per_second` are never read
+   --> src/modules/designer/catalog.rs:410:9
+    |
+406 | pub struct FlightItem {
+    |            ---------- fields in this struct
+...
+410 |     pub secondary_model: String,
+    |         ^^^^^^^^^^^^^^^
+...
+418 |     pub flight_time: Option<(f32, f32)>,
+    |         ^^^^^^^^^^^
+419 |     pub time_per_element: f32,
+    |         ^^^^^^^^^^^^^^^^
+420 |     pub mp_launch: i32,
+    |         ^^^^^^^^^
+421 |     pub mp_per_second: i32,
+    |         ^^^^^^^^^^^^^
+    |
+    = note: `FlightItem` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `monster_type` is never read
+   --> src/modules/designer/catalog.rs:459:9
+    |
+457 | pub struct MonsterItem {
+    |            ----------- field in this struct
+458 |     pub id: u32,
+459 |     pub monster_type: u32,
+    |         ^^^^^^^^^^^^
+    |
+    = note: `MonsterItem` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `is_spawnable` is never used
+   --> src/modules/designer/catalog.rs:468:12
+    |
+467 | impl MonsterItem {
+    | ---------------- method in this implementation
+468 |     pub fn is_spawnable(&self) -> bool {
+    |            ^^^^^^^^^^^^
+
+warning: field `max_level` is never read
+   --> src/modules/designer/catalog.rs:483:9
+    |
+478 | pub struct MountItem {
+    |            --------- field in this struct
+...
+483 |     pub max_level: i32,
+    |         ^^^^^^^^^
+    |
+    = note: `MountItem` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `walk` is never read
+   --> src/modules/designer/catalog.rs:500:9
+    |
+499 | pub struct ClassSpeeds {
+    |            ----------- field in this struct
+500 |     pub walk: f32,
+    |         ^^^^
+    |
+    = note: `ClassSpeeds` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `missing_face_ids` is never used
+   --> src/modules/designer/customize.rs:284:12
+    |
+230 | impl CharacterDesign {
+    | -------------------- method in this implementation
+...
+284 |     pub fn missing_face_ids(&self, catalog: &Catalog) -> Vec<String> {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: method `is_empty` is never used
+   --> src/modules/designer/face.rs:136:12
+    |
+ 74 | impl Expression {
+    | --------------- method in this implementation
+...
+136 |     pub fn is_empty(&self) -> bool {
+    |            ^^^^^^^^
+
+warning: method `read` is never used
+   --> src/modules/populator/mod.rs:360:8
+    |
+343 | impl Library {
+    | ------------ method in this implementation
+...
+360 |     fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
+    |        ^^^^
+
+warning: method `restart` is never used
+    --> src/modules/populator/mod.rs:1348:8
+     |
+1327 | impl WalkAnimation {
+     | ------------------ method in this implementation
+...
+1348 |     fn restart(&mut self) {
+     |        ^^^^^^^
+
+warning: field `name` is never read
+    --> src/modules/populator/mod.rs:1389:5
+     |
+1388 | struct CityZone {
+     |        -------- field in this struct
+1389 |     name: String,
+     |     ^^^^
+     |
+     = note: `CityZone` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: methods `audio_status`, `audio_diagnostic`, and `camera_shake` are never used
+   --> src/modules/walker/mod.rs:496:12
+    |
+362 | impl Walker {
+    | ----------- methods in this implementation
+...
+496 |     pub fn audio_status(&self) -> &str {
+    |            ^^^^^^^^^^^^
+...
+500 |     pub fn audio_diagnostic(&self) -> Option<String> {
+    |            ^^^^^^^^^^^^^^^^
+...
+888 |     pub fn camera_shake(&self) -> Vec3 {
+    |            ^^^^^^^^^^^^
+
+warning: fields `paths`, `volume_min`, `volume_max`, `pitch_min`, `pitch_max`, and `percent` are never read
+   --> src/modules/walker/audio.rs:106:9
+    |
+103 | pub struct SoundCue {
+    |            -------- fields in this struct
+...
+106 |     pub paths: Vec<String>,
+    |         ^^^^^
+107 |     pub volume_min: u32,
+    |         ^^^^^^^^^^
+108 |     pub volume_max: u32,
+    |         ^^^^^^^^^^
+109 |     pub pitch_min: f32,
+    |         ^^^^^^^^^
+110 |     pub pitch_max: f32,
+    |         ^^^^^^^^^
+111 |     pub percent: f32,
+    |         ^^^^^^^
+    |
+    = note: `SoundCue` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variants `Packed` and `Loose` are never constructed
+   --> src/modules/walker/audio.rs:139:5
+    |
+138 | enum Asset {
+    |      ----- variants in this enum
+139 |     Packed(pck::Entry),
+    |     ^^^^^^
+140 |     Loose(PathBuf),
+    |     ^^^^^
+    |
+    = note: `Asset` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+   --> src/modules/walker/audio.rs:145:5
+    |
+144 | struct Play {
+    |        ---- fields in this struct
+145 |     channel: u8,
+    |     ^^^^^^^
+146 |     event: u64,
+    |     ^^^^^
+147 |     label: String,
+    |     ^^^^^
+148 |     asset: Asset,
+    |     ^^^^^
+149 |     gain: f32,
+    |     ^^^^
+150 |     speed: f32,
+    |     ^^^^^
+151 |     looping: bool,
+    |     ^^^^^^^
+    |
+    = note: `Play` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variants `Play`, `Stop`, `StopChannel`, and `StopAll` are never constructed
+   --> src/modules/walker/audio.rs:156:5
+    |
+155 | enum WorkerCommand {
+    |      ------------- variants in this enum
+156 |     Play(Play),
+    |     ^^^^
+157 |     Stop { channel: u8, event: u64 },
+    |     ^^^^
+158 |     StopChannel(u8),
+    |     ^^^^^^^^^^^
+159 |     StopAll,
+    |     ^^^^^^^
+    |
+    = note: `WorkerCommand` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: struct `Request` is never constructed
+   --> src/modules/walker/audio.rs:162:8
+    |
+162 | struct Request {
+    |        ^^^^^^^
+
+warning: fields `element`, `packed`, `resolved`, `catalog_error`, `missing`, and `random` are never read
+   --> src/modules/walker/audio.rs:169:5
+    |
+168 | pub struct CharacterAudio {
+    |            -------------- fields in this struct
+169 |     element: PathBuf,
+    |     ^^^^^^^
+170 |     packed: HashMap<String, pck::Entry>,
+    |     ^^^^^^
+171 |     resolved: HashMap<String, Option<Asset>>,
+    |     ^^^^^^^^
+172 |     catalog_error: Option<String>,
+    |     ^^^^^^^^^^^^^
+173 |     worker_error: Option<String>,
+174 |     missing: HashSet<String>,
+    |     ^^^^^^^
+...
+179 |     random: u32,
+    |     ^^^^^^
+
+warning: methods `random`, `resolve`, `prepare`, `status`, and `diagnostic` are never used
+   --> src/modules/walker/audio.rs:250:8
+    |
+214 | impl CharacterAudio {
+    | ------------------- methods in this implementation
+...
+250 |     fn random(&mut self) -> u32 {
+    |        ^^^^^^
+...
+261 |     fn resolve(&mut self, path: &str) -> Option<Asset> {
+    |        ^^^^^^^
+...
+275 |     fn prepare(&mut self, cue: SoundCue) -> Option<WorkerCommand> {
+    |        ^^^^^^^
+...
+396 |     pub fn status(&self) -> &str {
+    |            ^^^^^^
+...
+400 |     pub fn diagnostic(&self) -> Option<String> {
+    |            ^^^^^^^^^^
+
+warning: methods `set_element`, `len`, and `is_empty` are never used
+  --> src/modules/walker/gallery.rs:81:12
+   |
+69 | impl Gallery {
+   | ------------ methods in this implementation
+...
+81 |     pub fn set_element(&mut self, element: PathBuf) {
+   |            ^^^^^^^^^^^
+...
+87 |     pub fn len(&self) -> usize {
+   |            ^^^
+...
+91 |     pub fn is_empty(&self) -> bool {
+   |            ^^^^^^^^
+
+warning: method `camera_shake` is never used
+   --> src/modules/walker/gfx.rs:161:12
+    |
+107 | impl CharacterGfx {
+    | ----------------- method in this implementation
+...
+161 |     pub fn camera_shake(&self) -> Vec3 {
+    |            ^^^^^^^^^^^^
+
+warning: variant `None` is never constructed
+  --> src/modules/walker/pose.rs:21:5
+   |
+20 | pub enum ScaleType {
+   |          --------- variant in this enum
+21 |     None,
+   |     ^^^^
+   |
+   = note: `ScaleType` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `enabled`, `volume`, `repeat`, `zone`, and `paths` are never read
+   --> src/music.rs:373:5
+    |
+372 | struct Request {
+    |        ------- fields in this struct
+373 |     enabled: bool,
+    |     ^^^^^^^
+374 |     volume: f32,
+    |     ^^^^^^
+375 |     repeat: bool,
+    |     ^^^^^^
+376 |     zone: Option<usize>,
+    |     ^^^^
+377 |     paths: Vec<Track>,
+    |     ^^^^^
+    |
+    = note: `Request` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `destinations` is never used
+  --> src/navigation.rs:10:8
+   |
+10 | pub fn destinations(path: &Path) -> Result<Vec<Destination>, String> {
+   |        ^^^^^^^^^^^^
+
+warning: methods `update`, `load_texture_reference`, `load_from_archive`, and `decode_and_store` are never used
+   --> src/objects.rs:429:12
+    |
+366 | impl Objects {
+    | ------------ methods in this implementation
+...
+429 |     pub fn update(&mut self, world_x: f32, world_z: f32, range: f32) -> Result<Vec<usize>, String> {
+    |            ^^^^^^
+...
+792 |     fn load_texture_reference(&mut self, raw: &str) -> Result<(), String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+...
+911 |     fn load_from_archive(&mut self, mount: usize, key: &str) -> Result<(), String> {
+    |        ^^^^^^^^^^^^^^^^^
+...
+937 |     fn decode_and_store(&mut self, key: &str, data: &[u8]) -> Result<(), String> {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: field `surface_format` is never read
+  --> src/present_encode.rs:52:5
+   |
+51 | pub struct PresentEncode {
+   |            ------------- field in this struct
+52 |     surface_format: wgpu::TextureFormat,
+   |     ^^^^^^^^^^^^^^
+
+warning: methods `surface_format`, `width`, `height`, and `raw_view` are never used
+   --> src/present_encode.rs:150:12
+    |
+ 61 | impl PresentEncode {
+    | ------------------ methods in this implementation
+...
+150 |     pub fn surface_format(&self) -> wgpu::TextureFormat {
+    |            ^^^^^^^^^^^^^^
+...
+154 |     pub fn width(&self) -> u32 {
+    |            ^^^^^
+...
+158 |     pub fn height(&self) -> u32 {
+    |            ^^^^^^
+...
+169 |     pub fn raw_view(&self) -> wgpu::TextureView {
+    |            ^^^^^^^^
+
+warning: method `name` is never used
+   --> src/scenery_visibility.rs:105:12
+    |
+ 96 | impl Pass {
+    | --------- method in this implementation
+...
+105 |     pub fn name(self) -> &'static str {
+    |            ^^^^
+
+warning: field `visibility` is never read
+   --> src/scenery_visibility.rs:357:9
+    |
+354 | pub struct Placement {
+    |            --------- field in this struct
+...
+357 |     pub visibility: Visibility,
+    |         ^^^^^^^^^^
+    |
+    = note: `Placement` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `block_center` is never used
+   --> src/scenery_visibility.rs:364:8
+    |
+364 | pub fn block_center(width: f32, length: f32, block_size: f32, position: [f32; 3]) -> [f32; 2] {
+    |        ^^^^^^^^^^^^
+
+warning: method `reset` is never used
+   --> src/scenery_visibility.rs:429:12
+    |
+388 | impl RegionResidency {
+    | -------------------- method in this implementation
+...
+429 |     pub fn reset(&mut self) {
+    |            ^^^^^
+
+warning: field `first_joint` is never read
+  --> src/skeleton.rs:12:9
+   |
+ 8 | pub struct Bone {
+   |            ---- field in this struct
+...
+12 |     pub first_joint: i32,
+   |         ^^^^^^^^^^^
+   |
+   = note: `Bone` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `parent` and `sibling` are never read
+  --> src/skeleton.rs:21:9
+   |
+18 | pub struct Joint {
+   |            ----- fields in this struct
+...
+21 |     pub parent: i32,
+   |         ^^^^^^
+22 |     pub child: i32,
+23 |     pub sibling: i32,
+   |         ^^^^^^^
+   |
+   = note: `Joint` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `kind` is never read
+  --> src/skeleton.rs:28:9
+   |
+26 | pub struct Hook {
+   |            ---- field in this struct
+27 |     pub name: String,
+28 |     pub kind: u32,
+   |         ^^^^
+   |
+   = note: `Hook` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `version`, `start`, and `end` are never read
+  --> src/skeleton.rs:34:9
+   |
+33 | pub struct Skeleton {
+   |            -------- fields in this struct
+34 |     pub version: u32,
+   |         ^^^^^^^
+35 |     pub start: i32,
+   |         ^^^^^
+36 |     pub end: i32,
+   |         ^^^
+   |
+   = note: `Skeleton` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `name` is never read
+  --> src/skin.rs:15:9
+   |
+14 | pub struct Material {
+   |            -------- field in this struct
+15 |     pub name: String,
+   |         ^^^^
+   |
+   = note: `Material` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: constant `WGSL` is never used
+  --> src/skin_pose.rs:83:11
+   |
+83 | pub const WGSL: &str = r#"
+   |           ^^^^
+
+warning: function `half_extent` is never used
+   --> src/sky_celestial.rs:101:8
+    |
+101 | pub fn half_extent(kind: DiscKind) -> f32 {
+    |        ^^^^^^^^^^^
+
+warning: constant `MOON_HALF_EXTENT` is never used
+  --> src/sky_gpu.rs:65:11
+   |
+65 | pub const MOON_HALF_EXTENT: f32 = 20.0;
+   |           ^^^^^^^^^^^^^^^^
+
+warning: multiple fields are never read
+   --> src/sky_gpu.rs:188:5
+    |
+181 | pub struct SkyGpu {
+    |            ------ fields in this struct
+...
+188 |     layout: wgpu::BindGroupLayout,
+    |     ^^^^^^
+189 |     skies_view: wgpu::TextureView,
+    |     ^^^^^^^^^^
+190 |     sampler: wgpu::Sampler,
+    |     ^^^^^^^
+191 |     roof_sampler: wgpu::Sampler,
+    |     ^^^^^^^^^^^^
+192 |     depth_sampler: wgpu::Sampler,
+    |     ^^^^^^^^^^^^^
+...
+197 |     disc_layers: [bool; 2],
+    |     ^^^^^^^^^^^
+...
+203 |     glow_layers: [bool; 4],
+    |     ^^^^^^^^^^^
+
+warning: methods `disc_texture_present`, `shine_texture_present`, `flare_texture_present`, and `set_depth` are never used
+    --> src/sky_gpu.rs:1259:12
+     |
+ 769 | impl SkyGpu {
+     | ----------- methods in this implementation
+...
+1259 |     pub fn disc_texture_present(&self, sun: bool) -> bool {
+     |            ^^^^^^^^^^^^^^^^^^^^
+...
+1264 |     pub fn shine_texture_present(&self, sun: bool) -> bool {
+     |            ^^^^^^^^^^^^^^^^^^^^^
+...
+1269 |     pub fn flare_texture_present(&self) -> bool {
+     |            ^^^^^^^^^^^^^^^^^^^^^
+...
+1283 |     pub fn set_depth(&mut self, device: &wgpu::Device, depth_view: &wgpu::TextureView) {
+     |            ^^^^^^^^^
+
+warning: field `0` is never read
+  --> src/world_audio.rs:14:12
+   |
+14 |     Packed(pck::Entry),
+   |     ------ ^^^^^^^^^^
+   |     |
+   |     field in this variant
+   |
+   = note: `Asset` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+   |
+14 -     Packed(pck::Entry),
+14 +     Packed(()),
+   |
+
+warning: field `0` is never read
+  --> src/world_audio.rs:15:11
+   |
+15 |     Loose(PathBuf),
+   |     ----- ^^^^^^^
+   |     |
+   |     field in this variant
+   |
+   = note: `Asset` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+   |
+15 -     Loose(PathBuf),
+15 +     Loose(()),
+   |
+
+warning: fields `enabled`, `volume`, and `voices` are never read
+  --> src/world_audio.rs:97:5
+   |
+96 | struct Request {
+   |        ------- fields in this struct
+97 |     enabled: bool,
+   |     ^^^^^^^
+98 |     volume: f32,
+   |     ^^^^^^
+99 |     voices: Vec<Voice>,
+   |     ^^^^^^
+
+warning: fields `version`, `flags`, and `header_len` are never read
+  --> src/terrain_block.rs:56:9
+   |
+55 | pub struct Layout {
+   |            ------ fields in this struct
+56 |     pub version: u32,
+   |         ^^^^^^^
+57 |     pub flags: u8,
+   |         ^^^^^
+58 |     pub header_len: usize,
+   |         ^^^^^^^^^^
+   |
+   = note: `Layout` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `metadata_bytes` is never read
+  --> src/terrain_store.rs:66:9
+   |
+60 | pub struct Stats {
+   |            ----- field in this struct
+...
+66 |     pub metadata_bytes: usize,
+   |         ^^^^^^^^^^^^^^
+   |
+   = note: `Stats` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `file_exists` is never used
+   --> src/texture_resolution.rs:431:8
+    |
+431 | pub fn file_exists(resolver_mounts: &[MountedArchive], disk_root: &Path, key: &str) -> bool {
+    |        ^^^^^^^^^^^
+
+warning: variant `Point` is never constructed
+  --> src/vegetation_material.rs:39:5
+   |
+38 | pub enum Filter {
+   |          ------ variant in this enum
+39 |     Point,
+   |     ^^^^^
+   |
+   = note: `Filter` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `Wrap` is never constructed
+  --> src/vegetation_material.rs:45:5
+   |
+44 | pub enum Address {
+   |          ------- variant in this enum
+45 |     Wrap,
+   |     ^^^^
+   |
+   = note: `Address` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: multiple variants are never constructed
+  --> src/vegetation_material.rs:61:5
+   |
+60 | pub enum Compare {
+   |          ------- variants in this enum
+61 |     Never,
+   |     ^^^^^
+62 |     Less,
+   |     ^^^^
+63 |     Equal,
+   |     ^^^^^
+64 |     LessEqual,
+   |     ^^^^^^^^^
+65 |     Greater,
+66 |     NotEqual,
+   |     ^^^^^^^^
+67 |     GreaterEqual,
+   |     ^^^^^^^^^^^^
+68 |     Always,
+   |     ^^^^^^
+   |
+   = note: `Compare` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: variant `None` is never constructed
+  --> src/vegetation_material.rs:89:5
+   |
+88 | pub enum Cutout {
+   |          ------ variant in this enum
+89 |     None,
+   |     ^^^^
+   |
+   = note: `Cutout` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `legacy_cutout` is never used
+   --> src/vegetation_material.rs:281:8
+    |
+281 | pub fn legacy_cutout(material: Material) -> Option<u8> {
+    |        ^^^^^^^^^^^^^
+
+warning: field `capacity` is never read
+  --> src/water.rs:31:9
+   |
+30 | pub struct ShoreWave {
+   |            --------- field in this struct
+31 |     pub capacity: usize,
+   |         ^^^^^^^^
+   |
+   = note: `ShoreWave` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: methods `label` and `tooltip` are never used
+  --> src/world_catalog.rs:47:12
+   |
+42 | impl WorldMap {
+   | ------------- methods in this implementation
+...
+47 |     pub fn label(&self) -> String {
+   |            ^^^^^
+...
+51 |     pub fn tooltip(&self) -> String {
+   |            ^^^^^^^
+
+warning: function `element_from_map_dir` is never used
+   --> src/world_catalog.rs:385:8
+    |
+385 | pub fn element_from_map_dir(dir: &Path) -> PathBuf {
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `recovering_from_map_failure` is never used
+  --> src/world_load.rs:23:8
+   |
+23 | pub fn recovering_from_map_failure() -> bool {
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `action` is never read
+  --> src/world_models.rs:11:9
+   |
+ 6 | pub struct Instance {
+   |            -------- field in this struct
+...
+11 |     pub action: Option<usize>,
+   |         ^^^^^^
+
+warning: constant `CATALOG_EFFECT_IDENTITY` is never used
+  --> src/world_models_gpu.rs:21:7
+   |
+21 | const CATALOG_EFFECT_IDENTITY: u64 = 3 << 40;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `catalog_spawns` is never read
+   --> src/world_models_gpu.rs:147:5
+    |
+113 | pub struct World {
+    |            ----- field in this struct
+...
+147 |     catalog_spawns: u64,
+    |     ^^^^^^^^^^^^^^
+
+warning: multiple methods are never used
+    --> src/world_models_gpu.rs:382:12
+     |
+ 166 | impl World {
+     | ---------- methods in this implementation
+...
+ 382 |     pub fn effect_census(&self) -> Vec<(crate::gfx_catalog::Group, usize)> {
+     |            ^^^^^^^^^^^^^
+...
+ 392 |     pub fn spawn_catalog_effect(
+     |            ^^^^^^^^^^^^^^^^^^^^
+...
+ 623 |     pub fn set_light_priority_limit(&mut self, limit: i32) {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 626 |     pub fn light_priority_limit(&self) -> i32 {
+     |            ^^^^^^^^^^^^^^^^^^^^
+...
+ 635 |     pub fn publish_dynamic_light(&mut self, identity: u64, light: DynamicLight) {
+     |            ^^^^^^^^^^^^^^^^^^^^^
+...
+ 641 |     pub fn tick_gfx_light(
+     |            ^^^^^^^^^^^^^^
+...
+ 658 |     pub fn unregister_dynamic_light(&mut self, identity: u64) {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+ 993 |     pub fn effects_enabled(&self) -> bool {
+     |            ^^^^^^^^^^^^^^^
+...
+1401 |     pub fn alpha_order(&self) -> Vec<(usize, usize)> {
+     |            ^^^^^^^^^^^
+
+warning: fields `resolver`, `unresolved_rows`, and `atlas_pages` are never read
+   --> src/world_objects.rs:339:9
+    |
+337 | pub struct DoneStats {
+    |            --------- fields in this struct
+338 |     pub residency: crate::objects::ResidencyStats,
+339 |     pub resolver: crate::texture_resolution::ResolverStats,
+    |         ^^^^^^^^
+...
+342 |     pub unresolved_rows: usize,
+    |         ^^^^^^^^^^^^^^^
+...
+351 |     pub atlas_pages: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `DoneStats` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: associated function `from_gpu` is never used
+   --> src/world_objects.rs:868:8
+    |
+857 | impl WorldPageMeta {
+    | ------------------ associated function in this implementation
+...
+868 |     fn from_gpu(page: &GpuPage) -> Self {
+    |        ^^^^^^^^
+
+warning: multiple associated items are never used
+    --> src/world_objects.rs:1031:12
+     |
+ 879 | impl GpuPage {
+     | ------------ associated items in this implementation
+...
+1031 |     pub fn draw_selected<'a>(
+     |            ^^^^^^^^^^^^^
+...
+1059 |     pub fn draw_order(pages: &[Self]) -> Vec<(usize, usize)> {
+     |            ^^^^^^^^^^
+...
+1077 |     pub fn draw_commands(pages: &[Self], order: &[(usize, usize)], view: Pass) -> Vec<DrawCmd> {
+     |            ^^^^^^^^^^^^^
+...
+1089 |     pub fn world_commands(pages: &[Self]) -> [Vec<DrawCmd>; WORLD_VIEWS] {
+     |            ^^^^^^^^^^^^^^
+...
+1107 |     pub fn draw_world<'a>(
+     |            ^^^^^^^^^^
+...
+1126 |     pub fn world_culled_commands(pages: &[Self]) -> [WorldDrawList; WORLD_VIEWS] {
+     |            ^^^^^^^^^^^^^^^^^^^^^
+...
+1250 |     pub fn draw_ordered<'a>(
+     |            ^^^^^^^^^^^^
+...
+1260 |     pub fn shares_atlas_with(&self, other: &Self) -> bool {
+     |            ^^^^^^^^^^^^^^^^^
+...
+1263 |     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, reflected: bool) {
+     |            ^^^^
+
+warning: function `run` is never used
+   --> src/viewer.rs:491:8
+    |
+491 | pub fn run(t: &mut Terrain) -> Result<(), String> {
+    |        ^^^
+
+warning: static variable `SRC_dxt1256x256` should have an upper case name
+   --> src/dxt.rs:376:12
+    |
+376 |     static SRC_dxt1256x256: [u8; 32768] = [
+    |            ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(non_upper_case_globals)]` (part of `#[warn(nonstandard_style)]`) on by default
+help: convert the identifier to upper case
+    |
+376 -     static SRC_dxt1256x256: [u8; 32768] = [
+376 +     static SRC_DXT1256X256: [u8; 32768] = [
+    |
+
+warning: static variable `SRC_dxt1512x512` should have an upper case name
+    --> src/dxt.rs:2564:12
+     |
+2564 |     static SRC_dxt1512x512: [u8; 131072] = [
+     |            ^^^^^^^^^^^^^^^
+     |
+help: convert the identifier to upper case
+     |
+2564 -     static SRC_dxt1512x512: [u8; 131072] = [
+2564 +     static SRC_DXT1512X512: [u8; 131072] = [
+     |
+
+warning: static variable `SRC_dxt3256x256` should have an upper case name
+     --> src/dxt.rs:11306:12
+      |
+11306 |     static SRC_dxt3256x256: [u8; 65536] = [
+      |            ^^^^^^^^^^^^^^^
+      |
+help: convert the identifier to upper case
+      |
+11306 -     static SRC_dxt3256x256: [u8; 65536] = [
+11306 +     static SRC_DXT3256X256: [u8; 65536] = [
+      |
+
+warning: static variable `SRC_dxt3512x512` should have an upper case name
+     --> src/dxt.rs:15679:12
+      |
+15679 |     static SRC_dxt3512x512: [u8; 262144] = [
+      |            ^^^^^^^^^^^^^^^
+      |
+help: convert the identifier to upper case
+      |
+15679 -     static SRC_dxt3512x512: [u8; 262144] = [
+15679 +     static SRC_DXT3512X512: [u8; 262144] = [
+      |
+
+warning: static variable `SRC_dxt3256x512` should have an upper case name
+     --> src/dxt.rs:33159:12
+      |
+33159 |     static SRC_dxt3256x512: [u8; 131072] = [
+      |            ^^^^^^^^^^^^^^^
+      |
+help: convert the identifier to upper case
+      |
+33159 -     static SRC_dxt3256x512: [u8; 131072] = [
+33159 +     static SRC_DXT3256X512: [u8; 131072] = [
+      |
+
+warning: static variable `SRC_dxt31024x1024` should have an upper case name
+     --> src/dxt.rs:41901:12
+      |
+41901 |     static SRC_dxt31024x1024: [u8; 1048576] = [
+      |            ^^^^^^^^^^^^^^^^^
+      |
+help: convert the identifier to upper case
+      |
+41901 -     static SRC_dxt31024x1024: [u8; 1048576] = [
+41901 +     static SRC_DXT31024X1024: [u8; 1048576] = [
+      |
+
+warning: `forsaken-world-explorer` (bin "forsaken-world-explorer" test) generated 137 warnings (run `cargo fix --bin "forsaken-world-explorer" -p forsaken-world-explorer --tests` to apply 26 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 08s
+     Running unittests src/main.rs (target/debug/build/forsaken-world-explorer/63e0b275e7daa5c1/out/forsaken_world_explorer-63e0b275e7daa5c1)
+
+running 9 tests
+blood-bream strip quad after the UV law: uv=[(0.000,1.000),(0.000,0.000),(0.033,0.000),(0.033,1.000)] pair_width=0.140 (the live log's before: uv=[(0,0),(1,0),(0.033,1),(1.033,1)] at half the width)
+test gfx_player::tests::the_shipped_lightning_strips_run_u_along_their_length ... ok
+test gfx_player::tests::the_shipped_portal_gate_is_a_warp_element ... ok
+garbage-scale root gfx/怪物/宠物通用/大龙虾_水波.gfx: 7 keypoints, widest keypoint scale 1.000, largest clamped ramp stop 0.000, largest generation-sequence scale 0e0, 1745 cards, widest edge 2.143
+::warning::gfx/人物/技能/刺客/回光返照_落光环.gfx is not in this gfx.pck build; the §6.2 checks are skipped for it
+::warning::gfx/人物/技能/刺客/回光返照_左手.gfx is not in this gfx.pck build; the §6.2 checks are skipped for it
+garbage-scale root gfx/怪物/技能/变异沼泽鸟_技能.gfx: 7 keypoints, widest keypoint scale 1.000, largest clamped ramp stop 0.000, largest generation-sequence scale 0e0, 1768 cards, widest edge 282.843
+garbage-scale root gfx/怪物/宠物通用/麋鹿左角.gfx: 2 keypoints, widest keypoint scale 1.000, largest clamped ramp stop 0.000, largest generation-sequence scale 4.1829734e17, 492 cards, widest edge 0.406
+garbage-scale root gfx/怪物/宠物通用/麋鹿右角.gfx: 2 keypoints, widest keypoint scale 1.000, largest clamped ramp stop 0.000, largest generation-sequence scale 4.1829734e17, 492 cards, widest edge 0.406
+test gfx_player::tests::the_roots_with_editor_garbage_scales_draw_with_their_keypoint_scales ... ok
+blood-bream strip quad after the UV law: uv=[(0.000,1.000),(0.000,0.000),(0.033,0.000),(0.033,1.000)] pair_width=0.140 (the live log's before: uv=[(0,0),(1,0),(0.033,1),(1.033,1)] at half the width)
+test gfx_player::tests::the_shipped_lightning_strips_run_u_along_their_length ... ok
+test modules::populator::nameplate::tests::the_shipped_client_archive_names_the_same_overhead_font ... ok
+test modules::populator::nameplate::tests::the_shipped_table_names_the_overhead_font_first ... ok
+test gfx_player::tests::the_shipped_waterfall_scrolls_and_hides_its_warp_veil ... ok
+test gfx_player::tests::the_shipped_waterfall_veil_fractals_scroll_their_sheets ... ok
+test gfx_player::tests::the_shipped_waterfall_sheet_keeps_its_alpha ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1253 filtered out; finished in 1.36s
+
