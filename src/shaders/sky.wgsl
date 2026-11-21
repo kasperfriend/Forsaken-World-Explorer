@@ -1,9 +1,10 @@
-// Forsaken World Explorer — Phase 5 Sky Dome / Gradient Shader
-// Renders a fullscreen time-of-day zenith/horizon gradient with sun/moon disc.
-// Documented approximation until full client surfaces.pck skybox textures are decoded.
+// Forsaken World Explorer — Client A3DSkySphere Shader (Cap + SurroundF + SurroundB)
+// Source: EC_World.cpp:865-888, 1367-1374 and ECBSDFILEBOXAREA15 (+280 sky texture strings).
+// Only invoked when real client sky textures resolve; never draws a procedural gradient fallback.
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
     sun_dir: vec4<f32>,
     fog_color: vec4<f32>,
     fog_params: vec4<f32>,
@@ -15,9 +16,21 @@ struct CameraUniform {
 @group(0) @binding(0)
 var<uniform> cam: CameraUniform;
 
+@group(1) @binding(0)
+var cap_tex: texture_2d<f32>;
+
+@group(1) @binding(1)
+var surr_f_tex: texture_2d<f32>;
+
+@group(1) @binding(2)
+var surr_b_tex: texture_2d<f32>;
+
+@group(1) @binding(3)
+var sky_sampler: sampler;
+
 struct SkyOut {
     @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
+    @location(0) ndc: vec2<f32>,
 };
 
 @vertex
@@ -30,25 +43,35 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> SkyOut {
     let p = positions[vid];
     var out: SkyOut;
     out.pos = vec4<f32>(p, 0.9999, 1.0);
-    out.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    out.ndc = p;
     return out;
 }
 
 @fragment
 fn fs_main(in: SkyOut) -> @location(0) vec4<f32> {
-    // Vertical gradient: uv.y = 0 is top of screen (zenith), uv.y = 1 is bottom (horizon)
-    let t = clamp(1.0 - in.uv.y, 0.0, 1.0);
-    let curve = pow(t, 0.65);
-    var col = mix(cam.sky_horizon.rgb, cam.sky_zenith.rgb, curve);
+    let near_p = cam.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
+    let far_p = cam.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    let dir = normalize(far_p.xyz / far_p.w - near_p.xyz / near_p.w);
 
-    // Subtle sun/moon glow near upper-center sky
-    let sun_uv = vec2<f32>(0.5 + cam.sun_dir.x * 0.25, clamp(0.42 - cam.sun_dir.y * 0.35, 0.08, 0.75));
-    let d = length(in.uv - sun_uv);
-    let disc = smoothstep(0.055, 0.015, d);
-    let halo = smoothstep(0.22, 0.02, d) * 0.25;
-    col = mix(col, cam.sun_color.rgb, clamp(disc + halo, 0.0, 1.0));
+    let pi = 3.14159265;
+    let elev = asin(clamp(dir.y, -1.0, 1.0));
+    let v_surr = clamp(1.0 - elev / (pi * 0.42), 0.0, 1.0);
 
-    // Underwater tint when camera is below water surface
+    var surr_col: vec3<f32>;
+    if (dir.z >= 0.0) {
+        let u_f = clamp(atan2(dir.z, dir.x) / pi, 0.0, 1.0);
+        surr_col = textureSample(surr_f_tex, sky_sampler, vec2<f32>(u_f, v_surr)).rgb;
+    } else {
+        let u_b = clamp(atan2(-dir.z, -dir.x) / pi, 0.0, 1.0);
+        surr_col = textureSample(surr_b_tex, sky_sampler, vec2<f32>(u_b, v_surr)).rgb;
+    }
+
+    let cap_uv = dir.xz / max(dir.y + 0.65, 0.35) * 0.45 + vec2<f32>(0.5, 0.5);
+    let cap_col = textureSample(cap_tex, sky_sampler, cap_uv).rgb;
+
+    let cap_blend = smoothstep(0.28, 0.46, dir.y);
+    var col = mix(surr_col, cap_col, cap_blend);
+
     if (cam.fog_params.w > 0.5) {
         col = mix(col, cam.fog_color.rgb, 0.65);
     }

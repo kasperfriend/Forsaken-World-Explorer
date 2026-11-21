@@ -4,9 +4,10 @@ An experimental, GPU-based, free-flight viewer for a **user-owned Forsaken World
 
 > **Current status (honest assessment):** No rendered feature is marked working until confirmed visually by the user in the Windows artifact on real client files.
 > - **Terrain layer textures:** `decoder verified on real data (dump: dump-s0.txt)` (5/5 `s0` DDS DXT3 layers decoded).
-> - **Terrain rendering:** `not working: black output (Task 1)` — fixed `Rgba8UnormSrgb` crushing and double-lighting in `terrain.wgsl`; added `--export-terrain-pngs` for visual/numeric verification.
-> - **Buildings (`.bmd`):** `not working: v0x10000006 layout unknown (Task 2)` — `sample_litmodel_1000.bmd` (45,318/45,318 B) traced via `--bmd-trace` and decoded; awaiting user visual check and additional samples.
-> - **Counters:** `fixed in this round, pending user check`.
+> - **Buildings & Trees (`s0`):** `working (user confirmed)` (`1,884/1,884` `A3DLitMesh 0x10000006` buildings and SpeedTree trees confirmed by user).
+> - **Sky (`A3DSkySphere`):** `not working` — decoded `ECBSDFILEBOXAREA15` sky paths (`EC_World.cpp:865-888`) and wired BMP/DDS sky sphere; draws nothing if textures are missing.
+> - **Ground detail:** `not working` — upgraded to real multi-layer GPU shader splatting (`512x512` mipmapped `texture_2d_array`, `t2mk` `scale_u`, trilinear + 16× aniso); awaiting user visual check.
+> - **Lag & Counters:** `not working` — added persistent GPU texture cache, background `.bmd`/DDS worker thread, per-stage avg/max frame timings, and `drawn <= loaded` reason breakdown; awaiting user check on `s0` and `s40`.
 > - See [Findings/Status.md](Findings/Status.md) for the full table.
 >
 > **No fake worlds in the default path:** The approximate sky gradient and the synthetic preview scene are **not** game worlds and have been removed from the default path.
@@ -53,6 +54,12 @@ All diagnostic and export commands are built into `forsaken-world-explorer.exe` 
 
 # Byte-level .bmd field trace (with optional --client to check texture resolution)
 .\forsaken-world-explorer.exe --bmd-trace sample_litmodel_1000.bmd --client "C:\Path\To\Forsaken World"
+
+# List entries in a .pck archive matching a substring (e.g. sky entries in surfaces.pck)
+.\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --list-entries surfaces.pck --filter sky --out reports\sky_entries.txt
+
+# Run 60-frame CPU flight benchmark with per-stage avg/max timings
+.\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --bench-flight s0
 
 # Extract a single entry from a client .pck archive
 .\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --extract-entry litmodels.pck "s0/1/litmodel_1000.bmd" --out sample_litmodel_1000.bmd

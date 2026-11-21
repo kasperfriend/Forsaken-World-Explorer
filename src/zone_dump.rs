@@ -993,6 +993,12 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
                     );
                     let _ = writeln!(
                         out,
+                        "  GPU Terrain Splatting: layers={} (full 2x2 box-filter mip chain), sampler=Linear/Linear/MipLinear Repeat anisotropy=16, t2mk_scales={:?}",
+                        session.splat.layers.len(),
+                        &session.splat.scales[..session.splat.layers.len().min(8)]
+                    );
+                    let _ = writeln!(
+                        out,
                         "  Composited layer textures bound: {}/{} real DDS layers (failed={}, {} bytes) | terrain draw_calls={draw_calls}{}",
                         session.terrain_layers_loaded,
                         session.terrain_layers_loaded + session.terrain_layers_failed,
@@ -1003,6 +1009,11 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
                         } else {
                             ""
                         }
+                    );
+                    let _ = writeln!(
+                        out,
+                        "  Sky (A3DSkySphere from ECBSDFILEBOXAREA15): {}",
+                        session.sky.status_note
                     );
                 }
                 Err(err) => {
@@ -1700,6 +1711,38 @@ pub fn export_terrain_pngs(
     for (li, m_img) in layer_masks.iter().enumerate() {
         save_and_stat(&format!("mask_layer_{li}.png"), full_side, full_side, m_img)?;
     }
+    for (li, lt) in layer_textures.iter().enumerate() {
+        if let Some((tw, th, rgba)) = lt {
+            save_and_stat(&format!("layer_{li}_raw.png"), *tw, *th, rgba)?;
+        }
+    }
+    let _ = writeln!(
+        report,
+        "\nFixed world-point weight & composited RGB checks:"
+    );
+    for &(wx, wz) in &[
+        (-480.0f32, 480.0f32),
+        (-160.0f32, 160.0f32),
+        (32.0f32, -32.0f32),
+    ] {
+        let u = ((wx + trn2.width * 0.5) / trn2.width).clamp(0.0, 0.9999);
+        let v = ((trn2.length * 0.5 - wz) / trn2.length).clamp(0.0, 0.9999);
+        let px = ((u * (full_side as f32)) as usize).min(full_side as usize - 1);
+        let py = ((v * (full_side as f32)) as usize).min(full_side as usize - 1);
+        let o = (py * (full_side as usize) + px) * 4;
+        let w_strs: Vec<String> = layer_masks
+            .iter()
+            .enumerate()
+            .map(|(li, m)| format!("L{li}={}/255", m[o]))
+            .collect();
+        let _ = writeln!(
+            report,
+            "  world=({wx:.1}, {wz:.1}) uv=({u:.3}, {v:.3}) | weights=[{}] | diffuse_rgb=({}, {}, {}) | lit_unscaled_rgb=({}, {}, {})",
+            w_strs.join(", "),
+            diffuse[o], diffuse[o + 1], diffuse[o + 2],
+            lit_unscaled[o], lit_unscaled[o + 1], lit_unscaled[o + 2]
+        );
+    }
 
     let _ = writeln!(
         report,
@@ -1772,6 +1815,122 @@ pub fn bmd_trace_file(file_path: &Path, client_root: Option<&Path>) -> Result<St
             Err(trace)
         }
     }
+}
+
+/// CLI helper: `--list-entries <archive.pck> [--filter <substring>]`
+pub fn list_archive_entries(
+    client_root: &Path,
+    archive_name: &str,
+    filter: Option<&str>,
+) -> Result<String, String> {
+    let (arch, _) = open_named_archive(client_root, archive_name)?;
+    let filter_low = filter.map(|f| f.to_ascii_lowercase());
+    let mut out = String::new();
+    let mut matched = 0usize;
+    let total = arch.info().entry_count;
+    let _ = writeln!(
+        out,
+        "=== PCK Entry Listing: {archive_name} (total={total}, filter={:?}) ===",
+        filter.unwrap_or("*")
+    );
+    for entry in arch.entries() {
+        let keep = match &filter_low {
+            Some(f) => entry.name.to_ascii_lowercase().contains(f),
+            None => true,
+        };
+        if keep {
+            let _ = writeln!(out, "  {} ({} B)", entry.name, entry.size);
+            matched += 1;
+        }
+    }
+    let _ = writeln!(out, "Matched {matched} / {total} entries.");
+    Ok(out)
+}
+
+/// CLI helper: `--bench-flight <zone>` — runs a deterministic 60-frame flight path over a zone
+/// and reports per-stage avg & max CPU timings (ms) and the top 3 stages by time.
+pub fn bench_flight(client_root: &Path, zone: &str) -> Result<String, String> {
+    use std::time::Instant;
+    let temp_cache =
+        std::env::temp_dir().join(format!("fwe-bench-{}-{}", zone, std::process::id()));
+    let _ = fs::remove_dir_all(&temp_cache);
+    let mut session = crate::terrain_gpu::TerrainSession::open_zone(
+        client_root,
+        zone,
+        &temp_cache,
+        64 * 1024 * 1024,
+    )?;
+    let zone_dir = client_root.join("maps").join(zone);
+    let placements = fs::read(zone_dir.join(format!("{zone}.ecwld")))
+        .ok()
+        .and_then(|wb| {
+            fs::read(zone_dir.join(format!("{zone}.ecbsd")))
+                .ok()
+                .and_then(|bb| world_objects::parse_ecwld_ecbsd_ornaments(&wb, &bb).ok())
+        })
+        .map(|(_, _, p)| p)
+        .unwrap_or_default();
+
+    let mut terrain_stat = crate::scenery::StageTimingStat::default();
+    let mut vis_stat = crate::scenery::StageTimingStat::default();
+    let mut dedup_stat = crate::scenery::StageTimingStat::default();
+    let mut total_stat = crate::scenery::StageTimingStat::default();
+
+    let h0 = session.sample_height(0.0, 0.0).unwrap_or(140.0);
+    for frame in 0..60usize {
+        let t_all = Instant::now();
+        let angle = (frame as f32) * 0.1;
+        let cam = glam::Vec3::new(angle.cos() * 180.0, h0 + 35.0, angle.sin() * 180.0);
+
+        let t0 = Instant::now();
+        let _ = session.update_for_camera(cam, 4);
+        terrain_stat.record(t0.elapsed().as_secs_f32() * 1000.0);
+
+        let t1 = Instant::now();
+        let vis = crate::scenery::select_visible_placements(&placements, cam, 300.0, 2000, false);
+        vis_stat.record(t1.elapsed().as_secs_f32() * 1000.0);
+
+        let t2 = Instant::now();
+        let _dedup = crate::scenery::dedup_instances_by_model(&vis);
+        dedup_stat.record(t2.elapsed().as_secs_f32() * 1000.0);
+
+        total_stat.record(t_all.elapsed().as_secs_f32() * 1000.0);
+    }
+    let _ = fs::remove_dir_all(&temp_cache);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "=== 60-Frame Flight Benchmark ({zone}, placements={}) ===",
+        placements.len()
+    );
+    let _ = writeln!(out, "| Stage | Avg (ms) | Max (ms) |");
+    let _ = writeln!(out, "| --- | ---: | ---: |");
+    let _ = writeln!(
+        out,
+        "| terrain_streaming | {:.3} | {:.3} |",
+        terrain_stat.avg_ms(),
+        terrain_stat.max_ms
+    );
+    let _ = writeln!(
+        out,
+        "| scenery_visibility | {:.3} | {:.3} |",
+        vis_stat.avg_ms(),
+        vis_stat.max_ms
+    );
+    let _ = writeln!(
+        out,
+        "| scenery_dedup | {:.3} | {:.3} |",
+        dedup_stat.avg_ms(),
+        dedup_stat.max_ms
+    );
+    let _ = writeln!(
+        out,
+        "| total_cpu_step | {:.3} | {:.3} |",
+        total_stat.avg_ms(),
+        total_stat.max_ms
+    );
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -19,6 +19,8 @@ fn print_help() {
          \t--export-texture-png <ARCHIVE> <ENTRY> --out <PNG>   Decode a DDS entry from a .pck archive and save as PNG\n\
          \t--export-terrain-pngs <ZONE> --out-dir <DIR>         Export diffuse, lightmaps, lit output & layer masks as PNGs + stats\n\
          \t--bmd-trace <FILE> [--client <PATH>]                 Trace every byte/field of a .bmd file and verify texture resolution\n\
+         \t--list-entries <ARCHIVE.pck> [--filter <SUBSTR>]     List matching entries in a client .pck archive\n\
+         \t--bench-flight <ZONE>                                Run a 60-frame flight benchmark and print per-stage avg/max ms\n\
          \t--client <PATH>                                      Client root folder (defaults to FW_CLIENT_DIR)\n\
          \t--out <PATH>                                         Output file path for dump/export commands\n\
          \t--self-test                                          Run CPU-only self-checks and exit\n\
@@ -58,6 +60,50 @@ fn main() -> ExitCode {
     if args.iter().any(|arg| arg == "-V" || arg == "--version") {
         println!("forsaken-world-explorer {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+
+    if let Some(archive) = arg_value(&args, "--list-entries") {
+        let client_root = match resolve_client_root(&args, "--list-entries") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let filter = arg_value(&args, "--filter");
+        return match zone_dump::list_archive_entries(&client_root, &archive, filter.as_deref()) {
+            Ok(listing) => {
+                print!("{listing}");
+                if let Some(out_path) = arg_value(&args, "--out") {
+                    let _ = fs::write(&out_path, &listing);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(zone) = arg_value(&args, "--bench-flight") {
+        let client_root = match resolve_client_root(&args, "--bench-flight") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match zone_dump::bench_flight(&client_root, &zone) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     if let Some(zone) = arg_value(&args, "--export-terrain-pngs") {

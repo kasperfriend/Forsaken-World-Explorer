@@ -174,6 +174,13 @@ pub struct BoxAreaAtmosphere {
     pub day_dir_light: u32,
     pub night_ambient: u32,
     pub night_dir_light: u32,
+    /// Verified from `EC_WorldFile.h` (`ECBSDFILEBOXAREA15` +272, +276) and real `s0.ecbsd`.
+    pub cap_tile_speed: f32,
+    pub cap_rot_speed: f32,
+    /// 3 `A3DSkySphere` day textures (`Cap`, `SurroundF`, `SurroundB`) at +280 in `s0.ecbsd`.
+    pub day_sky_textures: [String; 3],
+    /// 3 `A3DSkySphere` night textures (`Cap`, `SurroundF`, `SurroundB`) following day textures.
+    pub night_sky_textures: [String; 3],
 }
 
 impl Default for BoxAreaAtmosphere {
@@ -200,6 +207,10 @@ impl Default for BoxAreaAtmosphere {
             day_dir_light: 0xfffebe78,
             night_ambient: 0xff222a3e,
             night_dir_light: 0xff5a6f9a,
+            cap_tile_speed: 8.0,
+            cap_rot_speed: 0.0,
+            day_sky_textures: [String::new(), String::new(), String::new()],
+            night_sky_textures: [String::new(), String::new(), String::new()],
         }
     }
 }
@@ -473,6 +484,52 @@ pub fn parse_ecwld_ecbsd_atmosphere_and_water(
                     day_dir_light,
                     night_ambient,
                     night_dir_light,
+                    cap_tile_speed: f32le(bsd, bsd_off + 272).unwrap_or(8.0),
+                    cap_rot_speed: f32le(bsd, bsd_off + 276).unwrap_or(0.0),
+                    day_sky_textures: {
+                        let mut p_str = bsd_off + 280;
+                        let mut read_str = || -> String {
+                            if let Ok(slen) = u32le(bsd, p_str) {
+                                let sl = slen as usize;
+                                p_str += 4;
+                                if sl <= 512 && p_str + sl <= bsd.len() {
+                                    let (dec, _, _) =
+                                        encoding_rs::GB18030.decode(&bsd[p_str..p_str + sl]);
+                                    p_str += sl;
+                                    return dec.into_owned();
+                                }
+                            }
+                            String::new()
+                        };
+                        [read_str(), read_str(), read_str()]
+                    },
+                    night_sky_textures: {
+                        let mut p_str = bsd_off + 280;
+                        for _ in 0..3 {
+                            if let Ok(slen) = u32le(bsd, p_str) {
+                                let sl = slen as usize;
+                                if sl <= 512 && p_str + 4 + sl <= bsd.len() {
+                                    p_str += 4 + sl;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        let mut read_str = || -> String {
+                            if let Ok(slen) = u32le(bsd, p_str) {
+                                let sl = slen as usize;
+                                p_str += 4;
+                                if sl <= 512 && p_str + sl <= bsd.len() {
+                                    let (dec, _, _) =
+                                        encoding_rs::GB18030.decode(&bsd[p_str..p_str + sl]);
+                                    p_str += sl;
+                                    return dec.into_owned();
+                                }
+                            }
+                            String::new()
+                        };
+                        [read_str(), read_str(), read_str()]
+                    },
                 });
             }
         }
