@@ -2,9 +2,13 @@
 
 An experimental, GPU-based, free-flight viewer for a **user-owned Forsaken World client**. It reads world data from a client you provide; it is not a game client, editor, server, or gameplay implementation.
 
-> **Current status (honest assessment):** No rendered feature is marked `working on real data` yet until confirmed visually by the user in the Windows artifact on real client files. Earlier synthetic CI checks and Mesa `lavapipe` smoke tests only prove that shaders and pipelines run on synthetic fixtures — they are not evidence that the game world renders correctly. See [Findings/Status.md](Findings/Status.md) for the exact per-feature status.
+> **Current status (honest assessment):** No rendered feature is marked working until confirmed visually by the user in the Windows artifact on real client files.
+> - **Terrain layer textures:** `decoder verified on real data (dump: dump-s0.txt)` (5/5 `s0` DDS DXT3 layers decoded).
+> - **Terrain rendering (grey terrain):** `not working: cause under investigation (Task 3)` — fixes for polar normals (`login_1.t2bk`), GPU texture re-upload on zone switch, and `terrain.wgsl` washout are awaiting visual confirmation on `s0`.
+> - **Buildings (`.bmd`):** `blocked: version 0x10000006 unsupported (1884/1884 s0 models)` (Phase 4 claim retracted; awaiting `sample_litmodel_1000.bmd` + hexdump from user).
+> - See [Findings/Status.md](Findings/Status.md) for the full table.
 >
-> **No fake worlds in the default path:** The approximate sky gradient and the synthetic preview scene are **not** game worlds. They have been removed from the default path (the synthetic pipeline test scene is hidden behind a Developer checkbox, off by default). Missing features (skyboxes, effects, map tiles, teleport destinations, audio) are reported explicitly as `missing` or `not started`.
+> **No fake worlds in the default path:** The approximate sky gradient and the synthetic preview scene are **not** game worlds and have been removed from the default path.
 
 ## Controls (matching Perfect World Explorer)
 
@@ -32,15 +36,28 @@ An experimental, GPU-based, free-flight viewer for a **user-owned Forsaken World
      THIRD_PARTY_NOTICES.md
      SHA256SUMS.txt
    ```
-2. Run `forsaken-world-explorer.exe`, click **Browse…** to select your Forsaken World client folder (containing `update/` and `resources/`), pick a zone (`s0` by default), and click **Load World**.
+2. Run `forsaken-world-explorer.exe`, click **Browse…** to select your Forsaken World client folder (containing `update/` and `resources/`), confirm the default zone `s0` is selected, and click **Load World**. The active zone name is shown in the window title and at the top of the Diagnostics panel.
 3. Settings, per-run logs, and derived caches are stored beside `forsaken-world-explorer.exe` under `settings/`, `logs/`, and `cache/`. Your client folder is never modified.
 
-## Verifying Real Client Decoding (`--dump-zone`)
+## Diagnostic Dump & Small-Sample Export Tools
 
-To inspect exactly what the viewer's readers decode from your client files stage-by-stage (terrain heights, texture dimensions, placement counts, `.bmd` submeshes, vegetation, and missing systems):
+All diagnostic and export commands are built into `forsaken-world-explorer.exe` and produce small outputs (< 1 MB):
 
 ```powershell
+# Full stage-by-stage zone dump (including first-block terrain bindings & streamed block count)
 .\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --dump-zone s0 --out reports\dump-s0.txt
+
+# Extract a single entry from a client .pck archive
+.\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --extract-entry litmodels.pck "s0/1/litmodel_1000.bmd" --out sample_litmodel_1000.bmd
+
+# Write a hex + ASCII dump of the first N bytes of any extracted file
+.\forsaken-world-explorer.exe --hexdump sample_litmodel_1000.bmd --bytes 256 --out sample_litmodel_1000_hex.txt
+
+# Export decoded terrain block header and first 16 height values
+.\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --export-terrain-block s0 0 0 --out s0_block_0_0.txt
+
+# Decode a DDS texture entry from a .pck archive and save as PNG
+.\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --export-texture-png textures.pck "<entry path>" --out layer0.png
 ```
 
 Additional development survey tools (not shipped in the Windows ZIP):

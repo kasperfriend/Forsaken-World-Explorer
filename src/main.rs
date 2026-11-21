@@ -12,19 +12,39 @@ fn print_help() {
          \tforsaken-world-explorer [OPTIONS]\n\
          \n\
          OPTIONS:\n\
-         \t--dump-zone <ZONE>  Decode a real client zone stage-by-stage and print/write counts and samples\n\
-         \t--client <PATH>     Client root folder for --dump-zone (defaults to FW_CLIENT_DIR)\n\
-         \t--out <PATH>        Optional output file path for --dump-zone report\n\
-         \t--self-test         Run CPU-only self-checks and exit\n\
-         \t--smoke-launch      Initialize app state and render every UI page headlessly without a GPU\n\
-         \t-V, --version       Print version information\n\
-         \t-h, --help          Print this help message",
+         \t--dump-zone <ZONE>                                   Decode a real client zone stage-by-stage and write counts/bindings\n\
+         \t--extract-entry <ARCHIVE.pck> <ENTRY> --out <FILE>   Extract a single entry from a client .pck archive\n\
+         \t--hexdump <FILE> [--bytes N] --out <FILE.txt>        Write a hex + ASCII dump of the first N bytes (default 256)\n\
+         \t--export-terrain-block <ZONE> <BX> <BZ> --out <FILE> Export decoded terrain block header and first 16 heights\n\
+         \t--export-texture-png <ARCHIVE> <ENTRY> --out <PNG>   Decode a DDS entry from a .pck archive and save as PNG\n\
+         \t--client <PATH>                                      Client root folder (defaults to FW_CLIENT_DIR)\n\
+         \t--out <PATH>                                         Output file path for dump/export commands\n\
+         \t--self-test                                          Run CPU-only self-checks and exit\n\
+         \t--smoke-launch                                       Initialize app state and render every UI page headlessly\n\
+         \t-V, --version                                        Print version information\n\
+         \t-h, --help                                           Print this help message",
         env!("CARGO_PKG_VERSION")
     );
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+fn arg_values_n(args: &[String], flag: &str, n: usize) -> Option<Vec<String>> {
+    let idx = args.iter().position(|a| a == flag)?;
+    if idx + n < args.len() {
+        Some(args[idx + 1..=idx + n].to_vec())
+    } else {
+        None
+    }
+}
+
+fn resolve_client_root(args: &[String], cmd: &str) -> Result<PathBuf, String> {
+    arg_value(args, "--client")
+        .or_else(|| env::var("FW_CLIENT_DIR").ok())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{cmd} requires --client <PATH> or FW_CLIENT_DIR"))
 }
 
 fn main() -> ExitCode {
@@ -37,13 +57,130 @@ fn main() -> ExitCode {
         println!("forsaken-world-explorer {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    if let Some(zone) = arg_value(&args, "--dump-zone") {
-        let client_root = arg_value(&args, "--client")
-            .or_else(|| env::var("FW_CLIENT_DIR").ok())
-            .map(PathBuf::from);
-        let Some(client_root) = client_root else {
-            eprintln!("error: --dump-zone requires --client <PATH> or FW_CLIENT_DIR");
+
+    if let Some(vals) = arg_values_n(&args, "--extract-entry", 2) {
+        let client_root = match resolve_client_root(&args, "--extract-entry") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let Some(out_path) = arg_value(&args, "--out") else {
+            eprintln!("error: --extract-entry requires --out <FILE>");
             return ExitCode::FAILURE;
+        };
+        return match zone_dump::extract_entry(
+            &client_root,
+            &vals[0],
+            &vals[1],
+            &PathBuf::from(out_path),
+        ) {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(file_arg) = arg_value(&args, "--hexdump") {
+        let max_bytes: usize = arg_value(&args, "--bytes")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
+        let Some(out_path) = arg_value(&args, "--out") else {
+            eprintln!("error: --hexdump requires --out <FILE.txt>");
+            return ExitCode::FAILURE;
+        };
+        return match zone_dump::hexdump_file(
+            &PathBuf::from(file_arg),
+            max_bytes,
+            &PathBuf::from(out_path),
+        ) {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(vals) = arg_values_n(&args, "--export-terrain-block", 3) {
+        let client_root = match resolve_client_root(&args, "--export-terrain-block") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let Some(out_path) = arg_value(&args, "--out") else {
+            eprintln!("error: --export-terrain-block requires --out <FILE.txt>");
+            return ExitCode::FAILURE;
+        };
+        let (Ok(bx), Ok(bz)) = (vals[1].parse::<u32>(), vals[2].parse::<u32>()) else {
+            eprintln!("error: block_x and block_z must be non-negative integers");
+            return ExitCode::FAILURE;
+        };
+        return match zone_dump::export_terrain_block(
+            &client_root,
+            &vals[0],
+            bx,
+            bz,
+            &PathBuf::from(out_path),
+        ) {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(vals) = arg_values_n(&args, "--export-texture-png", 2) {
+        let client_root = match resolve_client_root(&args, "--export-texture-png") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let Some(out_path) = arg_value(&args, "--out") else {
+            eprintln!("error: --export-texture-png requires --out <FILE.png>");
+            return ExitCode::FAILURE;
+        };
+        return match zone_dump::export_texture_png(
+            &client_root,
+            &vals[0],
+            &vals[1],
+            &PathBuf::from(out_path),
+        ) {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(zone) = arg_value(&args, "--dump-zone") {
+        let client_root = match resolve_client_root(&args, "--dump-zone") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
         };
         let summary = zone_dump::dump_zone(&client_root, &zone);
         print!("{}", summary.report_text);

@@ -8,9 +8,18 @@
 
 use std::{
     env, fs,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_TERRAIN_TEX_REV: AtomicU64 = AtomicU64::new(1);
+
+fn next_terrain_tex_revision() -> u64 {
+    NEXT_TERRAIN_TEX_REV.fetch_add(1, Ordering::Relaxed)
+}
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -1640,7 +1649,7 @@ fn build_real_zone_terrain_textures(
             width: 1,
             height: 1,
             rgba: vec![0, 0, 0, 0],
-            revision: 1,
+            revision: next_terrain_tex_revision(),
         };
         return (
             empty.clone(),
@@ -1771,7 +1780,7 @@ fn build_real_zone_terrain_textures(
             width: full_side,
             height: full_side,
             rgba,
-            revision: 1,
+            revision: next_terrain_tex_revision(),
         }
     };
 
@@ -1867,13 +1876,13 @@ impl TerrainSession {
             width: surf.width,
             height: surf.height,
             rgba: rgba.clone(),
-            revision: 1,
+            revision: next_terrain_tex_revision(),
         };
         let night_lightmap = TerrainTextureSnapshot {
             width: surf.width,
             height: surf.height,
             rgba: rgba.iter().map(|&b| b / 2).collect(),
-            revision: 1,
+            revision: next_terrain_tex_revision(),
         };
 
         Ok(Self {
@@ -1973,9 +1982,10 @@ impl TerrainSession {
             let cache_id = format!("{}-b{block_idx}-g{}", self.zone_name, self.block_grid);
             let content_key = TerrainStore::content_key(cache_id.as_bytes());
             let page = self.store.get_or_insert_with(&content_key, || {
-                let decoded =
-                    self.t2bk
-                        .decode_block(&self.t2bk_bytes, block_idx, self.block_grid)?;
+                let decoded = self
+                    .t2bk
+                    .decode_block(&self.t2bk_bytes, block_idx, self.block_grid)
+                    .map_err(|e| format!("{}_1.t2bk: {e}", self.zone_name))?;
                 Ok(TerrainPage {
                     heights: decoded.heights,
                     normals: decoded.normals,

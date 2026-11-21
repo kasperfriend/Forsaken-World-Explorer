@@ -923,7 +923,13 @@ impl ExplorerApp {
         let selected_zone = detected_client
             .as_ref()
             .and_then(|r| r.as_ref().ok())
-            .and_then(|c| c.zones.first().cloned())
+            .and_then(|c| {
+                if c.zones.iter().any(|z| z == "s0") {
+                    Some("s0".to_string())
+                } else {
+                    c.zones.first().cloned()
+                }
+            })
             .unwrap_or_else(|| "s0".to_string());
         let modules = Registry::discover(Registry::default_root());
         let default_diag = SceneryDiagnostics {
@@ -993,7 +999,9 @@ impl ExplorerApp {
         self.settings.client_dir = Some(folder.clone());
         let result = client_detect::detect(&folder);
         if let Ok(client) = &result {
-            if let Some(first_zone) = client.zones.first() {
+            if client.zones.iter().any(|z| z == "s0") {
+                self.selected_zone = "s0".to_string();
+            } else if let Some(first_zone) = client.zones.first() {
                 self.selected_zone = first_zone.clone();
             }
         }
@@ -1059,10 +1067,12 @@ impl ExplorerApp {
         let hot_bytes = (self.settings.terrain_ram_mib as usize) * 1024 * 1024;
         let tex_budget_bytes = (self.settings.tex_budget_mib as usize) * 1024 * 1024;
         let zone = self.selected_zone.clone();
+        let archive_names = client.pck_archives.clone();
         if let Some(log) = self.logger.as_mut() {
             log.info(&format!(
-                "=== Load World: zone '{zone}' from {} ===",
-                client.root.display()
+                "=== Load World: zone '{zone}' | client_root={} | archives_searched=[{}] ===",
+                client.root.display(),
+                archive_names.join(", ")
             ));
         }
         // Stage 1: Terrain blocks, real layer textures/masks, and lightmaps
@@ -1177,8 +1187,41 @@ impl ExplorerApp {
                     "Loaded zone '{}' ({}x{} blocks, height(0,0)={origin_h:.1}m, {})",
                     session.zone_name, session.block_rows, session.block_cols, scenery_note
                 );
+                let reasons_summary = self
+                    .scenery_state
+                    .as_ref()
+                    .map(|st| {
+                        if st.failure_groups.is_empty() {
+                            "none".to_string()
+                        } else {
+                            st.failure_groups
+                                .iter()
+                                .map(|(r, g)| format!("{r}={}", g.count))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+                let bmd_tex_failed = self
+                    .scenery_state
+                    .as_ref()
+                    .map(|st| st.bmd_tex_failed)
+                    .unwrap_or(0);
+                let summary_line = format!(
+                    "[Zone Summary] zone='{}' | placements total={}, loaded={}, drawn={}, failed={} (by_reason: {}) | terrain blocks streamed={} | textures loaded={}, failed={}",
+                    session.zone_name,
+                    self.latest_diag.placements_total,
+                    self.latest_diag.models_loaded,
+                    self.latest_diag.instances_drawn,
+                    self.latest_diag.decode_failures,
+                    reasons_summary,
+                    session.mesh.streamed_blocks,
+                    session.terrain_layers_loaded + self.latest_diag.textures_cached,
+                    session.terrain_layers_failed + bmd_tex_failed
+                );
                 if let Some(log) = self.logger.as_mut() {
                     log.info(&msg);
+                    log.info(&summary_line);
                 }
                 self.status_line = msg;
                 self.terrain_session = Some(session);
@@ -1520,6 +1563,14 @@ impl ExplorerApp {
             .scenery_state
             .as_ref()
             .and_then(|s| s.water_planes.first().map(|w| w.height_y));
+        let active_zone_title = self
+            .terrain_session
+            .as_ref()
+            .map(|s| s.zone_name.as_str())
+            .unwrap_or(self.selected_zone.as_str());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "Forsaken World Explorer — {active_zone_title}"
+        )));
         let is_synthetic = self
             .terrain_session
             .as_ref()
@@ -1662,8 +1713,13 @@ impl ExplorerApp {
             egui::Area::new(egui::Id::new("world_diagnostics_panel"))
                 .fixed_pos(rect.right_bottom() + egui::vec2(-380.0, -240.0))
                 .show(ctx, |ui| {
+                    let active_zone_diag = self
+                        .terrain_session
+                        .as_ref()
+                        .map(|s| s.zone_name.as_str())
+                        .unwrap_or(self.selected_zone.as_str());
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.strong("Diagnostics (1 Hz)");
+                        ui.strong(format!("Diagnostics (1 Hz) — Zone: {active_zone_diag}"));
                         ui.small(format!(
                             "Terrain blocks drawn: {} (streamed={}, {} KiB hot RAM){}",
                             terrain_drawn_blocks,
