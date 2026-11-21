@@ -13,10 +13,10 @@ This document records every Forsaken World client feature, data path, or system 
 
 The following client paths are observed in `Findings/client-inventory.md` but have **no verified parser yet** and therefore remain `not-started`:
 
-1. `resources/*.pck` and `resources/models.pkx` archive headers, entry-table encryption keys, and compression parameters.
-2. `maps/s0`–`maps/s40` terrain (`.trn2`, `.t2bk`, `.t2mk`, `.t2lm`, `.t2lm1`, `.t2hc`), world placement (`.ecwld`, `.ecbsd`, `scenelights.dat`, `region.clt`, `precinct.clt`), and multi-zone layout vs. Perfect World's single `maps/world/`.
-3. Static mesh, animated skeleton/skin, DDS texture, and GFX effect formats inside `building.pck`, `litmodels.pck`, `models.pck`/`models.pkx`, `textures.pck`, `surfaces.pck`, and `gfx.pck`.
-4. `update/speedtreert.dll` exact SpeedTreeRT SDK version and `.spt` asset compatibility (32-bit PE32 confirmed; SDK version and bridge ABI pending Phase 6).
-5. `resources/sfx.pck` internal audio encodings (loose `music/*.ogg` confirmed Ogg Vorbis; `sfx.pck` internals pending Phase 1/7).
-6. `data/elements.data` and `data/task_npc.data` schemas for NPC placements and character templates (pending Phase 8).
+1. `update/pem.exe` SHA-256 fingerprint and PE version metadata (tracked in [#3](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/3)).
+2. `resources/*.pck` and `resources/models.pkx` archive headers, entry-table encryption keys, and compression parameters (tracked in [#4](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/4)).
+3. `maps/s0`–`maps/s40` terrain (`.trn2`, `.t2bk`, `.t2mk`, `.t2lm`, `.t2lm1`, `.t2hc`), world placement (`.ecwld`, `.ecbsd`, `scenelights.dat`, `region.clt`, `precinct.clt`), static meshes, animated skeletons/skins, DDS textures, and GFX effects (tracked in [#5](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/5)).
+4. `update/speedtreert.dll` exact SpeedTreeRT SDK version and `.spt` asset compatibility (32-bit PE32 confirmed; SDK version and bridge ABI tracked in [#6](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/6)).
+5. `resources/sfx.pck` internal audio encodings and zone music mapping (loose `music/*.ogg` confirmed Ogg Vorbis; tracked in [#7](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/7)).
+6. `data/elements.data` and `data/task_npc.data` schemas for NPC placements vs. server-only spawns (tracked in [#8](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/8)).
 7. Launcher artwork (`tools/launcher-art.jpg`): omitted unless copyright/redistribution rights are explicitly confirmed in writing.

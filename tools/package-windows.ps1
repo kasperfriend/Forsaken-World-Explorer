@@ -20,7 +20,7 @@ if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
 }
 foreach ($requiredManifest in @('Walker/module.ini', 'Populator/module.ini')) {
     if (-not (Test-Path -LiteralPath (Join-Path $modulesPath $requiredManifest) -PathType Leaf)) {
-        throw "Required module manifest not found under $modulesPath: $requiredManifest"
+        throw "Required module manifest not found under ${modulesPath}: $requiredManifest"
     }
 }
 
