@@ -1,6 +1,7 @@
 //! Desktop window, menu, native folder picker, portable root layout, live 3D World View
-//! with terrain + instanced `.bmd` static scenery, free-flight camera, resolution scaling,
-//! Settings, 1 Hz Diagnostics panel, and Modules.
+//! with sky, day/night terrain lightmaps, opaque & transparent `.bmd` static scenery,
+//! experimental animated water (reflection/refraction/shoreline/underwater), free-flight
+//! camera, resolution scaling, Settings, 1 Hz Diagnostics panel, and Modules.
 
 use std::{
     fs,
@@ -11,6 +12,7 @@ use std::{
 
 use eframe::{egui, egui_wgpu, wgpu};
 use forsaken_world_explorer::{
+    atmosphere::{self, BoxAreaAtmosphere, WaterPlane},
     bmd,
     camera::{scaled_render_target, CameraInput, FreeCamera},
     client_detect::{self, DetectedClient},
@@ -20,15 +22,16 @@ use forsaken_world_explorer::{
     pck::PckArchive,
     scenery::{self, SceneryDiagnostics, SceneryModelCache},
     settings::{
-        PortablePaths, ViewerSettings, DEFAULT_SCENERY_LOADS_PER_FRAME,
-        DEFAULT_SCENERY_MAX_INSTANCES, DEFAULT_SCENERY_RADIUS_M, DEFAULT_TERRAIN_RAM_MIB,
-        DEFAULT_TEX_BUDGET_MIB, MAX_RESOLUTION_SCALE_PCT, MAX_SCENERY_LOADS_PER_FRAME,
-        MAX_SCENERY_MAX_INSTANCES, MAX_SCENERY_RADIUS_M, MIN_RESOLUTION_SCALE_PCT,
+        PortablePaths, ViewerSettings, WaterQuality, DEFAULT_FOG_DIST_MULT_PCT,
+        DEFAULT_SCENERY_LOADS_PER_FRAME, DEFAULT_SCENERY_MAX_INSTANCES, DEFAULT_SCENERY_RADIUS_M,
+        DEFAULT_TERRAIN_RAM_MIB, DEFAULT_TEX_BUDGET_MIB, MAX_FOG_DIST_MULT_PCT,
+        MAX_RESOLUTION_SCALE_PCT, MAX_SCENERY_LOADS_PER_FRAME, MAX_SCENERY_MAX_INSTANCES,
+        MAX_SCENERY_RADIUS_M, MIN_FOG_DIST_MULT_PCT, MIN_RESOLUTION_SCALE_PCT,
         MIN_SCENERY_LOADS_PER_FRAME, MIN_SCENERY_MAX_INSTANCES, MIN_SCENERY_RADIUS_M,
     },
     terrain_gpu::{
         build_scenery_batches_for_model, CameraUniform, SceneryDrawSnapshot, TerrainMeshSnapshot,
-        TerrainSession, TerrainTextureSnapshot, TerrainViewportRenderer,
+        TerrainSession, TerrainTextureSnapshot, TerrainViewportRenderer, WaterRenderSnapshot,
     },
     tex_cache::{DecodedTexture, TextureCache},
     world_objects::{self, OrnamentPlacement},
@@ -57,8 +60,10 @@ struct TerrainCallback {
     scale_pct: u16,
     uniform: CameraUniform,
     mesh: Arc<TerrainMeshSnapshot>,
-    lightmap: Arc<TerrainTextureSnapshot>,
+    day_lightmap: Arc<TerrainTextureSnapshot>,
+    night_lightmap: Arc<TerrainTextureSnapshot>,
     scenery: Arc<SceneryDrawSnapshot>,
+    water: Arc<WaterRenderSnapshot>,
 }
 
 impl egui_wgpu::CallbackTrait for TerrainCallback {
@@ -81,8 +86,10 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             self.scale_pct,
             &self.uniform,
             &self.mesh,
-            &self.lightmap,
+            &self.day_lightmap,
+            &self.night_lightmap,
             &self.scenery,
+            &self.water,
         )]
     }
 
@@ -101,6 +108,8 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
 struct ActiveSceneryState {
     zone: String,
     placements: Vec<OrnamentPlacement>,
+    box_areas: Vec<BoxAreaAtmosphere>,
+    water_planes: Vec<WaterPlane>,
     model_cache: SceneryModelCache,
     tex_cache: TextureCache,
     bmd_archives: Vec<PckArchive>,
@@ -123,6 +132,28 @@ impl ActiveSceneryState {
             .map_err(|e| format!("failed to read {zone}.ecbsd: {e}"))?;
         let (_, _, placements) =
             world_objects::parse_ecwld_ecbsd_ornaments(&wld_bytes, &bsd_bytes)?;
+        let (_, _, box_areas, _water_refs) =
+            atmosphere::parse_ecwld_ecbsd_atmosphere_and_water(&wld_bytes, &bsd_bytes)
+                .unwrap_or_else(|_| {
+                    (
+                        world_objects::EcwldHeader {
+                            version: 14,
+                            world_width: 1024.0,
+                            world_length: 1024.0,
+                            block_size: 64.0,
+                            block_grid: 32,
+                            num_blocks: 0,
+                            block_rows: 0,
+                            block_cols: 0,
+                        },
+                        world_objects::EcbsdHeader {
+                            version: 15,
+                            sub_terrain_count: 1,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                });
 
         let res_dir = client_root.join("resources");
         let mut bmd_archives = Vec::new();
@@ -149,6 +180,8 @@ impl ActiveSceneryState {
         Ok(Self {
             zone: zone.to_string(),
             placements,
+            box_areas,
+            water_planes: Vec::new(),
             model_cache,
             tex_cache,
             bmd_archives,
@@ -161,34 +194,45 @@ impl ActiveSceneryState {
     fn open_synthetic(cache_root: &Path, tex_budget_bytes: usize) -> Result<Self, String> {
         let model_cache = SceneryModelCache::open(cache_root)?;
         let tex_cache = TextureCache::new(tex_budget_bytes);
-        let raw_bmd = bmd::synthetic::build_bmd_v5_box("textures/synthetic_tower.dds", 8.0, 28.0);
+        let raw_bmd = bmd::synthetic::build_bmd_v4_multi_submesh();
         let placements = vec![
             OrnamentPlacement {
                 export_id: 1,
-                asset_path: "synthetic/tower.bmd".into(),
+                asset_path: "synthetic/pavilion.bmd".into(),
                 position: [96.0, 100.0, 96.0],
                 direction: [0.0, 0.0, 1.0],
                 up: [0.0, 1.0, 0.0],
-                scale: [1.0, 1.0, 1.0],
+                scale: [3.0, 4.0, 3.0],
                 reflect: false,
                 refract: false,
                 optimize: false,
             },
             OrnamentPlacement {
                 export_id: 2,
-                asset_path: "synthetic/tower.bmd".into(),
+                asset_path: "synthetic/pavilion.bmd".into(),
                 position: [152.0, 102.0, 118.0],
                 direction: [1.0, 0.0, 0.0],
                 up: [0.0, 1.0, 0.0],
-                scale: [1.2, 1.0, 1.2],
+                scale: [3.5, 4.0, 3.5],
                 reflect: false,
                 refract: false,
                 optimize: false,
             },
         ];
+        let water_planes = vec![WaterPlane {
+            id: 1,
+            center_x: 128.0,
+            center_z: 128.0,
+            half_x: 72.0,
+            half_z: 72.0,
+            height_y: 108.0,
+            color_rgba: [0.06, 0.54, 0.84, 0.85],
+        }];
         Ok(Self {
             zone: "synthetic-preview".to_string(),
             placements,
+            box_areas: vec![BoxAreaAtmosphere::default()],
+            water_planes,
             model_cache,
             tex_cache,
             bmd_archives: Vec::new(),
@@ -198,14 +242,32 @@ impl ActiveSceneryState {
         })
     }
 
+    fn active_box_area(&self) -> Option<&BoxAreaAtmosphere> {
+        self.box_areas
+            .iter()
+            .find(|b| b.is_default)
+            .or_else(|| self.box_areas.first())
+    }
+
     fn step_frame(
         &mut self,
         camera_pos: glam::Vec3,
+        view_proj: glam::Mat4,
+        vp_w: u32,
+        vp_h: u32,
         settings: &ViewerSettings,
         logger: &mut Option<RunLogger>,
     ) -> (SceneryDrawSnapshot, SceneryDiagnostics) {
         let tex_budget_bytes = (settings.tex_budget_mib as usize) * 1024 * 1024;
         self.tex_cache.set_budget_bytes(tex_budget_bytes);
+
+        let vis_water = atmosphere::visible_water_planes(&self.water_planes, view_proj, vp_w, vp_h);
+        let water_passes = if vis_water.is_empty() {
+            0
+        } else {
+            usize::from(settings.water_reflection) + usize::from(settings.water_refraction)
+        };
+        let world_render_passes = 1 + water_passes;
 
         if !settings.scenery_enabled {
             let tstats = self.tex_cache.stats();
@@ -216,16 +278,22 @@ impl ActiveSceneryState {
                 models_loaded: self.model_cache.loaded_count(),
                 instances_drawn: 0,
                 decode_failures: self.model_cache.failed_count(),
-                deferred_transparent_submeshes: 0,
+                transparent_submeshes_drawn: 0,
+                transparent_submeshes_skipped: 0,
+                approximate_lighting_meshes: 0,
                 textures_cached: tstats.count,
                 texture_cache_bytes: tstats.total_bytes,
                 texture_budget_bytes: tstats.budget_bytes,
                 texture_budget_exceeded: tstats.budget_exceeded,
+                water_planes_visible: vis_water.len(),
+                world_render_passes,
+                gpu_timing_note: "Timestamp queries unsupported or skipped".into(),
             };
             self.revision = self.revision.wrapping_add(1);
             return (
                 SceneryDrawSnapshot {
-                    batches: Vec::new(),
+                    opaque_batches: Vec::new(),
+                    transparent_batches: Vec::new(),
                     revision: self.revision,
                 },
                 diag,
@@ -244,31 +312,30 @@ impl ActiveSceneryState {
         let zone = self.zone.clone();
         let synth = self.synthetic_bmd_bytes.clone();
         let bmd_archives = &mut self.bmd_archives;
-        let (_decoded_now, errs, drawn_instances, deferred_transparent) =
-            scenery::step_streaming_frame(
-                &mut self.model_cache,
-                &dedup,
-                settings.scenery_loads_per_frame as usize,
-                |model_key| {
-                    if let Some(raw) = &synth {
-                        return Ok(raw.clone());
-                    }
-                    let candidates = [
-                        model_key.to_string(),
-                        format!("litmodels/{zone}/{model_key}"),
-                        format!("litmodels/{model_key}"),
-                        format!("building/{model_key}"),
-                    ];
-                    for arch in bmd_archives.iter_mut() {
-                        for cand in &candidates {
-                            if let Ok(bytes) = arch.read_entry(cand) {
-                                return Ok(bytes);
-                            }
+        let (_decoded_now, errs, drawn_instances, _total_trans) = scenery::step_streaming_frame(
+            &mut self.model_cache,
+            &dedup,
+            settings.scenery_loads_per_frame as usize,
+            |model_key| {
+                if let Some(raw) = &synth {
+                    return Ok(raw.clone());
+                }
+                let candidates = [
+                    model_key.to_string(),
+                    format!("litmodels/{zone}/{model_key}"),
+                    format!("litmodels/{model_key}"),
+                    format!("building/{model_key}"),
+                ];
+                for arch in bmd_archives.iter_mut() {
+                    for cand in &candidates {
+                        if let Ok(bytes) = arch.read_entry(cand) {
+                            return Ok(bytes);
                         }
                     }
-                    Err(format!("model not found in archives: {model_key}"))
-                },
-            );
+                }
+                Err(format!("model not found in archives: {model_key}"))
+            },
+        );
         if let Some(log) = logger.as_mut() {
             for e in &errs {
                 log.warn(&format!("Scenery decode error: {e}"));
@@ -276,13 +343,21 @@ impl ActiveSceneryState {
         }
 
         self.tex_cache.begin_visible_batch();
-        let mut draw_batches = Vec::new();
-        for batch in &dedup {
+        let mut opaque_batches = Vec::new();
+        let mut transparent_batches = Vec::new();
+        let mut approx_lighting_meshes = 0usize;
+        let mut transparent_skipped = 0usize;
+
+        for (b_idx, batch) in dedup.iter().enumerate() {
             if let Some(model) = self.model_cache.get(&batch.model_key) {
                 let tex_archives = &mut self.tex_archives;
                 let tex_cache = &mut self.tex_cache;
-                let sub_batches =
-                    build_scenery_batches_for_model(&model, &batch.transforms, |tex_path| {
+                let (op, tr, approx, skipped) = build_scenery_batches_for_model(
+                    &model,
+                    &batch.transforms,
+                    settings.transparent_scenery_enabled,
+                    (b_idx as u64) << 32,
+                    |tex_path| {
                         tex_cache
                             .get_or_insert_pinned(tex_path, || {
                                 let candidates = [
@@ -303,7 +378,6 @@ impl ActiveSceneryState {
                                         }
                                     }
                                 }
-                                // Fallback 1x1 neutral texture for synthetic/missing textures
                                 Ok(DecodedTexture {
                                     width: 1,
                                     height: 1,
@@ -311,10 +385,20 @@ impl ActiveSceneryState {
                                 })
                             })
                             .ok()
-                    });
-                draw_batches.extend(sub_batches);
+                    },
+                );
+                opaque_batches.extend(op);
+                transparent_batches.extend(tr);
+                approx_lighting_meshes += approx;
+                transparent_skipped += skipped;
             }
         }
+
+        // Sort transparent submeshes strictly back-to-front per instance and per submesh
+        atmosphere::sort_transparent_back_to_front(&mut transparent_batches, camera_pos, |b| {
+            (b.sort_center, b.sort_id)
+        });
+
         if let Some(warn_msg) = self.tex_cache.enforce_budget_after_batch() {
             if let Some(log) = logger.as_mut() {
                 log.warn(&warn_msg);
@@ -329,17 +413,23 @@ impl ActiveSceneryState {
             models_loaded: self.model_cache.loaded_count(),
             instances_drawn: drawn_instances,
             decode_failures: self.model_cache.failed_count(),
-            deferred_transparent_submeshes: deferred_transparent,
+            transparent_submeshes_drawn: transparent_batches.len(),
+            transparent_submeshes_skipped: transparent_skipped,
+            approximate_lighting_meshes: approx_lighting_meshes,
             textures_cached: tstats.count,
             texture_cache_bytes: tstats.total_bytes,
             texture_budget_bytes: tstats.budget_bytes,
             texture_budget_exceeded: tstats.budget_exceeded,
+            water_planes_visible: vis_water.len(),
+            world_render_passes,
+            gpu_timing_note: "Timestamp queries checked on device init".into(),
         };
 
         self.revision = self.revision.wrapping_add(1);
         (
             SceneryDrawSnapshot {
-                batches: draw_batches,
+                opaque_batches,
+                transparent_batches,
                 revision: self.revision,
             },
             diag,
@@ -362,11 +452,14 @@ pub struct ExplorerApp {
     show_map_placeholder: bool,
     show_world_menu: bool,
     show_diagnostics: bool,
+    started_at: Instant,
     terrain_session: Option<TerrainSession>,
     scenery_state: Option<ActiveSceneryState>,
     mesh_arc: Arc<TerrainMeshSnapshot>,
-    lightmap_arc: Arc<TerrainTextureSnapshot>,
+    day_lm_arc: Arc<TerrainTextureSnapshot>,
+    night_lm_arc: Arc<TerrainTextureSnapshot>,
     scenery_arc: Arc<SceneryDrawSnapshot>,
+    water_arc: Arc<WaterRenderSnapshot>,
     latest_diag: SceneryDiagnostics,
     displayed_diag: SceneryDiagnostics,
     last_diag_refresh: Instant,
@@ -378,8 +471,6 @@ impl ExplorerApp {
         Self::with_portable_paths(paths, true)
     }
 
-    /// Construct app state for headless `--smoke-launch` without creating files
-    /// in the build output directory or opening any native dialog.
     pub fn new_headless_smoke() -> Self {
         let paths = PortablePaths::from_executable();
         Self::with_portable_paths(paths, false)
@@ -452,6 +543,8 @@ impl ExplorerApp {
         let modules = Registry::discover(Registry::default_root());
         let default_diag = SceneryDiagnostics {
             texture_budget_bytes: (settings.tex_budget_mib as usize) * 1024 * 1024,
+            world_render_passes: 1,
+            gpu_timing_note: "Timestamp queries checked on device init".into(),
             ..Default::default()
         };
         Self {
@@ -469,12 +562,15 @@ impl ExplorerApp {
             show_map_placeholder: false,
             show_world_menu: false,
             show_diagnostics: true,
+            started_at: Instant::now(),
             terrain_session: None,
             scenery_state: None,
             mesh_arc: Arc::new(TerrainMeshSnapshot::default()),
-            lightmap_arc: Arc::new(TerrainTextureSnapshot::default()),
+            day_lm_arc: Arc::new(TerrainTextureSnapshot::default()),
+            night_lm_arc: Arc::new(TerrainTextureSnapshot::default()),
             scenery_arc: Arc::new(SceneryDrawSnapshot::default()),
-            latest_diag: default_diag,
+            water_arc: Arc::new(WaterRenderSnapshot::default()),
+            latest_diag: default_diag.clone(),
             displayed_diag: default_diag,
             last_diag_refresh: Instant::now(),
         }
@@ -531,15 +627,27 @@ impl ExplorerApp {
         self.save_settings();
     }
 
-    fn step_scenery(&mut self) {
+    fn step_scenery(&mut self, view_proj: glam::Mat4, vp_w: u32, vp_h: u32) {
         if let Some(state) = self.scenery_state.as_mut() {
-            let (snap, diag) =
-                state.step_frame(self.camera.position, &self.settings, &mut self.logger);
+            let (snap, diag) = state.step_frame(
+                self.camera.position,
+                view_proj,
+                vp_w,
+                vp_h,
+                &self.settings,
+                &mut self.logger,
+            );
             self.scenery_arc = Arc::new(snap);
+            self.water_arc = Arc::new(WaterRenderSnapshot {
+                planes: state.water_planes.clone(),
+                reflection_enabled: self.settings.water_reflection,
+                refraction_enabled: self.settings.water_refraction,
+                quality: self.settings.water_quality,
+            });
             self.latest_diag = diag;
         }
         if self.last_diag_refresh.elapsed() >= Duration::from_secs(1) {
-            self.displayed_diag = self.latest_diag;
+            self.displayed_diag = self.latest_diag.clone();
             self.last_diag_refresh = Instant::now();
         }
     }
@@ -557,7 +665,8 @@ impl ExplorerApp {
                 self.camera = FreeCamera::default();
                 let _ = session.update_for_camera(self.camera.position, self.streaming_radius);
                 self.mesh_arc = Arc::new(session.mesh.clone());
-                self.lightmap_arc = Arc::new(session.lightmap.clone());
+                self.day_lm_arc = Arc::new(session.day_lightmap.clone());
+                self.night_lm_arc = Arc::new(session.night_lightmap.clone());
                 let scenery_note = match ActiveSceneryState::open_zone(
                     &client.root,
                     &zone,
@@ -566,19 +675,21 @@ impl ExplorerApp {
                 ) {
                     Ok(st) => {
                         let count = st.placements.len();
+                        let boxes = st.box_areas.len();
                         self.scenery_state = Some(st);
-                        format!("{count} static placements indexed")
+                        format!("{count} placements, {boxes} atmosphere box(es)")
                     }
                     Err(err) => {
                         self.scenery_state = None;
                         format!("scenery unavailable ({err})")
                     }
                 };
-                self.step_scenery();
-                self.displayed_diag = self.latest_diag;
+                let vp = self.camera.view_proj(16.0 / 9.0);
+                self.step_scenery(vp, 1080, 680);
+                self.displayed_diag = self.latest_diag.clone();
                 self.last_diag_refresh = Instant::now();
                 let msg = format!(
-                    "Loaded zone '{}' ({}x{} blocks, {}; lighting: approximate)",
+                    "Loaded zone '{}' ({}x{} blocks, {})",
                     session.zone_name, session.block_rows, session.block_cols, scenery_note
                 );
                 if let Some(log) = self.logger.as_mut() {
@@ -605,18 +716,22 @@ impl ExplorerApp {
                 self.camera = FreeCamera::default();
                 let _ = session.update_for_camera(self.camera.position, self.streaming_radius);
                 self.mesh_arc = Arc::new(session.mesh.clone());
-                self.lightmap_arc = Arc::new(session.lightmap.clone());
+                self.day_lm_arc = Arc::new(session.day_lightmap.clone());
+                self.night_lm_arc = Arc::new(session.night_lightmap.clone());
                 if let Ok(st) =
                     ActiveSceneryState::open_synthetic(&self.paths.cache_dir, tex_budget_bytes)
                 {
                     self.scenery_state = Some(st);
                 }
-                self.step_scenery();
-                self.displayed_diag = self.latest_diag;
+                let vp = self.camera.view_proj(16.0 / 9.0);
+                self.step_scenery(vp, 1080, 680);
+                self.displayed_diag = self.latest_diag.clone();
                 self.last_diag_refresh = Instant::now();
                 let msg = format!(
-                    "Loaded synthetic terrain + static .bmd preview ({} blocks, {} instances; lighting: approximate)",
-                    session.mesh.streamed_blocks, self.latest_diag.instances_drawn
+                    "Loaded synthetic world preview ({} blocks, {} scenery instances, {} water plane)",
+                    session.mesh.streamed_blocks,
+                    self.latest_diag.instances_drawn,
+                    self.latest_diag.water_planes_visible
                 );
                 if let Some(log) = self.logger.as_mut() {
                     log.info(&msg);
@@ -768,6 +883,7 @@ impl ExplorerApp {
             }
         });
 
+        let mut settings_changed = false;
         ui.horizontal(|ui| {
             let zones: Vec<String> = self
                 .detected_client
@@ -793,14 +909,25 @@ impl ExplorerApp {
             }
             ui.checkbox(&mut self.show_diagnostics, "Diagnostics");
             ui.separator();
-            ui.label(format!(
-                "Scale: {}% | Pos: ({:.1}, {:.1}, {:.1}) | Lighting: approximate",
-                self.settings.resolution_scale_pct,
-                self.camera.position.x,
-                self.camera.position.y,
-                self.camera.position.z,
-            ));
+            let hours = self.settings.time_of_day_hours();
+            let hh = (hours.floor() as u32) % 24;
+            let mm = ((hours.fract() * 60.0).floor() as u32) % 60;
+            ui.label(format!("Time: {hh:02}:{mm:02}"));
+            if !self.settings.follow_real_clock {
+                settings_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.settings.time_of_day_minutes, 0..=1439)
+                            .show_value(false),
+                    )
+                    .changed();
+            }
+            settings_changed |= ui
+                .checkbox(&mut self.settings.follow_real_clock, "Real clock")
+                .changed();
         });
+        if settings_changed {
+            self.save_settings();
+        }
 
         let avail = ui.available_size();
         let (rect, response) =
@@ -854,22 +981,39 @@ impl ExplorerApp {
             }
         }
 
-        // Advance multi-frame scenery streaming and 1 Hz diagnostics refresh
-        if self.scenery_state.is_some() {
-            self.step_scenery();
-        }
-
         let ppp = ctx.pixels_per_point();
         let vp_w = ((rect.width() * ppp).round() as u32).max(1);
         let vp_h = ((rect.height() * ppp).round() as u32).max(1);
         let (scaled_w, scaled_h) =
             scaled_render_target(vp_w, vp_h, self.settings.resolution_scale_pct);
         let aspect = (vp_w as f32) / (vp_h as f32);
-        let uniform = CameraUniform {
-            view_proj: self.camera.view_proj(aspect).to_cols_array_2d(),
-            sun_dir: [0.4, 0.85, 0.35, 0.0],
-            fog_color: [0.15, 0.25, 0.40, 1.0],
-        };
+        let vp = self.camera.view_proj(aspect);
+
+        if self.scenery_state.is_some() {
+            self.step_scenery(vp, scaled_w, scaled_h);
+        }
+
+        let active_box = self
+            .scenery_state
+            .as_ref()
+            .and_then(|s| s.active_box_area());
+        let water_height = self
+            .scenery_state
+            .as_ref()
+            .and_then(|s| s.water_planes.first().map(|w| w.height_y));
+
+        let hours = self.settings.time_of_day_hours();
+        let elapsed_sec = self.started_at.elapsed().as_secs_f32();
+        let uniform = CameraUniform::build(
+            vp,
+            self.camera.position,
+            hours,
+            elapsed_sec,
+            self.settings.fog_enabled,
+            self.settings.fog_distance_multiplier(),
+            active_box,
+            water_height,
+        );
 
         let cb = egui_wgpu::Callback::new_paint_callback(
             rect,
@@ -879,8 +1023,10 @@ impl ExplorerApp {
                 scale_pct: self.settings.resolution_scale_pct,
                 uniform,
                 mesh: Arc::clone(&self.mesh_arc),
-                lightmap: Arc::clone(&self.lightmap_arc),
+                day_lightmap: Arc::clone(&self.day_lm_arc),
+                night_lightmap: Arc::clone(&self.night_lm_arc),
                 scenery: Arc::clone(&self.scenery_arc),
+                water: Arc::clone(&self.water_arc),
             },
         );
         ui.painter().add(cb);
@@ -900,13 +1046,22 @@ impl ExplorerApp {
             });
 
         if self.show_diagnostics {
-            let d = self.displayed_diag;
+            let d = &self.displayed_diag;
+            let dn = atmosphere::day_night_factor(hours);
+            let lighting_label = if d.approximate_lighting_meshes > 0 {
+                format!(
+                    "client day/night (dn={dn:.2}) + {} approx fallback mesh(es)",
+                    d.approximate_lighting_meshes
+                )
+            } else {
+                format!("client day/night (dn={dn:.2}; sky gradient approximate)")
+            };
             egui::Area::new(egui::Id::new("world_diagnostics_panel"))
-                .fixed_pos(rect.right_top() + egui::vec2(-290.0, 10.0))
+                .fixed_pos(rect.right_top() + egui::vec2(-315.0, 10.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.strong("Scenery Diagnostics (1 Hz)");
-                        ui.small("Lighting: approximate (Phase 5 pending)");
+                        ui.strong("World Diagnostics (1 Hz)");
+                        ui.small(format!("Lighting: {lighting_label}"));
                         ui.small(format!(
                             "Placements in range: {} / {}",
                             d.placements_in_range, d.placements_total
@@ -915,11 +1070,18 @@ impl ExplorerApp {
                             "Unique models loaded: {} (in range: {})",
                             d.models_loaded, d.unique_models_in_range
                         ));
-                        ui.small(format!("Instances drawn: {}", d.instances_drawn));
+                        ui.small(format!(
+                            "Opaque/alpha-test instances: {}",
+                            d.instances_drawn
+                        ));
+                        ui.small(format!(
+                            "Transparent submeshes: drawn={}, skipped={}",
+                            d.transparent_submeshes_drawn, d.transparent_submeshes_skipped
+                        ));
                         ui.small(format!("Failed to decode: {}", d.decode_failures));
                         ui.small(format!(
-                            "Deferred transparent submeshes: {}",
-                            d.deferred_transparent_submeshes
+                            "Water planes visible: {} | World render passes/frame: {}",
+                            d.water_planes_visible, d.world_render_passes
                         ));
                         ui.small(format!(
                             "Textures cached: {} ({:.2} / {:.2} MiB){}",
@@ -932,6 +1094,9 @@ impl ExplorerApp {
                                 ""
                             }
                         ));
+                        if !d.gpu_timing_note.is_empty() {
+                            ui.small(format!("GPU timing: {}", d.gpu_timing_note));
+                        }
                     });
                 });
         }
@@ -996,7 +1161,9 @@ impl ExplorerApp {
         let mut changed = false;
         match tab {
             SettingsTab::Graphics => {
-                ui.label("Graphics settings (persisted under <root>/settings/).");
+                ui.label(
+                    "Graphics, atmosphere, and water settings (persisted under <root>/settings/).",
+                );
                 ui.add_space(6.0);
                 changed |= ui
                     .add(
@@ -1008,6 +1175,72 @@ impl ExplorerApp {
                         .text("Resolution scale (3D world; UI stays native)"),
                     )
                     .changed();
+                ui.separator();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.fog_enabled,
+                        "Environmental fog (default on)",
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.fog_distance_mult_pct,
+                            MIN_FOG_DIST_MULT_PCT..=MAX_FOG_DIST_MULT_PCT,
+                        )
+                        .suffix("%")
+                        .text(format!(
+                            "Fog distance multiplier (default {DEFAULT_FOG_DIST_MULT_PCT}%)"
+                        )),
+                    )
+                    .changed();
+                ui.separator();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.water_reflection,
+                        "Water planar reflection (disable for weak GPUs)",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.water_refraction,
+                        "Water refraction (disable for weak GPUs)",
+                    )
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Water quality (pass resolution):");
+                    for (q, label) in [
+                        (WaterQuality::Low, "Low (25%)"),
+                        (WaterQuality::Medium, "Medium (50%)"),
+                        (WaterQuality::High, "High (100%)"),
+                    ] {
+                        if ui
+                            .selectable_label(self.settings.water_quality == q, label)
+                            .clicked()
+                        {
+                            self.settings.water_quality = q;
+                            changed = true;
+                        }
+                    }
+                });
+                ui.separator();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.follow_real_clock,
+                        "Time of day follows real clock (UTC)",
+                    )
+                    .changed();
+                if !self.settings.follow_real_clock {
+                    let hh = (self.settings.time_of_day_minutes / 60) % 24;
+                    let mm = self.settings.time_of_day_minutes % 60;
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.settings.time_of_day_minutes, 0..=1439)
+                                .text(format!("Time of day ({hh:02}:{mm:02}; default 12:00)")),
+                        )
+                        .changed();
+                }
+                ui.separator();
                 changed |= ui
                     .add(
                         egui::Slider::new(&mut self.settings.tex_budget_mib, 8..=1024)
@@ -1028,12 +1261,18 @@ impl ExplorerApp {
                     .changed();
             }
             SettingsTab::World => {
-                ui.label("Static scenery streaming and memory controls.");
+                ui.label("Static scenery streaming and transparency controls.");
                 ui.add_space(6.0);
                 changed |= ui
                     .checkbox(
                         &mut self.settings.scenery_enabled,
                         "Show static scenery (.bmd)",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.transparent_scenery_enabled,
+                        "Show transparent scenery submeshes (sorted back-to-front; default on)",
                     )
                     .changed();
                 changed |= ui
@@ -1220,9 +1459,6 @@ impl eframe::App for ExplorerApp {
     }
 }
 
-/// CPU-only headless UI smoke test: initializes `ExplorerApp` non-interactively
-/// (never opens any native folder dialog), probes `wgpu::Instance`, and renders
-/// every UI page and Settings tab including World View and Diagnostics.
 pub fn run_smoke_launch() -> Result<(), String> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let _adapters = instance.enumerate_adapters(wgpu::Backends::all());
@@ -1339,19 +1575,29 @@ pub fn run_window() -> Result<(), String> {
         "Forsaken World Explorer",
         options,
         Box::new(|cc| {
+            let mut app = ExplorerApp::new();
             if let Some(render_state) = &cc.wgpu_render_state {
                 let renderer = TerrainViewportRenderer::new(
                     &render_state.device,
                     &render_state.queue,
                     render_state.target_format,
                 );
+                let ts_msg = if renderer.timestamp_queries_supported {
+                    "GPU timestamp queries supported on adapter".to_string()
+                } else {
+                    "GPU timestamp queries not supported on adapter (skipped)".to_string()
+                };
+                if let Some(log) = app.logger.as_mut() {
+                    log.info(&ts_msg);
+                }
+                app.displayed_diag.gpu_timing_note = ts_msg;
                 render_state
                     .renderer
                     .write()
                     .callback_resources
                     .insert(renderer);
             }
-            Ok(Box::new(ExplorerApp::new()))
+            Ok(Box::new(app))
         }),
     )
     .map_err(|error| format!("failed to launch viewer window: {error}"))

@@ -2,7 +2,7 @@
 
 An experimental, GPU-based, free-flight viewer for a user-owned **Forsaken World** client, recreated from the architecture and principles of [`kasperfriend/Perfect-World-Explorer`](https://github.com/kasperfriend/Perfect-World-Explorer). It reads world data from a client you already own; it is **not** a game client, editor, server, or gameplay implementation.
 
-> **Work in progress:** Client folder selection (native folder picker), portable root storage, verified `.pck`/`.pkx` archive reading, CPU terrain/lightmap/mask/placement/DDS/static `.bmd` decoders, RAM-first `cache/terrain-v1` and `cache/scenery-v1` streaming, 32 MiB pinned-batch texture caching, and Phases 3–4 `wgpu` terrain + instanced static scenery rendering with free-flight camera and `10%–200%` resolution scaling are implemented. **Visual parity is not verified without a hardware GPU:** offline `naga` validation and Mesa `lavapipe` software offscreen smoke tests prove shader validity and pipeline execution only, not visual parity on a real GPU or client. See [Findings/README.md](Findings/README.md), [Findings/scenery-formats.md](Findings/scenery-formats.md), [Findings/scenery-budget.md](Findings/scenery-budget.md), and [Findings/Status.md](Findings/Status.md) for evidence, limits, and open gates.
+> **Work in progress:** Phases 0–5 are implemented and CPU/CI-verified (native folder picker, portable root layout, `.pck`/`.pkx` archive layer, CPU terrain/lightmap/mask/placement/DDS/static `.bmd` decoders, `cache/terrain-v1` & `cache/scenery-v1`, 32 MiB pinned-batch texture cache, free-flight `wgpu` terrain + opaque/transparent `.bmd` scenery, time-of-day sky/lighting/fog, and experimental water). **Water is not complete** (see [Findings/water-status.md](Findings/water-status.md)), and **visual parity is not verified without a hardware GPU:** offline `naga` validation and Mesa `lavapipe` software offscreen smoke tests prove shader validity and pipeline execution only, not visual parity on a real GPU or client.
 
 ## Legal & Non-Affiliation Notice
 
@@ -13,7 +13,7 @@ An experimental, GPU-based, free-flight viewer for a user-owned **Forsaken World
 
 ## Portable Root Folder Layout
 
-All runtime data lives beside `forsaken-world-explorer.exe` (resolved from the executable's location, not the current working directory). The `settings/`, `logs/`, and `cache/` subdirectories are **created automatically on first run** (they are not pre-populated in the release ZIP):
+All runtime data lives beside `forsaken-world-explorer.exe` (resolved from the executable's location, not the current working directory). The `settings/`, `logs/`, and `cache/` subdirectories are **created automatically on first run**:
 
 ```text
 Forsaken World Explorer/
@@ -30,44 +30,45 @@ Forsaken World Explorer/
   cache/                   # created on first run: terrain-v1/, scenery-v1/ (overridable via FW_CACHE_DIR)
 ```
 
-- **One-time legacy migration:** If `<root>/settings/viewer-settings.txt` does not exist yet and an older `%LOCALAPPDATA%\ForsakenWorldExplorer\viewer-settings.txt` exists, it is imported once into `<root>/settings/viewer-settings.txt` and left untouched.
-- **Unwritable folder protection:** If `forsaken-world-explorer.exe` is placed in a read-only location (such as `Program Files`), the UI shows a clear banner and lets you choose a writable folder via the native folder picker.
-
-## Free-Flight Controls, World Settings & Diagnostics
+## Free-Flight Controls, Settings & Diagnostics
 
 - **Movement & Look:** `W`/`A`/`S`/`D` move, `Space`/`E` ascend, `Q`/`Left Ctrl` descend, `Shift` fast boost, `Arrow keys` (or mouse drag) look, `M` World Map placeholder, `Escape` Explorer Menu.
-- **Settings → Graphics:** Resolution scale (`10%–200%`, default `100%`; UI stays native), decoded texture cache budget (`FW_TEX_BUDGET_MIB`, default `32 MiB`, pinned visible batch never downscaled or silently dropped), terrain hot RAM budget (`FW_TERRAIN_RAM_MIB`, default `2 MiB`).
-- **Settings → World:** Static `.bmd` scenery on/off, camera-centered streaming radius (`32–2048 m`, default `256 m`), max loaded instances (`64–16384`, default `1024`), new models decoded per frame (`1–64`, default `4`), and whole-world loading on/off (default off; warns about high RAM/VRAM use).
-- **World View Diagnostics panel (1 Hz):** Displays placements in range, unique models loaded, instances drawn, failed decodes, deferred transparent submeshes, and decoded texture cache count/size vs budget.
+- **Settings → Graphics (persisted under `<root>/settings/`):**
+  - Resolution scale: `10%–200%` (default `100%`; UI stays native)
+  - Environmental fog: on/off (default `on`), fog distance multiplier `25%–400%` (default `100%`)
+  - Water reflection: on/off (default `on`, disable for weak GPUs)
+  - Water refraction: on/off (default `on`, disable for weak GPUs)
+  - Water quality: `Low` (25%), `Medium` (50%, default), `High` (100% of scaled 3D viewport)
+  - Time of day: `00:00`–`23:59` slider (default `12:00` matching client `MID_NOON`) and `Follow real clock` (default `off`)
+  - Decoded texture cache budget: `FW_TEX_BUDGET_MIB` (default `32 MiB`, pinned visible batch never silently dropped)
+  - Terrain hot RAM budget: `FW_TERRAIN_RAM_MIB` (default `2 MiB`)
+- **Settings → World (persisted under `<root>/settings/`):**
+  - Static `.bmd` scenery: on/off (default `on`)
+  - Transparent `.bmd` scenery: on/off (default `on`, sorted back-to-front, depth write off)
+  - Streaming radius: `32–2048 m` (default `256 m`)
+  - Max loaded instances: `64–16384` (default `1024`)
+  - New models decoded per frame: `1–64` (default `4`)
+  - Whole-world scenery loading: on/off (default `off`; warns about high RAM/VRAM use)
+- **World View Diagnostics (1 Hz):** Reports lighting mode (`client day/night` vs `approximate fallback`), placements in range, unique models loaded, opaque/alpha-test instances drawn, transparent submeshes drawn & skipped, decode failures, visible water planes, per-frame world render pass count, decoded texture cache usage, and GPU timestamp query support.
 
-### Known Limits (Phase 4)
+### Known Limits (Phase 5)
 
-- **Approximate lighting:** Terrain and static `.bmd` scenery currently use an approximate directional + hemisphere light until regional/time-of-day lighting is decoded in Phase 5.
-- **Transparent / blended submeshes:** Submeshes with translucent material alpha are classified and skipped rather than drawn incorrectly; they are deferred to Phase 5.
+- **Water is not complete:** Dual-layer animated normals, scissored planar reflection/refraction, shoreline edge fade, and underwater fog/tint are implemented-partial (see [Findings/water-status.md](Findings/water-status.md)). Shoreline wave foam strips, caustics, and watery-zone `BSData/*.dat` verification remain open.
+- **Sky dome:** Uses a procedural time-of-day zenith/horizon gradient + sun disc driven by `EC_SunMoon` and `ECBSDFILEBOXAREA15` colors (`approximate` until full `surfaces.pck` skybox textures are decoded).
+- **Scenery fallback lighting:** `v3`–`v5` `.bmd` submeshes blend real per-vertex day/night light arrays; `v2` meshes without vertex light arrays use approximate directional + hemisphere lighting (labeled in Diagnostics).
 - **Whole-world loading:** Not verified on full-zone memory use without a real client and hardware GPU.
 
 ## Current Status
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| Phase 0 | Build/CI skeleton, portable root (`settings/`, `logs/`, `cache/`), native folder picker, `--self-test`, `--smoke-launch`, Drive client inventory | `verified-cpu` |
-| Phase 1 | Client folder detection (`update/pem.exe`), verified `.pck`/`.pkx` archive reader, `pck-survey` tool | `verified-cpu` |
-| Phase 2 | CPU world decoders (`.trn2`, `.t2bk` v6, `.t2lm`/`.t2lm1`, `.t2mk`, `.ecwld`, `.ecbsd`, DDS `DXT1`/`DXT3`/`DXT5`), `cache/terrain-v1`, `terrain-survey`, `terrain-memory-check` | `verified-cpu` |
-| Phase 3 | GPU terrain rendering (`wgpu`), camera-centered streaming (`cache/terrain-v1`), free-flight camera, `10%–200%` resolution scale, `naga` WGSL validator, Mesa `lavapipe` offscreen smoke test | `verified-cpu` / `not-verified-without-gpu` |
-| Phase 4 | Static `.bmd` decoder, `.ecwld`/`.ecbsd` transforms, instanced GPU rendering, multi-frame streaming, 32 MiB pinned texture cache, 1 Hz Diagnostics, `scenery-survey` | `verified-cpu` / `not-verified-without-gpu` |
-| Phase 5–8 | Sky/lighting/water/transparency, SpeedTree bridge, effects/audio/maps, optional Modules | `not-started` |
+| Phase 0–2 | Skeleton, portable root, native folder picker, `.pck`/`.pkx`, CPU world decoders, `cache/terrain-v1` | `verified-cpu` |
+| Phase 3 | GPU terrain rendering (`wgpu`), free flight, `10%–200%` resolution scale, `naga` & Mesa `lavapipe` CI gates | `verified-cpu` / `not-verified-without-gpu` |
+| Phase 4 | Static `.bmd` decoder (all versions fixture-tested), instancing, multi-frame streaming, 32 MiB texture cache, `scenery-survey` | `verified-cpu` / `not-verified-without-gpu` |
+| Phase 5 | Sky gradient, day/night lightmap & `.bmd` vertex lighting blend, environmental fog, transparent `.bmd` scenery, experimental water, `sky-survey` & `water-survey` | `verified-cpu` / `implemented-partial` / `not-verified-without-gpu` |
+| Phase 6–8 | Vegetation (SpeedTree 32-bit bridge & grass), effects/audio/maps, optional Modules | `not-started` |
 
 See [Findings/Status.md](Findings/Status.md) for per-subsystem evidence and open gates.
-
-## Environment Variables
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `FW_CACHE_DIR` | `<root>/cache` beside executable | Override directory for derived caches (`terrain-v1`, `scenery-v1`) |
-| `FW_CLIENT_DIR` | Unset | Optional override for client folder path (used by local real-data checks; skipped in CI when unset) |
-| `FW_MODULES_DIR` | `<root>/Modules` beside executable | Override directory for discovering `module.ini` packages |
-| `FW_TERRAIN_RAM_MIB` | `2` | Terrain hot-set RAM budget (MiB) |
-| `FW_TEX_BUDGET_MIB` | `32` | Decoded texture cache budget (MiB) |
 
 ## Build & Verify from Source
 
@@ -92,4 +93,6 @@ WGPU_BACKEND=vulkan cargo run --locked --bin terrain-render-smoke
 cargo run --locked --bin pck-survey -- <path-to-forsaken-world-client> --out archive-survey.md
 cargo run --locked --bin terrain-survey -- <path-to-forsaken-world-client> --out terrain-survey.md
 cargo run --locked --bin scenery-survey -- <path-to-forsaken-world-client> s0 --out scenery-survey-s0.md
+cargo run --locked --bin sky-survey -- <path-to-forsaken-world-client> s0 --out sky-survey-s0.md
+cargo run --locked --bin water-survey -- <path-to-forsaken-world-client> s0 --out water-survey-s0.md
 ```

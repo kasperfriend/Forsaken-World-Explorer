@@ -1,16 +1,22 @@
-// Forsaken World Explorer — Phase 4 Instanced Static Scenery Shader (.bmd)
-// Renders opaque and alpha-tested submeshes depth-tested against terrain.
-// Uses approximate directional + hemisphere lighting until Phase 5 regional lighting.
+// Forsaken World Explorer — Phase 5 Instanced Static Scenery Shader (.bmd)
+// Supports opaque, alpha-tested, and alpha-blended transparent submeshes.
+// Blends per-vertex day_diffuse and night_diffuse using time-of-day dn_factor,
+// with directional+hemisphere fallback only for meshes without vertex light data.
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     sun_dir: vec4<f32>,
     fog_color: vec4<f32>,
+    fog_params: vec4<f32>,
+    sky_zenith: vec4<f32>,
+    sky_horizon: vec4<f32>,
+    sun_color: vec4<f32>,
 };
 
 struct MaterialUniform {
     diffuse_rgba: vec4<f32>,
-    // x = alpha_cutoff (0.0 for opaque, 0.5 for alpha-tested)
+    // x = alpha_cutoff (0.0 opaque/blended, 0.5 alpha-tested)
+    // y = has_vertex_lighting (1.0 = client day/night vertex light, 0.0 = approximate fallback)
     params: vec4<f32>,
 };
 
@@ -29,23 +35,25 @@ var<uniform> mat_u: MaterialUniform;
 struct VertexIn {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) color: vec4<f32>,
-    @location(3) uv: vec2<f32>,
+    @location(2) day_color: vec4<f32>,
+    @location(3) night_color: vec4<f32>,
+    @location(4) uv: vec2<f32>,
 };
 
 struct InstanceIn {
-    @location(4) model_c0: vec4<f32>,
-    @location(5) model_c1: vec4<f32>,
-    @location(6) model_c2: vec4<f32>,
-    @location(7) model_c3: vec4<f32>,
+    @location(5) model_c0: vec4<f32>,
+    @location(6) model_c1: vec4<f32>,
+    @location(7) model_c2: vec4<f32>,
+    @location(8) model_c3: vec4<f32>,
 };
 
 struct VertexOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_normal: vec3<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) uv: vec2<f32>,
-    @location(3) depth_dist: f32,
+    @location(1) day_color: vec4<f32>,
+    @location(2) night_color: vec4<f32>,
+    @location(3) uv: vec2<f32>,
+    @location(4) depth_dist: f32,
 };
 
 @vertex
@@ -58,7 +66,8 @@ fn vs_main(v: VertexIn, inst: InstanceIn) -> VertexOut {
     var out: VertexOut;
     out.clip_pos = clip;
     out.world_normal = normalize(world_nrm);
-    out.color = v.color;
+    out.day_color = v.day_color;
+    out.night_color = v.night_color;
     out.uv = v.uv;
     out.depth_dist = clip.w;
     return out;
@@ -71,15 +80,31 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let n = normalize(in.world_normal);
-    let sun = normalize(cam.sun_dir.xyz);
-    let ndotl = max(dot(n, sun), 0.0);
-    let hemi = 0.35 + 0.65 * ndotl;
+    let dn = clamp(cam.sun_dir.w, 0.0, 1.0);
+    var lit_rgb: vec3<f32>;
+    if (mat_u.params.y > 0.5) {
+        // Real per-vertex day/night lighting from .bmd
+        let v_light = mix(in.day_color.rgb, in.night_color.rgb, dn);
+        lit_rgb = tex_sample.rgb * mat_u.diffuse_rgba.rgb * v_light;
+    } else {
+        // Approximate directional + hemisphere fallback for v2 meshes without vertex light arrays
+        let n = normalize(in.world_normal);
+        let sun = normalize(cam.sun_dir.xyz);
+        let ndotl = max(dot(n, sun), 0.0);
+        let hemi = mix(0.38 + 0.62 * ndotl, 0.20 + 0.25 * ndotl, dn);
+        lit_rgb = tex_sample.rgb * mat_u.diffuse_rgba.rgb * hemi;
+    }
 
-    let albedo = tex_sample.rgb * in.color.rgb * mat_u.diffuse_rgba.rgb;
-    let lit = albedo * hemi;
+    var final_rgb = lit_rgb;
+    if (cam.fog_params.z > 0.5) {
+        let fog_span = max(cam.fog_params.y - cam.fog_params.x, 1.0);
+        let fog_f = clamp((in.depth_dist - cam.fog_params.x) / fog_span, 0.0, 0.92);
+        final_rgb = mix(final_rgb, cam.fog_color.rgb, fog_f);
+    }
+    if (cam.fog_params.w > 0.5) {
+        final_rgb = mix(final_rgb, cam.fog_color.rgb, 0.35);
+    }
 
-    let fog_factor = clamp((in.depth_dist - 400.0) / 1400.0, 0.0, 0.85);
-    let final_rgb = mix(lit, cam.fog_color.rgb, fog_factor);
-    return vec4<f32>(final_rgb, 1.0);
+    let out_alpha = clamp(tex_sample.a * mat_u.diffuse_rgba.a, 0.0, 1.0);
+    return vec4<f32>(final_rgb, out_alpha);
 }

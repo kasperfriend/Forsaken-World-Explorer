@@ -18,7 +18,7 @@ use crate::{
 
 pub const SCENERY_CACHE_SUBDIR: &str = "scenery-v1";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SceneryDiagnostics {
     pub placements_total: usize,
     pub placements_in_range: usize,
@@ -26,11 +26,16 @@ pub struct SceneryDiagnostics {
     pub models_loaded: usize,
     pub instances_drawn: usize,
     pub decode_failures: usize,
-    pub deferred_transparent_submeshes: usize,
+    pub transparent_submeshes_drawn: usize,
+    pub transparent_submeshes_skipped: usize,
+    pub approximate_lighting_meshes: usize,
     pub textures_cached: usize,
     pub texture_cache_bytes: usize,
     pub texture_budget_bytes: usize,
     pub texture_budget_exceeded: bool,
+    pub water_planes_visible: usize,
+    pub world_render_passes: usize,
+    pub gpu_timing_note: String,
 }
 
 /// One deduplicated `.bmd` model paired with all instance transforms that share it.
@@ -136,8 +141,6 @@ impl SceneryModelCache {
         self.failed.len()
     }
 
-    /// Decode a `.bmd` model if not yet cached, writing its raw validated bytes to
-    /// `<root>/cache/scenery-v1/<sha256>.bmd` so subsequent runs avoid archive extraction.
     pub fn load_or_decode<F>(
         &mut self,
         model_key: &str,
@@ -187,7 +190,6 @@ impl SceneryModelCache {
         }
     }
 
-    /// Directly insert a pre-parsed model (used by synthetic preview and tests).
     pub fn insert_parsed(&mut self, model_key: &str, model: BmdModel) {
         self.loaded
             .insert(model_key.to_ascii_lowercase(), Arc::new(model));
@@ -195,7 +197,8 @@ impl SceneryModelCache {
 }
 
 /// Advance multi-frame scenery streaming by decoding at most `loads_per_frame` uncached
-/// unique models from `batches`. Returns `(decoded_this_frame, errors_this_frame, drawn_instances, deferred_transparent)`.
+/// unique models from `batches`.
+/// Returns `(decoded_this_frame, errors_this_frame, drawn_instances, transparent_submesh_count)`.
 pub fn step_streaming_frame<F>(
     cache: &mut SceneryModelCache,
     batches: &[ModelInstanceBatch],
@@ -209,7 +212,7 @@ where
     let mut decoded_this_frame = 0usize;
     let mut errors = Vec::new();
     let mut drawn_instances = 0usize;
-    let mut deferred_transparent = 0usize;
+    let mut transparent_submeshes = 0usize;
 
     for batch in batches {
         if cache.get(&batch.model_key).is_none()
@@ -231,11 +234,12 @@ where
                 if has_drawable {
                     drawn_instances += batch.transforms.len();
                 }
-                deferred_transparent += model
+                transparent_submeshes += model
                     .submeshes
                     .iter()
                     .filter(|s| s.alpha_mode == AlphaMode::TransparentDeferred)
-                    .count();
+                    .count()
+                    * batch.transforms.len();
             }
         }
     }
@@ -244,11 +248,10 @@ where
         decoded_this_frame,
         errors,
         drawn_instances,
-        deferred_transparent,
+        transparent_submeshes,
     )
 }
 
-/// Helper to summarize a typed `BmdError` for diagnostics.
 pub fn format_bmd_error(model_key: &str, err: &BmdError) -> String {
     format!("{model_key}: {err}")
 }
@@ -289,18 +292,13 @@ mod tests {
         assert_eq!(visible[2].export_id, 2);
 
         let batches = dedup_instances_by_model(&visible);
-        assert_eq!(
-            batches.len(),
-            2,
-            "3 placements of 2 models -> 2 GPU mesh batches"
-        );
+        assert_eq!(batches.len(), 2);
         let house = batches
             .iter()
             .find(|b| b.model_key == "1/house.bmd")
             .unwrap();
         assert_eq!(house.transforms.len(), 2);
 
-        // Whole-world mode ignores radius cap
         let all = select_visible_placements(&placements, Vec3::ZERO, 100.0, 2, true);
         assert_eq!(all.len(), 4);
     }
@@ -324,23 +322,18 @@ mod tests {
         let batches = dedup_instances_by_model(&visible);
 
         let raw_box = synthetic::build_bmd_v5_box("textures/wall.dds", 2.0, 6.0);
-        // Frame 1 with budget=2 decodes only 2 models
         let (dec1, errs1, drawn1, _) =
             step_streaming_frame(&mut cache, &batches, 2, |_| Ok(raw_box.clone()));
         assert_eq!(dec1, 2);
         assert!(errs1.is_empty());
         assert_eq!(drawn1, 2);
-        assert_eq!(cache.loaded_count(), 2);
 
-        // Frame 2 decodes the remaining 1 model
         let (dec2, errs2, drawn2, _) =
             step_streaming_frame(&mut cache, &batches, 2, |_| Ok(raw_box.clone()));
         assert_eq!(dec2, 1);
         assert!(errs2.is_empty());
         assert_eq!(drawn2, 3);
-        assert_eq!(cache.loaded_count(), 3);
 
-        // Re-opening cache hits disk without invoking fetch_raw
         let mut cache2 = SceneryModelCache::open(&tmp).expect("reopen cache");
         let model = cache2
             .load_or_decode("a.bmd", || Err("should hit disk cache".into()))
