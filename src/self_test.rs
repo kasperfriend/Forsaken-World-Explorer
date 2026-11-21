@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{modules, settings};
+use crate::{modules, pck, settings};
 
 #[derive(Debug)]
 pub struct CheckResult {
@@ -84,8 +84,6 @@ fn check_module_discovery() -> Result<CheckResult, String> {
         });
     }
 
-    // Fallback when invoked directly from `target/debug` without copied `Modules/`:
-    // validate discovery and broken-manifest isolation on a temporary synthetic tree.
     let synthetic = unique_temp_dir("fw-selftest-modules")?;
     let res = (|| -> Result<CheckResult, String> {
         let valid_dir = synthetic.join("Synthetic");
@@ -117,33 +115,34 @@ fn check_module_discovery() -> Result<CheckResult, String> {
     res
 }
 
-fn check_synthetic_fixture_parsing() -> Result<CheckResult, String> {
-    // Phase 0 has no client archive parser yet (Phase 1); verify deterministic
-    // parsing and malformed-input rejection on a synthetic manifest fixture.
-    let dir = unique_temp_dir("fw-selftest-fixture")?;
+fn check_synthetic_pck_archive() -> Result<CheckResult, String> {
+    let dir = unique_temp_dir("fw-selftest-pck")?;
     let res = (|| -> Result<CheckResult, String> {
-        let good = dir.join("good");
-        fs::create_dir_all(&good).map_err(|e| e.to_string())?;
-        fs::write(
-            good.join(modules::MODULE_MANIFEST),
-            "format=1\nid=fixture-ok\nname=Fixture\nversion=0.1.0\ndescription=Synthetic fixture\n",
-        )
-        .map_err(|e| e.to_string())?;
-        let pkg = modules::Package::load(good)?;
-        if pkg.id != "fixture-ok" {
-            return Err(format!("unexpected fixture id '{}'", pkg.id));
+        let pck_path = dir.join("synthetic.pck");
+        let payload = b"Forsaken World Explorer synthetic PCK payload\n".repeat(16);
+        pck::synthetic::write_pck(&pck_path, &[("Configs\\test.cfg", &payload)])?;
+        let mut archive = pck::PckArchive::open(&pck_path)?;
+        let extracted = archive.read_entry("configs/test.cfg")?;
+        if extracted != payload {
+            return Err("extracted synthetic PCK payload did not match".into());
         }
 
-        let bad = dir.join("bad");
-        fs::create_dir_all(&bad).map_err(|e| e.to_string())?;
-        fs::write(bad.join(modules::MODULE_MANIFEST), [0xff, 0x00, 0xfe, 0x01])
-            .map_err(|e| e.to_string())?;
-        if modules::Package::load(bad).is_ok() {
-            return Err("malformed binary manifest unexpectedly succeeded".into());
+        let split_path = dir.join("split.pck");
+        pck::synthetic::write_split_pck(&split_path, &[("data\\a.bin", &payload)], 64)?;
+        let mut split_archive = pck::PckArchive::open(&split_path)?;
+        if split_archive.read_entry("data/a.bin")? != payload {
+            return Err("extracted split PCK/PKX payload did not match".into());
         }
+
+        let bad_path = dir.join("corrupt.pck");
+        fs::write(&bad_path, [0xffu8; 320]).map_err(|e| e.to_string())?;
+        if pck::PckArchive::open(&bad_path).is_ok() {
+            return Err("corrupt PCK archive unexpectedly opened".into());
+        }
+
         Ok(CheckResult {
-            name: "synthetic-fixture",
-            detail: "verified valid fixture load and malformed-bytes rejection".into(),
+            name: "synthetic-pck-archive",
+            detail: "verified single .pck, split .pck/.pkx, and corrupt-archive rejection".into(),
         })
     })();
     let _ = fs::remove_dir_all(&dir);
@@ -158,10 +157,16 @@ fn check_optional_client_env() -> CheckResult {
             CheckResult {
                 name: "real-client-check",
                 detail: if exists {
-                    format!(
-                        "FW_CLIENT_DIR is set and exists ({}); archive parsing arrives in Phase 1",
-                        path.display()
-                    )
+                    match crate::client_detect::detect(&path) {
+                        Ok(client) => format!(
+                            "detected client at {} ({}, {} .pck archives, {} zones)",
+                            client.root.display(),
+                            client.recognition.summary(),
+                            client.pck_archives.len(),
+                            client.zones.len()
+                        ),
+                        Err(err) => format!("FW_CLIENT_DIR invalid: {err}"),
+                    }
                 } else {
                     format!(
                         "FW_CLIENT_DIR is set but directory not found ({})",
@@ -177,12 +182,12 @@ fn check_optional_client_env() -> CheckResult {
     }
 }
 
-/// Run all Phase 0 CPU-only self-tests.
+/// Run all CPU-only self-tests.
 pub fn run() -> Result<Vec<CheckResult>, String> {
     Ok(vec![
         check_settings_round_trip()?,
         check_module_discovery()?,
-        check_synthetic_fixture_parsing()?,
+        check_synthetic_pck_archive()?,
         check_optional_client_env(),
     ])
 }

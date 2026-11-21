@@ -2,7 +2,7 @@
 
 An experimental, GPU-based, free-flight viewer for a user-owned **Forsaken World** client, recreated from the architecture and principles of [`kasperfriend/Perfect-World-Explorer`](https://github.com/kasperfriend/Perfect-World-Explorer). It reads world data from a client you already own; it is **not** a game client, editor, server, or gameplay implementation.
 
-> **Work in progress (Phase 0 — Skeleton & Client Inventory):** No 3D world rendering, archive parsing, or visual parity exists yet. Every automated check in CI runs CPU-only; visual and GPU behavior cannot be verified without a local GPU and real client files. See [Findings/README.md](Findings/README.md) and [Findings/Status.md](Findings/Status.md) for evidence, limits, and open gates.
+> **Work in progress (Phase 1 — Client Discovery & Archive Layer):** Client layout validation (`update/pem.exe`, `resources/`, `maps/`) and the verified Forsaken World `.pck`/`.pkx` archive reader + `pck-survey` tool are implemented and CPU-verified. No 3D world rendering or visual parity exists yet; all CI checks run without a GPU. See [Findings/README.md](Findings/README.md) and [Findings/Status.md](Findings/Status.md) for evidence, limits, and open gates.
 
 ## Legal & Non-Affiliation Notice
 
@@ -15,8 +15,8 @@ An experimental, GPU-based, free-flight viewer for a user-owned **Forsaken World
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| Phase 0 | Build/CI skeleton, settings persistence, window/menu placeholders, `--self-test`, Drive client inventory | `verified-cpu` (pending user local Windows verification) |
-| Phase 1 | Client folder detection (`update/pem.exe` fingerprint) & `.pck`/`.pkx` archive layer | `not-started` |
+| Phase 0 | Build/CI skeleton, settings persistence, window/menu, `--self-test`, `--smoke-launch`, Drive client inventory | `verified-cpu` |
+| Phase 1 | Client folder detection (`update/pem.exe`), verified `.pck`/`.pkx` archive reader, `pck-survey` tool | `verified-cpu` |
 | Phase 2 | CPU world decoders (terrain, placements, static meshes, DDS) | `not-started` |
 | Phase 3–8 | GPU rendering, scenery, sky/water, SpeedTree bridge, effects/audio/maps, optional Modules | `not-started` |
 
@@ -38,12 +38,21 @@ Install stable Rust from [rustup.rs](https://rustup.rs/), then from the reposito
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked --bin forsaken-world-explorer
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 cargo check --locked --bins
 ./tools/check-core.sh
 cargo run --locked --bin forsaken-world-explorer -- --self-test
+cargo run --locked --bin forsaken-world-explorer -- --smoke-launch
 ```
+
+### Survey a Local Client's Archives
+
+```sh
+cargo run --locked --bin pck-survey -- <path-to-forsaken-world-client> --out archive-survey.md
+```
+
+Add `--verify-payloads` to decompress and verify every entry payload across all `.pck`/`.pkx` archives.
 
 ## Portable Windows Package
 
@@ -61,4 +70,4 @@ Forsaken World Explorer/
   THIRD_PARTY_NOTICES.md
 ```
 
-Run `forsaken-world-explorer.exe --self-test` inside the extracted folder to verify settings persistence and executable-adjacent `Modules/` discovery without needing a GPU or game client.
+Run `forsaken-world-explorer.exe --self-test` and `forsaken-world-explorer.exe --smoke-launch` inside the extracted folder to verify settings persistence, `Modules/` discovery, synthetic `.pck`/`.pkx` reading, and UI initialization without needing a GPU or game client.

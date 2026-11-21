@@ -1,9 +1,8 @@
-mod modules;
-mod self_test;
-mod settings;
 mod ui;
 
 use std::{env, process::ExitCode};
+
+use forsaken_world_explorer::self_test;
 
 fn print_help() {
     println!(
@@ -13,9 +12,10 @@ fn print_help() {
          \tforsaken-world-explorer [OPTIONS]\n\
          \n\
          OPTIONS:\n\
-         \t--self-test    Run CPU-only self-checks (settings, modules, synthetic fixtures) and exit\n\
-         \t-V, --version  Print version information\n\
-         \t-h, --help     Print this help message",
+         \t--self-test     Run CPU-only self-checks (settings, modules, synthetic PCK/PKX) and exit\n\
+         \t--smoke-launch  Initialize app state and render every UI page headlessly without a GPU\n\
+         \t-V, --version   Print version information\n\
+         \t-h, --help      Print this help message",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -40,6 +40,18 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("[FAIL] self-test: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.iter().any(|arg| arg == "--smoke-launch") {
+        return match ui::run_smoke_launch() {
+            Ok(()) => {
+                println!("[PASS] smoke-launch: initialized app state and rendered all UI tabs");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("[FAIL] smoke-launch: {error}");
                 ExitCode::FAILURE
             }
         };

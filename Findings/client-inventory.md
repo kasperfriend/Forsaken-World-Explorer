@@ -9,7 +9,7 @@
 - **Main client executable:** `update/pem.exe`
   - **Size:** `10,703,784` bytes (`~10.21 MiB`)
   - **Last modified (Drive metadata):** `2016-02-05T14:38:50Z`
-  - **SHA-256:** **Not yet computed remotely** — the automated Drive download connector enforces a 10 MB single-file transfer limit (`10,703,784` bytes exceeds the limit). The user must run `Get-FileHash update\pem.exe -Algorithm SHA256` (Windows) or `sha256sum update/pem.exe` (Linux) locally so Phase 1 can record the exact recognized executable hash.
+  - **SHA-256:** `pending` (not computed remotely) — the automated Drive download connector enforces a 10 MB single-file transfer limit (`10,703,784` bytes exceeds the limit). The user must run `Get-FileHash update\pem.exe -Algorithm SHA256` (Windows) or `sha256sum update/pem.exe` (Linux) locally so Phase 1 can record the exact recognized executable hash.
 - **Additional client copies in Drive:** Only one Forsaken World client folder (`Forsaken World 0.525 Client`) and one Forsaken World source folder (`ForsakenWorldv260ClientSource`) exist under `Games/ForsakenWorld`.
 
 ## 2. Top-Level Client Folder Layout (`Forsaken World 0.525 Client`)
