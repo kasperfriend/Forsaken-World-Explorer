@@ -42,8 +42,20 @@ pub const DEFAULT_SCENERY_LOADS_PER_FRAME: u32 = 4;
 pub const MIN_FOG_DIST_MULT_PCT: u16 = 25;
 pub const MAX_FOG_DIST_MULT_PCT: u16 = 400;
 pub const DEFAULT_FOG_DIST_MULT_PCT: u16 = 100;
-/// Default time-of-day: 12:00 (`MID_NOON` in `EC_SunMoon.h`) = 720 minutes.
 pub const DEFAULT_TIME_OF_DAY_MINUTES: u16 = 720;
+
+pub const MIN_VEG_RADIUS_M: u32 = 32;
+pub const MAX_VEG_RADIUS_M: u32 = 1024;
+pub const DEFAULT_VEG_RADIUS_M: u32 = 180;
+pub const MIN_VEG_MAX_INSTANCES: u32 = 64;
+pub const MAX_VEG_MAX_INSTANCES: u32 = 16_384;
+pub const DEFAULT_VEG_MAX_INSTANCES: u32 = 2048;
+pub const MIN_VEG_LOADS_PER_FRAME: u32 = 1;
+pub const MAX_VEG_LOADS_PER_FRAME: u32 = 64;
+pub const DEFAULT_VEG_LOADS_PER_FRAME: u32 = 4;
+pub const MIN_TREE_LOD_DIST_MULT_PCT: u16 = 25;
+pub const MAX_TREE_LOD_DIST_MULT_PCT: u16 = 400;
+pub const DEFAULT_TREE_LOD_DIST_MULT_PCT: u16 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaterQuality {
@@ -53,11 +65,44 @@ pub enum WaterQuality {
 }
 
 impl WaterQuality {
-    /// Pass resolution percentage relative to the scaled 3D viewport.
     pub fn pass_scale_pct(self) -> u16 {
         match self {
             Self::Low => 25,
             Self::Medium => 50,
+            Self::High => 100,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" | "med" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrassDensity {
+    Low,
+    Medium,
+    High,
+}
+
+impl GrassDensity {
+    pub fn keep_percent(self) -> u32 {
+        match self {
+            Self::Low => 35,
+            Self::Medium => 65,
             Self::High => 100,
         }
     }
@@ -159,6 +204,13 @@ pub struct ViewerSettings {
     pub water_quality: WaterQuality,
     pub time_of_day_minutes: u16,
     pub follow_real_clock: bool,
+    pub trees_enabled: bool,
+    pub grass_enabled: bool,
+    pub grass_density: GrassDensity,
+    pub veg_radius_m: u32,
+    pub veg_max_instances: u32,
+    pub veg_loads_per_frame: u32,
+    pub tree_lod_dist_mult_pct: u16,
     pub music_volume: u8,
     pub ambience_volume: u8,
     pub effects_volume: u8,
@@ -186,6 +238,13 @@ impl Default for ViewerSettings {
             water_quality: WaterQuality::Medium,
             time_of_day_minutes: DEFAULT_TIME_OF_DAY_MINUTES,
             follow_real_clock: false,
+            trees_enabled: true,
+            grass_enabled: true,
+            grass_density: GrassDensity::Medium,
+            veg_radius_m: DEFAULT_VEG_RADIUS_M,
+            veg_max_instances: DEFAULT_VEG_MAX_INSTANCES,
+            veg_loads_per_frame: DEFAULT_VEG_LOADS_PER_FRAME,
+            tree_lod_dist_mult_pct: DEFAULT_TREE_LOD_DIST_MULT_PCT,
             music_volume: 70,
             ambience_volume: 70,
             effects_volume: 80,
@@ -200,6 +259,13 @@ impl ViewerSettings {
         (self
             .fog_distance_mult_pct
             .clamp(MIN_FOG_DIST_MULT_PCT, MAX_FOG_DIST_MULT_PCT) as f32)
+            / 100.0
+    }
+
+    pub fn tree_lod_distance_multiplier(&self) -> f32 {
+        (self
+            .tree_lod_dist_mult_pct
+            .clamp(MIN_TREE_LOD_DIST_MULT_PCT, MAX_TREE_LOD_DIST_MULT_PCT) as f32)
             / 100.0
     }
 
@@ -315,6 +381,28 @@ impl ViewerSettings {
             self.time_of_day_minutes % 1440
         ));
         out.push_str(&format!("follow_real_clock={}\n", self.follow_real_clock));
+        out.push_str(&format!("trees_enabled={}\n", self.trees_enabled));
+        out.push_str(&format!("grass_enabled={}\n", self.grass_enabled));
+        out.push_str(&format!("grass_density={}\n", self.grass_density.as_str()));
+        out.push_str(&format!(
+            "veg_radius_m={}\n",
+            self.veg_radius_m.clamp(MIN_VEG_RADIUS_M, MAX_VEG_RADIUS_M)
+        ));
+        out.push_str(&format!(
+            "veg_max_instances={}\n",
+            self.veg_max_instances
+                .clamp(MIN_VEG_MAX_INSTANCES, MAX_VEG_MAX_INSTANCES)
+        ));
+        out.push_str(&format!(
+            "veg_loads_per_frame={}\n",
+            self.veg_loads_per_frame
+                .clamp(MIN_VEG_LOADS_PER_FRAME, MAX_VEG_LOADS_PER_FRAME)
+        ));
+        out.push_str(&format!(
+            "tree_lod_dist_mult_pct={}\n",
+            self.tree_lod_dist_mult_pct
+                .clamp(MIN_TREE_LOD_DIST_MULT_PCT, MAX_TREE_LOD_DIST_MULT_PCT)
+        ));
         out.push_str(&format!("music_volume={}\n", self.music_volume.min(100)));
         out.push_str(&format!(
             "ambience_volume={}\n",
@@ -428,6 +516,44 @@ impl ViewerSettings {
                 "follow_real_clock" => {
                     if let Some(parsed) = parse_bool(value) {
                         settings.follow_real_clock = parsed;
+                    }
+                }
+                "trees_enabled" => {
+                    if let Some(parsed) = parse_bool(value) {
+                        settings.trees_enabled = parsed;
+                    }
+                }
+                "grass_enabled" => {
+                    if let Some(parsed) = parse_bool(value) {
+                        settings.grass_enabled = parsed;
+                    }
+                }
+                "grass_density" => {
+                    if let Some(parsed) = GrassDensity::parse(value) {
+                        settings.grass_density = parsed;
+                    }
+                }
+                "veg_radius_m" => {
+                    if let Ok(parsed) = value.parse::<u32>() {
+                        settings.veg_radius_m = parsed.clamp(MIN_VEG_RADIUS_M, MAX_VEG_RADIUS_M);
+                    }
+                }
+                "veg_max_instances" => {
+                    if let Ok(parsed) = value.parse::<u32>() {
+                        settings.veg_max_instances =
+                            parsed.clamp(MIN_VEG_MAX_INSTANCES, MAX_VEG_MAX_INSTANCES);
+                    }
+                }
+                "veg_loads_per_frame" => {
+                    if let Ok(parsed) = value.parse::<u32>() {
+                        settings.veg_loads_per_frame =
+                            parsed.clamp(MIN_VEG_LOADS_PER_FRAME, MAX_VEG_LOADS_PER_FRAME);
+                    }
+                }
+                "tree_lod_dist_mult_pct" => {
+                    if let Ok(parsed) = value.parse::<u16>() {
+                        settings.tree_lod_dist_mult_pct =
+                            parsed.clamp(MIN_TREE_LOD_DIST_MULT_PCT, MAX_TREE_LOD_DIST_MULT_PCT);
                     }
                 }
                 "music_volume" => {
@@ -546,6 +672,13 @@ mod tests {
             water_quality: WaterQuality::High,
             time_of_day_minutes: 1110,
             follow_real_clock: true,
+            trees_enabled: false,
+            grass_enabled: true,
+            grass_density: GrassDensity::High,
+            veg_radius_m: 300,
+            veg_max_instances: 4096,
+            veg_loads_per_frame: 8,
+            tree_lod_dist_mult_pct: 150,
             music_volume: 45,
             ambience_volume: 55,
             effects_volume: 90,
@@ -602,19 +735,15 @@ mod tests {
     fn malformed_and_out_of_range_values_fall_back_safely() {
         let raw = "\
 resolution_scale_pct=999
-fog_distance_mult_pct=9999
-water_quality=ultra
-time_of_day_minutes=1500
-scenery_radius_m=99999
-scenery_max_instances=1
-scenery_loads_per_frame=0
+grass_density=extreme
+veg_radius_m=9999
+tree_lod_dist_mult_pct=9999
 ";
         let parsed = ViewerSettings::from_text(raw);
         assert_eq!(parsed.resolution_scale_pct, MAX_RESOLUTION_SCALE_PCT);
-        assert_eq!(parsed.fog_distance_mult_pct, MAX_FOG_DIST_MULT_PCT);
-        assert_eq!(parsed.water_quality, WaterQuality::Medium);
-        assert_eq!(parsed.time_of_day_minutes, 60);
-        assert_eq!(parsed.scenery_radius_m, MAX_SCENERY_RADIUS_M);
+        assert_eq!(parsed.grass_density, GrassDensity::Medium);
+        assert_eq!(parsed.veg_radius_m, MAX_VEG_RADIUS_M);
+        assert_eq!(parsed.tree_lod_dist_mult_pct, MAX_TREE_LOD_DIST_MULT_PCT);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use glam::Vec3;
 
 use crate::{
     atmosphere, bmd, camera, dxt, logging, modules, pck, scenery, settings, terrain_block,
-    terrain_store, tex_cache, world_objects,
+    terrain_store, tex_cache, vegetation, world_objects,
 };
 
 #[derive(Debug)]
@@ -50,6 +50,13 @@ fn check_portable_settings_and_logs() -> Result<CheckResult, String> {
         water_quality: settings::WaterQuality::High,
         time_of_day_minutes: 900,
         follow_real_clock: false,
+        trees_enabled: true,
+        grass_enabled: true,
+        grass_density: settings::GrassDensity::High,
+        veg_radius_m: 240,
+        veg_max_instances: 3000,
+        veg_loads_per_frame: 6,
+        tree_lod_dist_mult_pct: 125,
         music_volume: 65,
         ambience_volume: 50,
         effects_volume: 85,
@@ -326,6 +333,50 @@ fn check_phase5_atmosphere_and_water() -> Result<CheckResult, String> {
     })
 }
 
+fn check_phase6_vegetation() -> Result<CheckResult, String> {
+    let tree = vegetation::synthetic::build_synthetic_tree_fwst(1, 0);
+    let encoded = tree.encode();
+    let decoded = vegetation::FwstTreeMesh::decode(&encoded)?;
+    if decoded != tree {
+        return Err("FWST v1 tree cache round-trip mismatch".into());
+    }
+    if vegetation::select_tree_lod(50.0, 1.0) != 0 || vegetation::select_tree_lod(150.0, 1.0) != 1 {
+        return Err("tree LOD distance selection mismatch".into());
+    }
+    let grass: Vec<vegetation::GrassPlacement> = (0..40u32)
+        .map(|i| vegetation::GrassPlacement {
+            export_id: i + 1,
+            grass_type: i % 2,
+            position: [(i as f32) * 2.0, 0.0, 0.0],
+            grid_size: 2.0,
+            grid_cols: 4,
+            grid_rows: 4,
+        })
+        .collect();
+    let high = vegetation::select_visible_grass(
+        &grass,
+        Vec3::ZERO,
+        100.0,
+        500,
+        settings::GrassDensity::High,
+    );
+    let low = vegetation::select_visible_grass(
+        &grass,
+        Vec3::ZERO,
+        100.0,
+        500,
+        settings::GrassDensity::Low,
+    );
+    if high.len() <= low.len() {
+        return Err("grass density thinning did not reduce instance count".into());
+    }
+    Ok(CheckResult {
+        name: "vegetation-speedtree-grass",
+        detail: "verified FWST v1 cache round-trip, tree LOD selection, and grass density/dedup"
+            .into(),
+    })
+}
+
 fn check_optional_client_env() -> CheckResult {
     match env::var_os(settings::ENV_CLIENT_DIR).filter(|v| !v.is_empty()) {
         Some(path) => {
@@ -368,6 +419,7 @@ pub fn run() -> Result<Vec<CheckResult>, String> {
         check_synthetic_world_decoders()?,
         check_synthetic_scenery_pipeline()?,
         check_phase5_atmosphere_and_water()?,
+        check_phase6_vegetation()?,
         check_optional_client_env(),
     ])
 }
@@ -379,6 +431,6 @@ mod tests {
     #[test]
     fn self_test_passes_on_cpu() {
         let results = run().expect("self-test should pass");
-        assert!(results.len() >= 7);
+        assert!(results.len() >= 8);
     }
 }

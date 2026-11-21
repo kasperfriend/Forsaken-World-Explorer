@@ -1,0 +1,11 @@
+[package]
+name = "fw-speedtree-helper"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "32-bit out-of-process SpeedTreeRT bridge helper for Forsaken World Explorer"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

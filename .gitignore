@@ -44,3 +44,4 @@ google_drive/
 Thumbs.db
 __pycache__/
 *.pyc
+target/
