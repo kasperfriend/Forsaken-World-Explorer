@@ -66,12 +66,44 @@ fn u32le(bytes: &[u8], offset: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(slice.try_into().unwrap()))
 }
 
+/// Canonical path normalizer used by every archive lookup:
+/// - Converts backslashes to forward slashes and collapses repeated slashes
+/// - Strips leading `./` and `/`
+/// - Lowercases ASCII while preserving GBK/GB18030-decoded Unicode characters
 pub fn normalize_entry_path(path: &str) -> String {
-    path.trim()
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .trim_start_matches('/')
-        .to_ascii_lowercase()
+    let replaced = path.trim().replace('\\', "/");
+    let mut collapsed = String::with_capacity(replaced.len());
+    let mut prev_slash = false;
+    for ch in replaced.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push('/');
+            }
+            prev_slash = true;
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+    let mut s = collapsed.as_str();
+    while let Some(rest) = s.strip_prefix("./").or_else(|| s.strip_prefix('/')) {
+        s = rest;
+    }
+    s.to_ascii_lowercase()
+}
+
+/// Normalize an asset reference for lookup inside a specific `.pck` archive whose
+/// internal entries omit the archive's mount folder (e.g. `Textures\maps\...`
+/// becomes `maps/...` when `archive_mount = Some("textures")`).
+pub fn normalize_archive_path(path: &str, archive_mount: Option<&str>) -> String {
+    let norm = normalize_entry_path(path);
+    if let Some(mount) = archive_mount {
+        let prefix = format!("{}/", mount.trim_matches('/').to_ascii_lowercase());
+        if let Some(rest) = norm.strip_prefix(&prefix) {
+            return rest.to_string();
+        }
+    }
+    norm
 }
 
 pub fn companion_pkx_path(pck_path: &Path) -> PathBuf {
@@ -254,7 +286,7 @@ impl PckArchive {
             let rec_len = (w0 ^ ENTRY_MASK) as usize;
             if (w1 ^ ENTRY_MASK ^ ENTRY_CHECK) != rec_len as u32
                 || rec_len == 0
-                || rec_len > ENTRY_RECORD_LEN
+                || rec_len > ENTRY_RECORD_LEN + 64
                 || cursor + 8 + rec_len > table.len()
             {
                 return Err(format!("invalid entry record header at index {i}"));
@@ -332,6 +364,48 @@ impl PckArchive {
     pub fn find_index(&self, name: &str) -> Option<usize> {
         let key = normalize_entry_path(name);
         self.index_by_norm.get(&key).copied()
+    }
+
+    /// Return up to `limit` closest entry names in this archive for diagnostics when a
+    /// lookup misses (case-insensitive, separators ignored; never guessed/substituted).
+    pub fn closest_entries(&self, query: &str, limit: usize) -> Vec<String> {
+        if limit == 0 || self.entries.is_empty() {
+            return Vec::new();
+        }
+        let q_norm = normalize_entry_path(query);
+        let q_flat: String = q_norm.chars().filter(|&c| c != '/' && c != '\\').collect();
+        let q_base = q_norm.rsplit('/').next().unwrap_or(&q_norm);
+        let q_stem = q_base.split('.').next().unwrap_or(q_base);
+
+        let mut scored: Vec<(u32, &str)> = Vec::new();
+        for e in &self.entries {
+            let en = normalize_entry_path(&e.name);
+            let e_base = en.rsplit('/').next().unwrap_or(&en);
+            let mut score = 0u32;
+            if e_base == q_base {
+                score += 100;
+            } else if !q_stem.is_empty() && e_base.contains(q_stem) {
+                score += 50;
+            }
+            let e_flat: String = en.chars().filter(|&c| c != '/' && c != '\\').collect();
+            if e_flat.contains(&q_flat) || q_flat.contains(&e_flat) {
+                score += 40;
+            }
+            for tok in q_norm.split('/').filter(|t| t.len() >= 2) {
+                if en.contains(tok) {
+                    score += 10;
+                }
+            }
+            if score > 0 {
+                scored.push((score, e.name.as_str()));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, s)| s.to_string())
+            .collect()
     }
 
     pub fn read_entry_by_index(&mut self, index: usize) -> Result<Vec<u8>, String> {
@@ -571,6 +645,76 @@ mod tests {
         fs::write(&path, &valid).unwrap();
         assert!(PckArchive::open(&path).is_err());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalizes_exact_s0_trn2_gbk_layer_paths_byte_for_byte() {
+        let raw_layers: [&[u8]; 5] = [
+            &[
+                0x54, 0x65, 0x78, 0x74, 0x75, 0x72, 0x65, 0x73, 0x5c, 0x6d, 0x61, 0x70, 0x73, 0x5c,
+                0xb9, 0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0x5c, 0xd1, 0xe5, 0xb9,
+                0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0xcd, 0xc1, 0x30, 0x31, 0x2e,
+                0x64, 0x64, 0x73,
+            ],
+            &[
+                0x54, 0x65, 0x78, 0x74, 0x75, 0x72, 0x65, 0x73, 0x5c, 0x6d, 0x61, 0x70, 0x73, 0x5c,
+                0xb9, 0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0x5c, 0xd1, 0xe5, 0xb9,
+                0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0xb2, 0xdd, 0x30, 0x31, 0x2e,
+                0x64, 0x64, 0x73,
+            ],
+            &[
+                0x54, 0x65, 0x78, 0x74, 0x75, 0x72, 0x65, 0x73, 0x5c, 0x6d, 0x61, 0x70, 0x73, 0x5c,
+                0xb9, 0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0x5c, 0xd1, 0xe5, 0xb9,
+                0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0xc9, 0xbd, 0x30, 0x31, 0x2e,
+                0x64, 0x64, 0x73,
+            ],
+            &[
+                0x54, 0x65, 0x78, 0x74, 0x75, 0x72, 0x65, 0x73, 0x5c, 0x6d, 0x61, 0x70, 0x73, 0x5c,
+                0xb9, 0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0x5c, 0xd1, 0xe5, 0xb9,
+                0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0xd1, 0xd2, 0xbd, 0xac, 0xca,
+                0xaf, 0xcd, 0xb7, 0x30, 0x31, 0x2e, 0x64, 0x64, 0x73,
+            ],
+            &[
+                0x54, 0x65, 0x78, 0x74, 0x75, 0x72, 0x65, 0x73, 0x5c, 0x6d, 0x61, 0x70, 0x73, 0x5c,
+                0xb9, 0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0x5c, 0xd1, 0xe5, 0xb9,
+                0xc5, 0xc2, 0xde, 0xc2, 0xed, 0xd5, 0xbd, 0xb3, 0xa1, 0xd1, 0xd2, 0xbd, 0xac, 0x30,
+                0x31, 0x2e, 0x64, 0x64, 0x73,
+            ],
+        ];
+        let mut decoded_strings = Vec::new();
+        let mut archive_keys = Vec::new();
+        for raw in raw_layers {
+            let (s, _, had_errors) = GB18030.decode(raw);
+            assert!(!had_errors);
+            let k = normalize_archive_path(&s, Some("textures"));
+            assert!(k.starts_with("maps/古罗马战场/"));
+            assert!(k.ends_with("01.dds"));
+            decoded_strings.push(s.into_owned());
+            archive_keys.push(k);
+        }
+
+        let dir = temp_dir("s0-gbk-layers");
+        let pck_path = dir.join("textures.pck");
+        let entries_owned: Vec<(String, Vec<u8>)> = archive_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.replace('/', "\\"), vec![i as u8 + 1; 16]))
+            .collect();
+        let entry_refs: Vec<(&str, &[u8])> = entries_owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        synthetic::write_pck(&pck_path, &entry_refs).unwrap();
+
+        let mut arch = PckArchive::open(&pck_path).unwrap();
+        for (i, raw_str) in decoded_strings.iter().enumerate() {
+            let key = normalize_archive_path(raw_str, Some("textures"));
+            let data = arch.read_entry(&key).expect("s0 GBK layer must resolve");
+            assert_eq!(data, vec![i as u8 + 1; 16]);
+        }
+        let closest = arch.closest_entries("Textures/maps/古罗马战场/彦古罗马战场土99.dds", 3);
+        assert!(!closest.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

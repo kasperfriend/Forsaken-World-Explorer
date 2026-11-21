@@ -32,3 +32,25 @@ This document records the binary formats used for static scenery and building pl
 - **Opaque & alpha-tested submeshes:** Drawn in the opaque pass (`alpha_cutoff = 0.0` or `0.5` discard) with depth test and depth write enabled.
 - **Transparent / alpha-blended submeshes (`AlphaMode::TransparentDeferred`):** Now drawn in **Phase 5** after the opaque pass and before water, sorted back-to-front per instance and per submesh, with alpha blending enabled and depth write disabled (toggled via **Settings → World → Transparent scenery**).
 - **Per-vertex day/night lighting:** Submeshes with `v3`–`v5` vertex light arrays blend `day_diffuse` and `night_diffuse` using the `EC_SunMoon` time-of-day `dn_factor`. Meshes without vertex light arrays (`v2`) fall back to directional + hemisphere lighting and are labeled `approximate` in Diagnostics.
+
+## Placement Height & Axis-Mapping Verification (`maps/s0/`)
+
+Verified across all **1,884** unique ornament placements in `maps/s0/s0.ecwld` (v14) + `maps/s0/s0.ecbsd` (v15) against the decoded `maps/s0/s0_1.t2bk` (v6, 256/256 blocks) heightfield using the renderer's exact `sample_angelica_height` sampler (no fudge offset applied):
+
+```text
+| Candidate Mapping | Median |dy| | Min |dy| | Max |dy| | >1m | >5m | >20m |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Angelica (x, y, z) on Z=+512-row*64-gz*2 | 0.33 m | 0.00 m | 139.30 m | 404 | 170 | 38 |
+| X negated (-x, y, z) | 5.41 m | 0.00 m | 139.30 m | 1777 | 1143 | 238 |
+| X/Z swapped (z, y, x) | 17.16 m | 0.00 m | 144.82 m | 1660 | 1466 | 829 |
+| X&Z negated (-x, y, -z) | 22.06 m | 0.00 m | 148.28 m | 1805 | 1697 | 1210 |
+| Z negated (x, y, -z) | 25.17 m | 0.02 m | 139.30 m | 1828 | 1784 | 1347 |
+| Non-flipped terrain Z=-512+row*64+gz*2 | 25.17 m | 0.02 m | 139.30 m | 1828 | 1784 | 1347 |
+| Y/Z swapped (x, z, y) | 187.73 m | 0.24 m | 495.55 m | 1864 | 1801 | 1681 |
+```
+
+### Evidence & Outlier Explanation
+- **Winning mapping:** Angelica `(x, y, z)` on `Z = +world_length/2 - row*block_size - gz*step` produces a **0.33 m** median `|dy|` across all 1,884 placements (**1,480 / 1,884** within 1 m; **1,714 / 1,884** within 5 m), beating every alternative sign/axis mapping by 16× to 560×.
+- **Outliers (`|dy| > 20 m`, 38 of 1,884 — left unchanged with zero fudge offset):**
+  - `id=2275` at `(0.00, 0.00, 0.00)` (`terrain_h = 139.30 m`, `dy = -139.30 m`, `1\litmodel_3218.bmd`): origin-baked world-space composite mesh whose geometry carries its own world-space offset.
+  - Perimeter arena cliff/wall/arch structures (`id=72`, `id=479`, `id=4`, `id=48`, `id=73`, `id=75`, `id=38`, `id=74`, `id=128`) whose authored pivots sit below steep perimeter cliffs or elevated above the arena floor. No fudge offset is added.

@@ -46,7 +46,10 @@ use forsaken_world_explorer::{
         TreeTypeDef, DEFAULT_HELPER_TIMEOUT_SECS, SPEEDTREE_CACHE_SUBDIR,
     },
     world_objects::{self, OrnamentPlacement},
-    zone_dump::{bmd_lookup_candidates, texture_lookup_candidates},
+    zone_dump::{
+        bmd_lookup_candidates_for_archive, open_all_resource_pcks,
+        texture_lookup_candidates_for_archive, FailureGroup,
+    },
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +81,8 @@ struct TerrainCallback {
     vegetation: Arc<VegetationDrawSnapshot>,
     water: Arc<WaterRenderSnapshot>,
     draw_sky_gradient: bool,
+    terrain_has_real_textures: bool,
+    terrain_wireframe_debug: bool,
 }
 
 impl egui_wgpu::CallbackTrait for TerrainCallback {
@@ -106,6 +111,8 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             &self.vegetation,
             &self.water,
             self.draw_sky_gradient,
+            self.terrain_has_real_textures,
+            self.terrain_wireframe_debug,
         )]
     }
 
@@ -129,8 +136,10 @@ struct ActiveSceneryState {
     water_planes: Vec<WaterPlane>,
     model_cache: SceneryModelCache,
     tex_cache: TextureCache,
-    bmd_archives: Vec<PckArchive>,
-    tex_archives: Vec<PckArchive>,
+    resource_archives: Vec<(String, String, PckArchive)>,
+    archive_open_errors: Vec<(String, String)>,
+    failure_groups: BTreeMap<String, FailureGroup>,
+    bmd_tex_failed: usize,
     synthetic_bmd_bytes: Option<Vec<u8>>,
     revision: u64,
 }
@@ -172,26 +181,7 @@ impl ActiveSceneryState {
                     )
                 });
 
-        let res_dir = client_root.join("resources");
-        let mut bmd_archives = Vec::new();
-        for name in ["litmodels.pck", "building.pck"] {
-            let p = res_dir.join(name);
-            if p.is_file() {
-                if let Ok(a) = PckArchive::open(&p) {
-                    bmd_archives.push(a);
-                }
-            }
-        }
-        let mut tex_archives = Vec::new();
-        for name in ["textures.pck", "litmodels.pck", "building.pck"] {
-            let p = res_dir.join(name);
-            if p.is_file() {
-                if let Ok(a) = PckArchive::open(&p) {
-                    tex_archives.push(a);
-                }
-            }
-        }
-
+        let (resource_archives, archive_open_errors) = open_all_resource_pcks(client_root);
         let model_cache = SceneryModelCache::open(cache_root)?;
         let tex_cache = TextureCache::new(tex_budget_bytes);
         Ok(Self {
@@ -202,8 +192,10 @@ impl ActiveSceneryState {
             water_planes: Vec::new(),
             model_cache,
             tex_cache,
-            bmd_archives,
-            tex_archives,
+            resource_archives,
+            archive_open_errors,
+            failure_groups: BTreeMap::new(),
+            bmd_tex_failed: 0,
             synthetic_bmd_bytes: None,
             revision: 0,
         })
@@ -254,8 +246,10 @@ impl ActiveSceneryState {
             water_planes,
             model_cache,
             tex_cache,
-            bmd_archives: Vec::new(),
-            tex_archives: Vec::new(),
+            resource_archives: Vec::new(),
+            archive_open_errors: Vec::new(),
+            failure_groups: BTreeMap::new(),
+            bmd_tex_failed: 0,
             synthetic_bmd_bytes: Some(raw_bmd),
             revision: 0,
         })
@@ -331,7 +325,8 @@ impl ActiveSceneryState {
         let zone = self.zone.clone();
         let client_root_opt = self.client_root.clone();
         let synth = self.synthetic_bmd_bytes.clone();
-        let bmd_archives = &mut self.bmd_archives;
+        let resource_archives = &mut self.resource_archives;
+        let has_open_errors = !self.archive_open_errors.is_empty();
         let (_decoded_now, errs, drawn_instances, _total_trans) = scenery::step_streaming_frame(
             &mut self.model_cache,
             &dedup,
@@ -340,10 +335,9 @@ impl ActiveSceneryState {
                 if let Some(raw) = &synth {
                     return Ok(raw.clone());
                 }
-                let candidates = bmd_lookup_candidates(&zone, model_key);
-                for arch in bmd_archives.iter_mut() {
-                    for cand in &candidates {
-                        if let Ok(bytes) = arch.read_entry(cand) {
+                for (_, mount, arch) in resource_archives.iter_mut() {
+                    for cand in bmd_lookup_candidates_for_archive(&zone, model_key, Some(mount)) {
+                        if let Ok(bytes) = arch.read_entry(&cand) {
                             return Ok(bytes);
                         }
                     }
@@ -357,13 +351,34 @@ impl ActiveSceneryState {
                         return Ok(bytes);
                     }
                 }
-                Err(format!(
-                    "model not found in litmodels.pck/building.pck: {model_key}"
-                ))
+                if resource_archives.is_empty() {
+                    if has_open_errors {
+                        Err(format!("archive_open_error: {model_key}"))
+                    } else {
+                        Err(format!("archive_not_found: {model_key}"))
+                    }
+                } else {
+                    Err(format!("entry_not_found: {model_key}"))
+                }
             },
         );
-        if let Some(log) = logger.as_mut() {
-            for e in &errs {
+        for e in &errs {
+            let (reason, sample) = if e.contains("archive_open_error") {
+                ("archive_open_error", e.as_str())
+            } else if e.contains("archive_not_found") {
+                ("archive_not_found", e.as_str())
+            } else if e.contains("entry_not_found") {
+                ("entry_not_found", e.as_str())
+            } else if e.contains("version") {
+                ("unsupported_bmd_version", e.as_str())
+            } else {
+                ("bmd_parse_error", e.as_str())
+            };
+            self.failure_groups
+                .entry(reason.to_string())
+                .or_default()
+                .record(sample.to_string());
+            if let Some(log) = logger.as_mut() {
                 log.warn(&format!("Scenery decode error: {e}"));
             }
         }
@@ -376,33 +391,43 @@ impl ActiveSceneryState {
 
         for (b_idx, batch) in dedup.iter().enumerate() {
             if let Some(model) = self.model_cache.get(&batch.model_key) {
-                let tex_archives = &mut self.tex_archives;
+                let resource_archives = &mut self.resource_archives;
                 let tex_cache = &mut self.tex_cache;
+                let bmd_tex_failed = &mut self.bmd_tex_failed;
                 let (op, tr, approx, skipped) = build_scenery_batches_for_model(
                     &model,
                     &batch.transforms,
                     settings.transparent_scenery_enabled,
                     (b_idx as u64) << 32,
                     |tex_path| {
-                        tex_cache
-                            .get_or_insert_pinned(tex_path, || {
-                                let candidates = texture_lookup_candidates(tex_path);
-                                for arch in tex_archives.iter_mut() {
-                                    for cand in &candidates {
-                                        if let Ok(bytes) = arch.read_entry(cand) {
-                                            let surf = dxt::parse_dds(&bytes)?;
-                                            let rgba = dxt::decode_rgba8(&surf);
-                                            return Ok(DecodedTexture {
-                                                width: surf.width,
-                                                height: surf.height,
-                                                rgba,
-                                            });
-                                        }
+                        let res = tex_cache.get_or_insert_pinned(tex_path, || {
+                            for (_, mount, arch) in resource_archives.iter_mut() {
+                                if !matches!(
+                                    mount.as_str(),
+                                    "textures" | "litmodels" | "building" | "models" | "surfaces"
+                                ) {
+                                    continue;
+                                }
+                                for cand in
+                                    texture_lookup_candidates_for_archive(tex_path, Some(mount))
+                                {
+                                    if let Ok(bytes) = arch.read_entry(&cand) {
+                                        let surf = dxt::parse_dds(&bytes)?;
+                                        let rgba = dxt::decode_rgba8(&surf);
+                                        return Ok(DecodedTexture {
+                                            width: surf.width,
+                                            height: surf.height,
+                                            rgba,
+                                        });
                                     }
                                 }
-                                Err(format!("missing texture in archives: {tex_path}"))
-                            })
-                            .ok()
+                            }
+                            Err(format!("missing texture in archives: {tex_path}"))
+                        });
+                        if res.is_err() {
+                            *bmd_tex_failed += 1;
+                        }
+                        res.ok()
                     },
                 );
                 opaque_batches.extend(op);
@@ -456,6 +481,7 @@ impl ActiveSceneryState {
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
 struct VegetationDiagnostics {
     trees_total: usize,
     trees_in_range: usize,
@@ -806,6 +832,7 @@ pub struct ExplorerApp {
     world_settings_tab: SettingsTab,
     show_diagnostics: bool,
     show_developer_tools: bool,
+    terrain_wireframe_debug: bool,
     started_at: Instant,
     terrain_session: Option<TerrainSession>,
     scenery_state: Option<ActiveSceneryState>,
@@ -921,6 +948,7 @@ impl ExplorerApp {
             world_settings_tab: SettingsTab::Graphics,
             show_diagnostics: true,
             show_developer_tools: false,
+            terrain_wireframe_debug: false,
             started_at: Instant::now(),
             terrain_session: None,
             scenery_state: None,
@@ -1052,7 +1080,15 @@ impl ExplorerApp {
                     pitch: -0.25,
                     ..Default::default()
                 };
-                let _ = session.update_for_camera(self.camera.position, self.streaming_radius);
+                if let Err(err) =
+                    session.update_for_camera(self.camera.position, self.streaming_radius)
+                {
+                    if let Some(log) = self.logger.as_mut() {
+                        log.error(&format!(
+                            "[Stage 1 Terrain] update_for_camera FAILED: {err}"
+                        ));
+                    }
+                }
                 if let Some(log) = self.logger.as_mut() {
                     log.info(&format!(
                         "[Stage 1 Terrain] OK: {}x{} blocks, streamed={}, height(0,0)={origin_h:.2}m, spawn=({:.1}, {:.1}, {:.1})",
@@ -1078,11 +1114,17 @@ impl ExplorerApp {
                     Ok(st) => {
                         let count = st.placements.len();
                         let boxes = st.box_areas.len();
-                        let bmd_pcks = st.bmd_archives.len();
+                        let bmd_pcks = st.resource_archives.len();
                         if let Some(log) = self.logger.as_mut() {
                             log.info(&format!(
-                                "[Stage 2 Scenery] OK: {count} placements, {bmd_pcks} building archive(s) opened"
+                                "[Stage 2 Scenery] OK: {count} placements, {bmd_pcks} resource .pck archive(s) opened, {} open error(s)",
+                                st.archive_open_errors.len()
                             ));
+                            for (aname, aerr) in &st.archive_open_errors {
+                                log.error(&format!(
+                                    "[Stage 2 Scenery] PCK open error {aname}: {aerr}"
+                                ));
+                            }
                             log.info(&format!(
                                 "[Stage 4 Atmosphere/Water] box_areas={boxes}, water_planes={} | Sky: missing (Issue #15) | Effects: missing",
                                 st.water_planes.len()
@@ -1510,6 +1552,11 @@ impl ExplorerApp {
                 vegetation: Arc::clone(&self.veg_arc),
                 water: Arc::clone(&self.water_arc),
                 draw_sky_gradient: is_synthetic,
+                terrain_has_real_textures: self
+                    .terrain_session
+                    .as_ref()
+                    .is_some_and(|s| s.terrain_layers_loaded > 0),
+                terrain_wireframe_debug: self.terrain_wireframe_debug,
             },
         );
         ui.painter().add(cb);
@@ -1561,52 +1608,103 @@ impl ExplorerApp {
         // 1 Hz Diagnostics overlay (bottom-right)
         if self.show_diagnostics {
             let d = &self.displayed_diag;
-            let vd = &self.displayed_veg_diag;
+            let terrain_layers_loaded = self
+                .terrain_session
+                .as_ref()
+                .map(|s| s.terrain_layers_loaded)
+                .unwrap_or(0);
+            let terrain_layers_failed = self
+                .terrain_session
+                .as_ref()
+                .map(|s| s.terrain_layers_failed)
+                .unwrap_or(0);
+            let terrain_tex_bytes = self
+                .terrain_session
+                .as_ref()
+                .map(|s| s.terrain_tex_bytes)
+                .unwrap_or(0);
+            let terrain_drawn_blocks = if terrain_layers_loaded > 0 || self.terrain_wireframe_debug
+            {
+                self.mesh_arc.streamed_blocks
+            } else {
+                0
+            };
+            let terrain_reason = if terrain_drawn_blocks == 0 {
+                if self.mesh_arc.streamed_blocks == 0 {
+                    " (no zone loaded)"
+                } else {
+                    " (0 terrain textures resolved; enable wireframe debug in Settings -> World)"
+                }
+            } else if terrain_layers_loaded == 0 && self.terrain_wireframe_debug {
+                " [WIREFRAME DEBUG]"
+            } else {
+                ""
+            };
+            let total_tex_loaded = terrain_layers_loaded + d.textures_cached;
+            let bmd_tex_failed = self
+                .scenery_state
+                .as_ref()
+                .map(|s| s.bmd_tex_failed)
+                .unwrap_or(0);
+            let total_tex_failed = terrain_layers_failed + bmd_tex_failed;
+            let total_tex_bytes = terrain_tex_bytes + d.texture_cache_bytes;
+            let tex_reason = if total_tex_loaded == 0 {
+                " (check logs/ or --dump-zone for missing entries or PCK open errors)"
+            } else {
+                ""
+            };
+            let bmd_reason = if d.models_loaded == 0 {
+                " (see failure reasons below)"
+            } else {
+                ""
+            };
+
             egui::Area::new(egui::Id::new("world_diagnostics_panel"))
-                .fixed_pos(rect.right_bottom() + egui::vec2(-320.0, -185.0))
+                .fixed_pos(rect.right_bottom() + egui::vec2(-380.0, -240.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.strong("Diagnostics (1 Hz)");
                         ui.small(format!(
-                            "Terrain blocks: {} ({} KiB hot RAM)",
+                            "Terrain blocks drawn: {} (streamed={}, {} KiB hot RAM){}",
+                            terrain_drawn_blocks,
                             self.mesh_arc.streamed_blocks,
-                            self.mesh_arc.hot_ram_bytes / 1024
+                            self.mesh_arc.hot_ram_bytes / 1024,
+                            terrain_reason
                         ));
                         ui.small(format!(
-                            "Placements: {} in range / {} total | .bmd loaded: {} (failed: {})",
+                            "Textures: loaded={}, failed={}, bytes={:.2} MiB{}",
+                            total_tex_loaded,
+                            total_tex_failed,
+                            total_tex_bytes as f64 / (1024.0 * 1024.0),
+                            tex_reason
+                        ));
+                        ui.small(format!(
+                            "Placements: in_range={}/{}, loaded={}, drawn={}, failed={}{}",
                             d.placements_in_range,
                             d.placements_total,
                             d.models_loaded,
-                            d.decode_failures
-                        ));
-                        ui.small(format!(
-                            "Instances drawn: {} | Transparent: drawn={}, skipped={}",
                             d.instances_drawn,
-                            d.transparent_submeshes_drawn,
-                            d.transparent_submeshes_skipped
+                            d.decode_failures,
+                            bmd_reason
                         ));
-                        ui.small(format!(
-                            "Textures: {} ({:.1} / {:.1} MiB) | Water visible: {}",
-                            d.textures_cached,
-                            d.texture_cache_bytes as f64 / (1024.0 * 1024.0),
-                            d.texture_budget_bytes as f64 / (1024.0 * 1024.0),
-                            d.water_planes_visible
-                        ));
-                        ui.small(format!(
-                            "Trees: {}/{} ({} meshes, {:.1} KiB) | Grass: {}/{} ({} total) | Helper: {}",
-                            vd.trees_in_range,
-                            vd.trees_total,
-                            vd.trees_loaded,
-                            vd.speedtree_cache_bytes as f64 / 1024.0,
-                            vd.grass_drawn,
-                            vd.grass_in_range,
-                            vd.grass_total,
-                            if vd.helper_status.is_empty() {
-                                "idle"
-                            } else {
-                                &vd.helper_status
+                        if let Some(st) = &self.scenery_state {
+                            if !st.archive_open_errors.is_empty() {
+                                for (name, err) in st.archive_open_errors.iter().take(2) {
+                                    ui.small(format!("  PCK open error ({name}): {err}"));
+                                }
                             }
-                        ));
+                            if !st.failure_groups.is_empty() {
+                                ui.small("Building failures by reason:");
+                                for (reason, grp) in &st.failure_groups {
+                                    let sample =
+                                        grp.samples.first().map(String::as_str).unwrap_or("-");
+                                    ui.small(format!(
+                                        "  - {reason}: {} (e.g. {sample})",
+                                        grp.count
+                                    ));
+                                }
+                            }
+                        }
                         ui.small(
                             "Sky: missing (Issue #15) | Effects: missing | Audio: not started",
                         );
@@ -1915,6 +2013,10 @@ impl ExplorerApp {
             SettingsTab::World => {
                 ui.label("Static scenery streaming and transparency controls.");
                 ui.add_space(6.0);
+                ui.checkbox(
+                    &mut self.terrain_wireframe_debug,
+                    "Terrain wireframe debug mode (only when 0 terrain textures resolve; default off)",
+                );
                 changed |= ui
                     .checkbox(
                         &mut self.settings.scenery_enabled,

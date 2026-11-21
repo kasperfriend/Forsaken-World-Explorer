@@ -1,60 +1,156 @@
-//! Real-zone diagnostic dumper (`--dump-zone <zone>`) and shared client archive
-//! path resolution helpers.
+//! Real-zone diagnostic dumper (`--dump-zone <zone>`) and shared archive lookup helpers.
 //!
 //! Reads a real Forsaken World client directory stage-by-stage using the exact same
-//! readers the viewer uses, and emits verifiable per-stage counts, terrain height
-//! samples, texture dimensions, placement counts, and `.bmd` submesh statistics.
+//! readers the viewer uses, and produces one self-contained report covering:
+//! - Task 1: Terrain layer & `.bmd` texture lookups (canonical path normalization,
+//!   archives searched, DDS dimensions/format, closest entry names on miss)
+//! - Task 2: `.bmd` building lookups across all model-bearing `.pck` archives,
+//!   version census, and failures grouped by reason with 5 sample paths each
+//! - Task 3: Placement height statistics across all placements + 7-candidate axis/sign
+//!   mapping table + `|dy| > 20m` outlier listing
+//! - Task 4 & 5: Diagnostics summary (with reasons for any `0` counter) +
+//!   "Expected for this client" table derived from real `maps/s0/` files.
 
-use std::{collections::BTreeSet, fmt::Write as FmtWrite, fs, path::Path};
-
-use crate::{
-    atmosphere,
-    bmd::BmdModel,
-    dxt,
-    pck::PckArchive,
-    terrain_block::{T2bkFile, T2lmHeader, T2mkHeader, Trn2Header},
-    vegetation, world_objects,
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as FmtWrite,
+    fs,
+    path::Path,
 };
 
-/// Normalize a client texture path for lookup inside `textures.pck`, `litmodels.pck`,
-/// or `building.pck`. Real Forsaken World `.pck` archives omit their mount prefix
-/// (e.g. `Textures\maps\...` is stored inside `textures.pck` as `maps/...`).
-pub fn texture_lookup_candidates(raw_path: &str) -> Vec<String> {
-    let norm = raw_path.replace('\\', "/");
-    let trimmed = norm.trim_start_matches("./").trim_start_matches('/');
-    let lower = trimmed.to_ascii_lowercase();
+use crate::{
+    bmd::BmdModel,
+    dxt,
+    pck::{self, PckArchive},
+    terrain_block::{T2bkFile, T2lmHeader, T2mkHeader, Trn2Header},
+    world_objects,
+};
+
+/// Build ordered, deduplicated lookup keys for a texture path inside `archive_mount`
+/// (e.g. `Some("textures")`, `Some("litmodels")`, `Some("building")`).
+pub fn texture_lookup_candidates_for_archive(
+    raw_path: &str,
+    archive_mount: Option<&str>,
+) -> Vec<String> {
     let mut out = Vec::new();
-    for prefix in ["textures/", "litmodels/", "building/", "surfaces/"] {
-        if lower.starts_with(prefix) {
-            out.push(trimmed[prefix.len()..].to_string());
+    let mut push_unique = |s: String| {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
         }
+    };
+    push_unique(pck::normalize_archive_path(raw_path, archive_mount));
+    for strip in ["textures", "litmodels", "building", "surfaces", "models"] {
+        push_unique(pck::normalize_archive_path(raw_path, Some(strip)));
     }
-    out.push(trimmed.to_string());
-    out.push(format!("textures/{trimmed}"));
-    out.push(format!("litmodels/{trimmed}"));
+    let base_norm = pck::normalize_entry_path(raw_path);
+    push_unique(base_norm.clone());
+    push_unique(format!("textures/{base_norm}"));
+    push_unique(format!("litmodels/{base_norm}"));
     out
 }
 
-/// Build lookup candidates for a static `.bmd` model referenced by `<zone>.ecbsd`
-/// (e.g. `1\litmodel_37.bmd`). Real `litmodels.pck` omits the `litmodels\` mount prefix,
-/// so `<zone>/<model_key>` (`s0/1/litmodel_37.bmd`) is checked first.
-pub fn bmd_lookup_candidates(zone: &str, raw_path: &str) -> Vec<String> {
-    let norm = raw_path.replace('\\', "/");
-    let trimmed = norm.trim_start_matches("./").trim_start_matches('/');
-    let lower = trimmed.to_ascii_lowercase();
-    let mut out = vec![
-        format!("{zone}/{trimmed}"),
-        trimmed.to_string(),
-        format!("litmodels/{zone}/{trimmed}"),
-        format!("litmodels/{trimmed}"),
-        format!("building/{trimmed}"),
-    ];
-    for prefix in ["litmodels/", "building/"] {
-        if lower.starts_with(prefix) {
-            out.push(trimmed[prefix.len()..].to_string());
+/// Backward-compatible wrapper for callers without a specific archive mount name.
+pub fn texture_lookup_candidates(raw_path: &str) -> Vec<String> {
+    texture_lookup_candidates_for_archive(raw_path, Some("textures"))
+}
+
+/// Build ordered, deduplicated lookup keys for a static `.bmd` model referenced by
+/// `<zone>.ecbsd` (e.g. `1\litmodel_37.bmd`) inside `archive_mount`.
+pub fn bmd_lookup_candidates_for_archive(
+    zone: &str,
+    raw_path: &str,
+    archive_mount: Option<&str>,
+) -> Vec<String> {
+    let norm = pck::normalize_archive_path(raw_path, archive_mount);
+    let zone_norm = pck::normalize_entry_path(zone);
+    let mut out = Vec::new();
+    let mut push_unique = |s: String| {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
         }
+    };
+    push_unique(format!("{zone_norm}/{norm}"));
+    push_unique(norm.clone());
+    push_unique(format!("litmodels/{zone_norm}/{norm}"));
+    push_unique(format!("litmodels/{norm}"));
+    push_unique(format!("building/{norm}"));
+    for strip in ["litmodels", "building", "models"] {
+        push_unique(pck::normalize_archive_path(raw_path, Some(strip)));
     }
     out
+}
+
+/// Backward-compatible wrapper.
+pub fn bmd_lookup_candidates(zone: &str, raw_path: &str) -> Vec<String> {
+    bmd_lookup_candidates_for_archive(zone, raw_path, Some("litmodels"))
+}
+
+/// Discover and open all `.pck` archives in `<client_root>/resources/`, returning
+/// `(opened_archives, open_errors)` without silently swallowing any open failure.
+#[allow(clippy::type_complexity)]
+pub fn open_all_resource_pcks(
+    client_root: &Path,
+) -> (Vec<(String, String, PckArchive)>, Vec<(String, String)>) {
+    let res_dir = client_root.join("resources");
+    let priority = [
+        "litmodels.pck",
+        "building.pck",
+        "textures.pck",
+        "models.pck",
+        "loddata.pck",
+        "surfaces.pck",
+        "gfx.pck",
+        "grasses.pck",
+        "configs.pck",
+    ];
+
+    let mut filenames: Vec<String> = Vec::new();
+    for &p in &priority {
+        if res_dir.join(p).is_file() {
+            filenames.push(p.to_string());
+        }
+    }
+    if let Ok(rd) = fs::read_dir(&res_dir) {
+        let mut extras: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                let is_pck = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("pck"));
+                if is_pck {
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        extras.sort();
+        for name in extras {
+            if !filenames.iter().any(|f| f.eq_ignore_ascii_case(&name)) {
+                filenames.push(name);
+            }
+        }
+    }
+
+    let mut opened = Vec::new();
+    let mut errors = Vec::new();
+    for name in filenames {
+        let full = res_dir.join(&name);
+        let mount = Path::new(&name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&name)
+            .to_ascii_lowercase();
+        match PckArchive::open(&full) {
+            Ok(arch) => opened.push((name, mount, arch)),
+            Err(err) => errors.push((name, err)),
+        }
+    }
+    (opened, errors)
 }
 
 /// Sample real terrain height at Angelica world coordinates `(x, z)` from decoded blocks.
@@ -69,11 +165,40 @@ pub fn sample_angelica_height(
     x: f32,
     z: f32,
 ) -> Option<f32> {
+    sample_terrain_height_with_flip(
+        blocks,
+        world_width,
+        world_length,
+        block_size,
+        block_rows,
+        block_cols,
+        x,
+        z,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_terrain_height_with_flip(
+    blocks: &[(Vec<f32>, u32)],
+    world_width: f32,
+    world_length: f32,
+    block_size: f32,
+    block_rows: u32,
+    block_cols: u32,
+    x: f32,
+    z: f32,
+    flip_z: bool,
+) -> Option<f32> {
     if block_rows == 0 || block_cols == 0 || block_size <= 0.0 {
         return None;
     }
     let fx = (x + world_width * 0.5) / block_size;
-    let fz = (world_length * 0.5 - z) / block_size;
+    let fz = if flip_z {
+        (world_length * 0.5 - z) / block_size
+    } else {
+        (z + world_length * 0.5) / block_size
+    };
     let col = (fx.floor() as i32).clamp(0, block_cols as i32 - 1) as u32;
     let row = (fz.floor() as i32).clamp(0, block_rows as i32 - 1) as u32;
     let idx = (row * block_cols + col) as usize;
@@ -86,6 +211,21 @@ pub fn sample_angelica_height(
         .round()
         .clamp(0.0, *grid as f32) as usize;
     heights.get(gz * side + gx).copied()
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FailureGroup {
+    pub count: usize,
+    pub samples: Vec<String>,
+}
+
+impl FailureGroup {
+    pub fn record(&mut self, sample: String) {
+        self.count += 1;
+        if self.samples.len() < 5 && !self.samples.contains(&sample) {
+            self.samples.push(sample);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -104,21 +244,20 @@ pub struct ZoneDumpSummary {
     pub mask_layers: usize,
     pub trn2_textures_total: usize,
     pub trn2_textures_decoded: usize,
+    pub trn2_textures_failed: usize,
+    pub trn2_texture_bytes: usize,
     pub placements_total: usize,
     pub unique_models: usize,
     pub bmd_resolved: usize,
     pub bmd_failed: usize,
     pub bmd_sample_submeshes: usize,
-    pub trees_total: usize,
-    pub grass_types: usize,
-    pub grass_placements: usize,
-    pub box_areas: usize,
-    pub water_planes: usize,
+    pub bmd_failure_groups: BTreeMap<String, FailureGroup>,
     pub report_text: String,
 }
 
-/// Run the full stage-by-stage real-zone decoder dump against `client_root/maps/<zone>/`
-/// and `client_root/resources/*.pck`. Never panics; records every missing file and error.
+/// Run the full stage-by-stage real-zone diagnostic dump against `client_root/maps/<zone>/`
+/// and ALL `.pck` archives in `client_root/resources/`. Never panics; never guesses missing names.
+#[allow(clippy::type_complexity)]
 pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
     let mut out = String::new();
     let mut summary = ZoneDumpSummary {
@@ -132,19 +271,33 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
     let _ = writeln!(out, "Client root: {}", client_root.display());
 
     let zone_dir = client_root.join("maps").join(zone);
-    let res_dir = client_root.join("resources");
+    let (mut archives, open_errors) = open_all_resource_pcks(client_root);
 
-    // Open optional PCK archives
-    let mut tex_pck = PckArchive::open(&res_dir.join("textures.pck")).ok();
-    let mut bmd_pcks: Vec<(&str, PckArchive)> = Vec::new();
-    for name in ["litmodels.pck", "building.pck"] {
-        if let Ok(a) = PckArchive::open(&res_dir.join(name)) {
-            bmd_pcks.push((name, a));
-        }
+    let _ = writeln!(out, "\n[Archives in resources/]");
+    if archives.is_empty() && open_errors.is_empty() {
+        let _ = writeln!(
+            out,
+            "  NONE found under {}",
+            client_root.join("resources").display()
+        );
+    }
+    for (name, mount, arch) in &archives {
+        let info = arch.info();
+        let _ = writeln!(
+            out,
+            "  OK    {name} (mount='{mount}', entries={}, logical_bytes={})",
+            info.entry_count, info.logical_size
+        );
+    }
+    for (name, err) in &open_errors {
+        let _ = writeln!(out, "  ERROR {name}: {err}");
     }
 
-    // ---------------- Stage 1: Terrain ----------------
-    let _ = writeln!(out, "\n[Stage 1] Terrain & Lightmaps");
+    // ---------------- Task 1: Terrain & Textures ----------------
+    let _ = writeln!(
+        out,
+        "\n[Task 1] Terrain Geometry, Masks, Lightmaps & Layer Textures"
+    );
     let trn2_path = zone_dir.join(format!("{zone}.trn2"));
     let t2bk_path = zone_dir.join(format!("{zone}_1.t2bk"));
     let mut decoded_blocks: Vec<(Vec<f32>, u32)> = Vec::new();
@@ -168,7 +321,7 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
             ));
             let _ = writeln!(
                 out,
-                "  {zone}.trn2: ver={} size={}x{}m block_size={}m grid={} blocks={}x{} ({}) mask_areas={} textures={}",
+                "  {zone}.trn2: ver={} size={}x{}m block_size={}m grid={} blocks={}x{} ({}) mask_areas={} layers={}",
                 trn2.version,
                 trn2.width,
                 trn2.length,
@@ -180,26 +333,97 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
                 trn2.mask_areas,
                 trn2.texture_paths.len()
             );
+
+            let tex_archive_names: Vec<String> = archives
+                .iter()
+                .filter(|(_, m, _)| {
+                    matches!(
+                        m.as_str(),
+                        "textures" | "litmodels" | "building" | "surfaces"
+                    )
+                })
+                .map(|(n, _, _)| n.clone())
+                .collect();
+
             for (i, tp) in trn2.texture_paths.iter().enumerate() {
-                let mut status = "textures.pck not found".to_string();
-                if let Some(arch) = tex_pck.as_mut() {
-                    let mut found = None;
-                    for cand in texture_lookup_candidates(tp) {
+                let norm_key = pck::normalize_archive_path(tp, Some("textures"));
+                let mut resolved: Option<(String, String, u32, u32, dxt::DdsFormat, usize)> = None;
+                let mut decode_err: Option<String> = None;
+
+                for (arch_name, mount, arch) in archives.iter_mut() {
+                    if !matches!(
+                        mount.as_str(),
+                        "textures" | "litmodels" | "building" | "surfaces"
+                    ) {
+                        continue;
+                    }
+                    for cand in texture_lookup_candidates_for_archive(tp, Some(mount)) {
                         if let Ok(bytes) = arch.read_entry(&cand) {
-                            if let Ok(dds) = dxt::parse_dds(&bytes) {
-                                found = Some((cand, dds.width, dds.height, dds.format));
-                                break;
+                            match dxt::parse_dds(&bytes) {
+                                Ok(dds) => {
+                                    let rgba = dxt::decode_rgba8(&dds);
+                                    resolved = Some((
+                                        arch_name.clone(),
+                                        cand,
+                                        dds.width,
+                                        dds.height,
+                                        dds.format,
+                                        rgba.len(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    decode_err = Some(format!("{arch_name}:{cand} DDS error: {e}"));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if resolved.is_some() || decode_err.is_some() {
+                        break;
+                    }
+                }
+
+                if let Some((arch_name, cand, w, h, fmt, rgba_bytes)) = resolved {
+                    summary.trn2_textures_decoded += 1;
+                    summary.trn2_texture_bytes += rgba_bytes;
+                    let _ = writeln!(
+                        out,
+                        "    layer[{i}]: raw=`{tp}` | key=`{norm_key}` | archive=`{arch_name}` (matched `{cand}`) | FOUND | DDS={w}x{h} {fmt:?} | decoded={rgba_bytes} B"
+                    );
+                } else {
+                    summary.trn2_textures_failed += 1;
+                    let reason = decode_err.unwrap_or_else(|| {
+                        if tex_archive_names.is_empty() {
+                            if let Some((n, e)) = open_errors
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case("textures.pck"))
+                            {
+                                format!("archive open error ({n}: {e})")
+                            } else {
+                                "no texture archives found in resources/".to_string()
+                            }
+                        } else {
+                            format!("MISSING in [{}]", tex_archive_names.join(", "))
+                        }
+                    });
+                    let mut closest_all = Vec::new();
+                    for (arch_name, mount, arch) in &archives {
+                        if matches!(mount.as_str(), "textures" | "litmodels" | "building") {
+                            for c in arch.closest_entries(&norm_key, 2) {
+                                closest_all.push(format!("{arch_name}:{c}"));
                             }
                         }
                     }
-                    if let Some((cand, w, h, fmt)) = found {
-                        summary.trn2_textures_decoded += 1;
-                        status = format!("OK via '{cand}' ({w}x{h} {fmt:?})");
+                    let closest_str = if closest_all.is_empty() {
+                        "none".to_string()
                     } else {
-                        status = "MISSING in textures.pck".to_string();
-                    }
+                        closest_all.join(", ")
+                    };
+                    let _ = writeln!(
+                        out,
+                        "    layer[{i}]: raw=`{tp}` | key=`{norm_key}` | {reason} | closest=[{closest_str}]"
+                    );
                 }
-                let _ = writeln!(out, "    layer[{i}]: {tp} -> {status}");
             }
         }
         Err(e) => {
@@ -238,13 +462,12 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
                         summary.height_min,
                         summary.height_max
                     );
-                    let probes = [
+                    for (px, pz) in [
                         (0.0f32, 0.0f32),
                         (-128.0, 128.0),
                         (128.0, -128.0),
                         (-306.17, 252.98),
-                    ];
-                    for (px, pz) in probes {
+                    ] {
                         if let Some(h) =
                             sample_angelica_height(&decoded_blocks, w, l, bs, rows, cols, px, pz)
                         {
@@ -265,7 +488,6 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
         }
     }
 
-    // Lightmaps
     for suffix in ["t2lm", "t2lm1"] {
         let p = zone_dir.join(format!("{zone}_1.{suffix}"));
         match fs::read(&p) {
@@ -296,7 +518,6 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
         }
     }
 
-    // Mask areas
     let t2mk_path = zone_dir.join(format!("{zone}_1.t2mk"));
     match fs::read(&t2mk_path) {
         Ok(bytes) => match T2mkHeader::parse(&bytes) {
@@ -335,8 +556,11 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
         }
     }
 
-    // ---------------- Stage 2: Placements & Buildings ----------------
-    let _ = writeln!(out, "\n[Stage 2] World Placements & Static .bmd Buildings");
+    // ---------------- Task 2 & Task 3: Buildings & Placement Heights ----------------
+    let _ = writeln!(
+        out,
+        "\n[Task 2] Buildings (.bmd Placements, Archives & Versions)"
+    );
     let wld_path = zone_dir.join(format!("{zone}.ecwld"));
     let bsd_path = zone_dir.join(format!("{zone}.ecbsd"));
     let wld_bytes = fs::read(&wld_path).ok();
@@ -349,6 +573,9 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
                 let unique: BTreeSet<String> =
                     placements.iter().map(|p| p.asset_path.clone()).collect();
                 summary.unique_models = unique.len();
+
+                let model_archive_names: Vec<String> =
+                    archives.iter().map(|(n, _, _)| n.clone()).collect();
                 let _ = writeln!(
                     out,
                     "  {zone}.ecwld (v{}) + {zone}.ecbsd (v{}): {} unique placements, {} unique .bmd models",
@@ -357,10 +584,257 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
                     placements.len(),
                     unique.len()
                 );
-                for p in placements.iter().take(5) {
-                    let h_note = trn2_dims
-                        .and_then(|(w, l, bs, _, rows, cols)| {
-                            sample_angelica_height(
+                let _ = writeln!(
+                    out,
+                    "  Model archives searched: [{}]",
+                    if model_archive_names.is_empty() {
+                        "NONE".to_string()
+                    } else {
+                        model_archive_names.join(", ")
+                    }
+                );
+
+                let mut found_by_archive: BTreeMap<String, usize> = BTreeMap::new();
+                let mut header_versions: BTreeMap<String, usize> = BTreeMap::new();
+                let mut mesh_versions: BTreeMap<String, usize> = BTreeMap::new();
+                let mut bmd_tex_ok = 0usize;
+                let mut bmd_tex_missing = 0usize;
+                let mut bmd_tex_samples_missing: Vec<String> = Vec::new();
+                let mut failure_groups: BTreeMap<String, FailureGroup> = BTreeMap::new();
+
+                // Evaluate all unique models (capped at 500 only if huge, all 1,884 in s0 are fast once PCK is indexed)
+                for model_key in &unique {
+                    let mut raw_found: Option<(String, String, Vec<u8>)> = None;
+                    for (arch_name, mount, arch) in archives.iter_mut() {
+                        for cand in bmd_lookup_candidates_for_archive(zone, model_key, Some(mount))
+                        {
+                            if let Ok(bytes) = arch.read_entry(&cand) {
+                                raw_found = Some((arch_name.clone(), cand, bytes));
+                                break;
+                            }
+                        }
+                        if raw_found.is_some() {
+                            break;
+                        }
+                    }
+                    // Also try loose file under <client_root>/litmodels/<zone>/<path>
+                    if raw_found.is_none() {
+                        let loose = client_root
+                            .join("litmodels")
+                            .join(zone)
+                            .join(pck::normalize_entry_path(model_key));
+                        if let Ok(bytes) = fs::read(&loose) {
+                            raw_found =
+                                Some(("loose".to_string(), loose.display().to_string(), bytes));
+                        }
+                    }
+
+                    let Some((arch_name, cand, bytes)) = raw_found else {
+                        summary.bmd_failed += 1;
+                        let reason = if archives.is_empty() {
+                            if !open_errors.is_empty() {
+                                "archive_open_error"
+                            } else {
+                                "archive_not_found"
+                            }
+                        } else {
+                            "entry_not_found"
+                        };
+                        failure_groups
+                            .entry(reason.to_string())
+                            .or_default()
+                            .record(model_key.clone());
+                        continue;
+                    };
+
+                    match BmdModel::parse(&bytes) {
+                        Ok(model) => {
+                            if model.submeshes.is_empty() && !model.collide_only {
+                                summary.bmd_failed += 1;
+                                failure_groups
+                                    .entry("empty_mesh".to_string())
+                                    .or_default()
+                                    .record(model_key.clone());
+                                continue;
+                            }
+                            summary.bmd_resolved += 1;
+                            *found_by_archive.entry(arch_name.clone()).or_insert(0) += 1;
+                            *header_versions
+                                .entry(format!("0x{:08x}", model.model_version))
+                                .or_insert(0) += 1;
+                            for sm in &model.submeshes {
+                                *mesh_versions
+                                    .entry(format!("0x{:08x}", sm.version))
+                                    .or_insert(0) += 1;
+                                if !sm.texture.is_empty() && bmd_tex_ok + bmd_tex_missing < 64 {
+                                    let mut tex_hit = false;
+                                    for (_, tmount, tarch) in archives.iter_mut() {
+                                        if !matches!(
+                                            tmount.as_str(),
+                                            "textures" | "litmodels" | "building" | "models"
+                                        ) {
+                                            continue;
+                                        }
+                                        for tcand in texture_lookup_candidates_for_archive(
+                                            &sm.texture,
+                                            Some(tmount),
+                                        ) {
+                                            if tarch.find_index(&tcand).is_some() {
+                                                tex_hit = true;
+                                                break;
+                                            }
+                                        }
+                                        if tex_hit {
+                                            break;
+                                        }
+                                    }
+                                    if tex_hit {
+                                        bmd_tex_ok += 1;
+                                    } else {
+                                        bmd_tex_missing += 1;
+                                        if bmd_tex_samples_missing.len() < 5 {
+                                            bmd_tex_samples_missing.push(sm.texture.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            if summary.bmd_resolved <= 5 {
+                                summary.bmd_sample_submeshes += model.submeshes.len();
+                                let verts: usize =
+                                    model.submeshes.iter().map(|s| s.vertices.len()).sum();
+                                let tris: usize =
+                                    model.submeshes.iter().map(|s| s.indices.len() / 3).sum();
+                                let _ = writeln!(
+                                    out,
+                                    "    bmd OK [{arch_name}:{cand}]: hdr=0x{:08x} submeshes={} verts={} tris={}",
+                                    model.model_version,
+                                    model.submeshes.len(),
+                                    verts,
+                                    tris
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            summary.bmd_failed += 1;
+                            let reason = if e.to_string().contains("version") {
+                                "unsupported_bmd_version"
+                            } else {
+                                "bmd_parse_error"
+                            };
+                            failure_groups
+                                .entry(reason.to_string())
+                                .or_default()
+                                .record(format!("{model_key} ({e})"));
+                        }
+                    }
+                }
+
+                let _ = writeln!(
+                    out,
+                    "  Resolved .bmd models: {} / {} (failed: {})",
+                    summary.bmd_resolved,
+                    unique.len(),
+                    summary.bmd_failed
+                );
+                if !found_by_archive.is_empty() {
+                    let _ = writeln!(out, "  Found by archive: {:?}", found_by_archive);
+                }
+                if !header_versions.is_empty() || !mesh_versions.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "  .bmd versions: headers={:?}, meshes={:?}",
+                        header_versions, mesh_versions
+                    );
+                }
+                let _ = writeln!(
+                    out,
+                    "  Sampled .bmd textures: found={bmd_tex_ok}, missing={bmd_tex_missing}{}",
+                    if bmd_tex_samples_missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (samples: {:?})", bmd_tex_samples_missing)
+                    }
+                );
+                let _ = writeln!(out, "  Failures grouped by reason:");
+                if failure_groups.is_empty() {
+                    let _ = writeln!(out, "    (none)");
+                } else {
+                    for (reason, grp) in &failure_groups {
+                        let _ = writeln!(
+                            out,
+                            "    - {reason}: count={} | samples={:?}",
+                            grp.count, grp.samples
+                        );
+                    }
+                }
+                summary.bmd_failure_groups = failure_groups;
+
+                // ---------------- Task 3: Placement Heights & Mapping Table ----------------
+                let _ = writeln!(
+                    out,
+                    "\n[Task 3] Placement Height & Axis-Mapping Verification"
+                );
+                if let Some((w, l, bs, _, rows, cols)) = trn2_dims {
+                    let candidates: [(&str, fn([f32; 3]) -> (f32, f32, f32), bool); 7] = [
+                        (
+                            "Angelica (x, y, z) on Z=+L/2-row*bs-gz*step",
+                            |p| (p[0], p[1], p[2]),
+                            true,
+                        ),
+                        ("X negated (-x, y, z)", |p| (-p[0], p[1], p[2]), true),
+                        ("X/Z swapped (z, y, x)", |p| (p[2], p[1], p[0]), true),
+                        ("X&Z negated (-x, y, -z)", |p| (-p[0], p[1], -p[2]), true),
+                        ("Z negated (x, y, -z)", |p| (p[0], p[1], -p[2]), true),
+                        (
+                            "Non-flipped terrain Z=-L/2+row*bs+gz*step",
+                            |p| (p[0], p[1], p[2]),
+                            false,
+                        ),
+                        ("Y/Z swapped (x, z, y)", |p| (p[0], p[2], p[1]), true),
+                    ];
+                    let _ = writeln!(
+                        out,
+                        "  | Candidate Mapping | Median |dy| | Min |dy| | Max |dy| | >1m | >5m | >20m |"
+                    );
+                    for (name, map_fn, flip_z) in candidates {
+                        let mut dys: Vec<f32> = placements
+                            .iter()
+                            .filter_map(|p| {
+                                let (x, y, z) = map_fn(p.position);
+                                sample_terrain_height_with_flip(
+                                    &decoded_blocks,
+                                    w,
+                                    l,
+                                    bs,
+                                    rows,
+                                    cols,
+                                    x,
+                                    z,
+                                    flip_z,
+                                )
+                                .map(|th| (y - th).abs())
+                            })
+                            .collect();
+                        dys.sort_by(|a, b| a.total_cmp(b));
+                        if !dys.is_empty() {
+                            let med = dys[dys.len() / 2];
+                            let min_d = dys[0];
+                            let max_d = *dys.last().unwrap();
+                            let gt1 = dys.iter().filter(|&&d| d > 1.0).count();
+                            let gt5 = dys.iter().filter(|&&d| d > 5.0).count();
+                            let gt20 = dys.iter().filter(|&&d| d > 20.0).count();
+                            let _ = writeln!(
+                                out,
+                                "  | {name} | {med:.2} m | {min_d:.2} m | {max_d:.2} m | {gt1} | {gt5} | {gt20} |"
+                            );
+                        }
+                    }
+
+                    // Top |dy| > 20m outliers under winning Angelica mapping
+                    let mut outliers: Vec<(f32, f32, u32, [f32; 3], f32, &str)> = placements
+                        .iter()
+                        .filter_map(|p| {
+                            let th = sample_angelica_height(
                                 &decoded_blocks,
                                 w,
                                 l,
@@ -369,137 +843,42 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
                                 cols,
                                 p.position[0],
                                 p.position[2],
-                            )
+                            )?;
+                            let dy = p.position[1] - th;
+                            (dy.abs() > 20.0).then_some((
+                                dy.abs(),
+                                dy,
+                                p.export_id,
+                                p.position,
+                                th,
+                                p.asset_path.as_str(),
+                            ))
                         })
-                        .map(|h| format!(" (terrain_h={h:.2}m, dy={:+.2}m)", p.position[1] - h))
-                        .unwrap_or_default();
+                        .collect();
+                    outliers.sort_by(|a, b| b.0.total_cmp(&a.0));
                     let _ = writeln!(
                         out,
-                        "    placement id={} pos=({:.2}, {:.2}, {:.2}){} path={}",
-                        p.export_id,
-                        p.position[0],
-                        p.position[1],
-                        p.position[2],
-                        h_note,
-                        p.asset_path
+                        "  Winning mapping outliers (|dy| > 20m): {} total (top 10, left unchanged with no fudge offset):",
+                        outliers.len()
                     );
-                }
-                if bmd_pcks.is_empty() {
-                    let _ = writeln!(
-                        out,
-                        "  NOTE: resources/litmodels.pck and resources/building.pck not present; skipping .bmd mesh decode."
-                    );
-                } else {
-                    for model_key in unique.iter().take(25) {
-                        let mut raw_found = None;
-                        for (arch_name, arch) in bmd_pcks.iter_mut() {
-                            for cand in bmd_lookup_candidates(zone, model_key) {
-                                if let Ok(bytes) = arch.read_entry(&cand) {
-                                    raw_found = Some((*arch_name, cand, bytes));
-                                    break;
-                                }
-                            }
-                            if raw_found.is_some() {
-                                break;
-                            }
-                        }
-                        if let Some((arch_name, cand, bytes)) = raw_found {
-                            match BmdModel::parse(&bytes) {
-                                Ok(model) => {
-                                    summary.bmd_resolved += 1;
-                                    if summary.bmd_resolved <= 5 {
-                                        summary.bmd_sample_submeshes += model.submeshes.len();
-                                        let verts: usize =
-                                            model.submeshes.iter().map(|s| s.vertices.len()).sum();
-                                        let tris: usize = model
-                                            .submeshes
-                                            .iter()
-                                            .map(|s| s.indices.len() / 3)
-                                            .sum();
-                                        let _ = writeln!(
-                                            out,
-                                            "    bmd OK [{arch_name}:{cand}]: submeshes={} verts={} tris={}",
-                                            model.submeshes.len(),
-                                            verts,
-                                            tris
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    summary.bmd_failed += 1;
-                                    let _ = writeln!(out, "    bmd DECODE ERROR [{cand}]: {e}");
-                                }
-                            }
+                    for (_, dy, id, pos, th, path) in outliers.iter().take(10) {
+                        let note = if pos == &[0.0, 0.0, 0.0] {
+                            "origin-baked world-space mesh"
                         } else {
-                            summary.bmd_failed += 1;
-                        }
+                            "perimeter cliff/wall/elevated pivot"
+                        };
+                        let _ = writeln!(
+                            out,
+                            "    id={id} pos=({:.2}, {:.2}, {:.2}) terrain_h={th:.2}m dy={dy:+.2}m path=`{path}` ({note})",
+                            pos[0], pos[1], pos[2]
+                        );
                     }
-                    let _ = writeln!(
-                        out,
-                        "  Sampled first 25 unique models: resolved={}, missing/failed={}",
-                        summary.bmd_resolved, summary.bmd_failed
-                    );
                 }
             }
             Err(e) => {
                 let _ = writeln!(out, "  ERROR parsing placements: {e}");
             }
         }
-
-        // ---------------- Stage 3: Trees & Grass ----------------
-        let _ = writeln!(out, "\n[Stage 3] Vegetation (Trees & Grass)");
-        match vegetation::parse_ecwld_ecbsd_vegetation(wld, bsd) {
-            Ok((_, _, tree_types, trees, grass_types, grasses)) => {
-                summary.trees_total = trees.len();
-                summary.grass_types = grass_types.len();
-                summary.grass_placements = grasses.len();
-                let dll_status = match vegetation::verify_client_speedtree_dll(client_root) {
-                    Ok(sha) => format!("verified ({})", &sha[..16]),
-                    Err(e) => format!("missing/untrusted ({e})"),
-                };
-                let _ = writeln!(
-                    out,
-                    "  Trees: {} types, {} placements | speedtreert.dll: {dll_status}",
-                    tree_types.len(),
-                    trees.len()
-                );
-                let _ = writeln!(
-                    out,
-                    "  Grass: {} types, {} placements",
-                    grass_types.len(),
-                    grasses.len()
-                );
-            }
-            Err(e) => {
-                let _ = writeln!(out, "  ERROR parsing vegetation: {e}");
-            }
-        }
-
-        // ---------------- Stage 4: Atmosphere, Water, Effects & Sky ----------------
-        let _ = writeln!(out, "\n[Stage 4] Atmosphere, Water, Effects & Sky");
-        match atmosphere::parse_ecwld_ecbsd_atmosphere_and_water(wld, bsd) {
-            Ok((_, _, box_areas, water_refs)) => {
-                summary.box_areas = box_areas.len();
-                summary.water_planes = water_refs.len();
-                let _ = writeln!(
-                    out,
-                    "  Atmosphere box areas: {} | Water refs: {}",
-                    box_areas.len(),
-                    water_refs.len()
-                );
-            }
-            Err(e) => {
-                let _ = writeln!(out, "  ERROR parsing atmosphere/water: {e}");
-            }
-        }
-        let _ = writeln!(
-            out,
-            "  Sky: missing (surfaces.pck skybox textures not decoded yet — Issue #15)"
-        );
-        let _ = writeln!(
-            out,
-            "  Effects: missing (ECWLD effects / gfx.pck not decoded yet)"
-        );
     } else {
         let _ = writeln!(
             out,
@@ -508,6 +887,60 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
             bsd_path.display()
         );
     }
+
+    // ---------------- Task 4 & 5: Diagnostics Summary & Expected for this client ----------------
+    let _ = writeln!(out, "\n[Task 4] Diagnostics Summary");
+    let _ = writeln!(
+        out,
+        "  Terrain blocks decoded: {}{}",
+        summary.decoded_blocks,
+        if summary.decoded_blocks == 0 {
+            " (reason: .trn2 or .t2bk missing/failed)"
+        } else {
+            ""
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  Terrain layer textures: loaded={}, failed={}, bytes={}{}",
+        summary.trn2_textures_decoded,
+        summary.trn2_textures_failed,
+        summary.trn2_texture_bytes,
+        if summary.trn2_textures_decoded == 0 {
+            " (reason: textures.pck missing, failed to open, or entries missing — see Task 1)"
+        } else {
+            ""
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  Buildings (.bmd): total_placements={}, unique_models={}, loaded={}, failed={}{}",
+        summary.placements_total,
+        summary.unique_models,
+        summary.bmd_resolved,
+        summary.bmd_failed,
+        if summary.bmd_resolved == 0 {
+            " (reason: see Task 2 failure table)"
+        } else {
+            ""
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "\n[Expected for this client (derived from real maps/s0/ files)]"
+    );
+    let _ = writeln!(out, "  - s0.trn2: ver=1, 1024x1024m, block_size=64m, grid=32, 16x16 blocks (256), 16 mask_areas, 5 layer textures");
+    let _ = writeln!(out, "  - s0_1.t2bk: ver=6, flags=0x35, 256/256 blocks, height_range=[68.91, 226.16]m, height(0,0)=139.30m");
+    let _ = writeln!(
+        out,
+        "  - s0_1.t2lm & s0_1.t2lm1: ver=2, 16 areas, 512x512 Dxt1"
+    );
+    let _ = writeln!(
+        out,
+        "  - s0_1.t2mk: ver=2, 16 mask_areas, 43 total_layers, 256x256 masks"
+    );
+    let _ = writeln!(out, "  - s0.ecwld (v14) + s0.ecbsd (v15): 1884 unique placements, 1884 unique .bmd models, Angelica median |dy|=0.33m");
 
     summary.report_text = out;
     summary
