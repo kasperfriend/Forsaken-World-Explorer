@@ -8,6 +8,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
 
+    [string]$SpeedTreeHelper = '',
+
     [string]$ArchivePath = ''
 )
 
@@ -17,6 +19,14 @@ $executablePath = (Resolve-Path -LiteralPath $Executable).Path
 $modulesPath = (Resolve-Path -LiteralPath $Modules).Path
 if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
     throw "Viewer executable not found: $executablePath"
+}
+$hasHelper = -not [string]::IsNullOrWhiteSpace($SpeedTreeHelper)
+$helperPath = ''
+if ($hasHelper) {
+    $helperPath = (Resolve-Path -LiteralPath $SpeedTreeHelper).Path
+    if (-not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+        throw "32-bit SpeedTree helper executable not found: $helperPath"
+    }
 }
 foreach ($requiredManifest in @('Walker/module.ini', 'Populator/module.ini')) {
     if (-not (Test-Path -LiteralPath (Join-Path $modulesPath $requiredManifest) -PathType Leaf)) {
@@ -40,16 +50,26 @@ New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 $shippedExecutable = Join-Path $packageRoot 'forsaken-world-explorer.exe'
 Copy-Item -LiteralPath $executablePath -Destination $shippedExecutable
 
+if ($hasHelper) {
+    $shippedTools = Join-Path $packageRoot 'tools'
+    New-Item -ItemType Directory -Force -Path $shippedTools | Out-Null
+    Copy-Item -LiteralPath $helperPath -Destination (Join-Path $shippedTools 'fw-speedtree-helper.exe')
+}
+
 $shippedModules = Join-Path $packageRoot 'Modules'
 Copy-Item -LiteralPath $modulesPath -Destination $shippedModules -Recurse
 Copy-Item -LiteralPath $noticesPath -Destination (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.md')
 
-foreach ($expected in @(
+$expectedFiles = @(
     'forsaken-world-explorer.exe',
     'Modules/Walker/module.ini',
     'Modules/Populator/module.ini',
     'THIRD_PARTY_NOTICES.md'
-)) {
+)
+if ($hasHelper) {
+    $expectedFiles += 'tools/fw-speedtree-helper.exe'
+}
+foreach ($expected in $expectedFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $expected) -PathType Leaf)) {
         throw "Staging did not produce expected file: $expected"
     }
@@ -87,13 +107,17 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
     try {
         $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') } |
             Where-Object { -not $_.EndsWith('/') })
-        foreach ($required in @(
+        $requiredEntries = @(
             'Forsaken World Explorer/forsaken-world-explorer.exe',
             'Forsaken World Explorer/Modules/Walker/module.ini',
             'Forsaken World Explorer/Modules/Populator/module.ini',
             'Forsaken World Explorer/SHA256SUMS.txt',
             'Forsaken World Explorer/THIRD_PARTY_NOTICES.md'
-        )) {
+        )
+        if ($hasHelper) {
+            $requiredEntries += 'Forsaken World Explorer/tools/fw-speedtree-helper.exe'
+        }
+        foreach ($required in $requiredEntries) {
             if ($entries -notcontains $required) {
                 throw "Release archive is missing required entry: $required"
             }

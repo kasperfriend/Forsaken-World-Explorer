@@ -25,12 +25,14 @@ use crate::{
     terrain_block::{self, T2bkFile},
     terrain_store::{TerrainPage, TerrainStore, DEFAULT_HOT_RAM_BYTES},
     tex_cache::DecodedTexture,
+    vegetation::{self, FwstTreeMesh, VegVertex},
     world_objects::placement_transform_matrix,
 };
 
 pub const SKY_WGSL: &str = include_str!("shaders/sky.wgsl");
 pub const TERRAIN_WGSL: &str = include_str!("shaders/terrain.wgsl");
 pub const SCENERY_WGSL: &str = include_str!("shaders/scenery.wgsl");
+pub const VEGETATION_WGSL: &str = include_str!("shaders/vegetation.wgsl");
 pub const WATER_WGSL: &str = include_str!("shaders/water.wgsl");
 pub const BLIT_WGSL: &str = include_str!("shaders/blit.wgsl");
 
@@ -65,6 +67,14 @@ pub struct SceneryMaterialUniform {
     pub diffuse_rgba: [f32; 4],
     /// x = alpha_cutoff (0.0 opaque/blended, 0.5 alpha-tested)
     /// y = has_vertex_lighting (1.0 client day/night, 0.0 approximate fallback)
+    pub params: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct VegMaterialUniform {
+    pub base_color: [f32; 4],
+    /// x = alpha_cutoff (0.0 trunk, 0.5 alpha-tested leaves/grass), y = wind_amplitude
     pub params: [f32; 4],
 }
 
@@ -191,6 +201,68 @@ pub struct SceneryDrawSnapshot {
     pub opaque_batches: Vec<SceneryDrawBatch>,
     pub transparent_batches: Vec<SceneryDrawBatch>,
     pub revision: u64,
+}
+
+/// One instanced vegetation draw batch (SpeedTree trunk/leaves or grass tuft type).
+#[derive(Clone, Debug)]
+pub struct VegetationDrawBatch {
+    pub vertices: Vec<VegVertex>,
+    pub indices: Vec<u16>,
+    pub instances: Vec<SceneryInstance>,
+    pub base_color: [f32; 4],
+    pub alpha_cutoff: f32,
+    pub wind_amplitude: f32,
+    pub texture: Option<Arc<DecodedTexture>>,
+}
+
+/// Complete set of instanced tree and grass batches for the current frame.
+#[derive(Clone, Debug, Default)]
+pub struct VegetationDrawSnapshot {
+    pub batches: Vec<VegetationDrawBatch>,
+    pub revision: u64,
+}
+
+/// Build trunk + alpha-tested leaf draw batches from a cached `FwstTreeMesh`.
+pub fn build_tree_batches(
+    mesh: &FwstTreeMesh,
+    transforms: &[Mat4],
+    trunk_color: [f32; 4],
+    leaf_color: [f32; 4],
+    leaf_tex: Option<Arc<DecodedTexture>>,
+) -> Vec<VegetationDrawBatch> {
+    if transforms.is_empty() {
+        return Vec::new();
+    }
+    let instances: Vec<SceneryInstance> = transforms
+        .iter()
+        .map(|m| SceneryInstance {
+            model_cols: m.to_cols_array_2d(),
+        })
+        .collect();
+    let mut out = Vec::new();
+    if !mesh.trunk_vertices.is_empty() && !mesh.trunk_indices.is_empty() {
+        out.push(VegetationDrawBatch {
+            vertices: mesh.trunk_vertices.clone(),
+            indices: mesh.trunk_indices.clone(),
+            instances: instances.clone(),
+            base_color: trunk_color,
+            alpha_cutoff: 0.0,
+            wind_amplitude: if mesh.wind_approximate { 0.12 } else { 0.0 },
+            texture: None,
+        });
+    }
+    if !mesh.leaf_vertices.is_empty() && !mesh.leaf_indices.is_empty() {
+        out.push(VegetationDrawBatch {
+            vertices: mesh.leaf_vertices.clone(),
+            indices: mesh.leaf_indices.clone(),
+            instances,
+            base_color: leaf_color,
+            alpha_cutoff: mesh.alpha_ref.clamp(0.0, 0.95),
+            wind_amplitude: if mesh.wind_approximate { 0.35 } else { 0.0 },
+            texture: leaf_tex,
+        });
+    }
+    out
 }
 
 /// Water render configuration for the current frame.
@@ -464,6 +536,8 @@ pub struct OffscreenSmokeMetrics {
     pub sky_pixels: usize,
     pub non_clear_pixels: usize,
     pub scenery_pixels: usize,
+    pub tree_pixels: usize,
+    pub grass_pixels: usize,
     pub translucent_pixels: usize,
     pub water_pixels: usize,
     pub water_differs_from_non_water: bool,
@@ -542,7 +616,7 @@ fn create_scenery_mat_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -766,6 +840,110 @@ fn create_scenery_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: !transparent,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn create_vegetation_pipeline(
+    device: &wgpu::Device,
+    cam_bgl: &wgpu::BindGroupLayout,
+    mat_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("vegetation-shader"),
+        source: wgpu::ShaderSource::Wgsl(VEGETATION_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("vegetation-pipeline-layout"),
+        bind_group_layouts: &[cam_bgl, mat_bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("vegetation-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<VegVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 24,
+                            shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 32,
+                            shader_location: 3,
+                        },
+                    ],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SceneryInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 0,
+                            shader_location: 4,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 16,
+                            shader_location: 5,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 32,
+                            shader_location: 6,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 48,
+                            shader_location: 7,
+                        },
+                    ],
+                },
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
             depth_compare: wgpu::CompareFunction::Less,
             stencil: Default::default(),
             bias: Default::default(),
@@ -1020,6 +1198,54 @@ pub fn render_offscreen_smoke(
         quality: WaterQuality::Medium,
     };
 
+    // Synthetic SpeedTree mesh (round-tripped through FWST v1) + alpha-tested leaf texture
+    // and synthetic crossed-blade grass patch to prove vegetation.wgsl executes on lavapipe.
+    let mut alpha_tex_rgba = Vec::with_capacity(8 * 8 * 4);
+    for ty in 0..8u32 {
+        for tx in 0..8u32 {
+            let opaque = (1..=6).contains(&tx) && (1..=6).contains(&ty);
+            alpha_tex_rgba.extend_from_slice(&[255, 255, 255, if opaque { 255 } else { 0 }]);
+        }
+    }
+    let alpha_tex = Arc::new(DecodedTexture {
+        width: 8,
+        height: 8,
+        rgba: alpha_tex_rgba,
+    });
+    let tree_bytes = vegetation::synthetic::build_synthetic_tree_fwst(0, 0).encode();
+    let tree_mesh = FwstTreeMesh::decode(&tree_bytes)?;
+    let tree_mat = Mat4::from_translation(Vec3::new(34.0, 102.0, 56.0));
+    let mut veg_batches = build_tree_batches(
+        &tree_mesh,
+        &[tree_mat],
+        [0.42, 0.25, 0.10, 1.0],
+        [0.06, 0.94, 0.18, 1.0],
+        Some(Arc::clone(&alpha_tex)),
+    );
+    let (grass_verts, grass_idxs) = vegetation::synthetic::build_grass_tuft_mesh(9.0);
+    let mut grass_instances = Vec::new();
+    for gx in 0..3 {
+        for gz in 0..3 {
+            let pos = Vec3::new(34.0 + (gx as f32) * 7.0, 106.0, 26.0 + (gz as f32) * 7.0);
+            grass_instances.push(SceneryInstance {
+                model_cols: Mat4::from_translation(pos).to_cols_array_2d(),
+            });
+        }
+    }
+    veg_batches.push(VegetationDrawBatch {
+        vertices: grass_verts,
+        indices: grass_idxs,
+        instances: grass_instances,
+        base_color: [0.92, 0.95, 0.08, 1.0],
+        alpha_cutoff: 0.5,
+        wind_amplitude: 0.25,
+        texture: Some(alpha_tex),
+    });
+    let veg_snap = VegetationDrawSnapshot {
+        batches: veg_batches,
+        revision: 1,
+    };
+
     let world_cmd = renderer.prepare_frame(
         device,
         queue,
@@ -1031,6 +1257,7 @@ pub fn render_offscreen_smoke(
         &day_lm,
         &night_lm,
         &scenery_snap,
+        &veg_snap,
         &water_snap,
     );
 
@@ -1124,6 +1351,8 @@ pub fn render_offscreen_smoke(
     let mut sky_pixels = 0usize;
     let mut non_clear_pixels = 0usize;
     let mut scenery_pixels = 0usize;
+    let mut tree_pixels = 0usize;
+    let mut grass_pixels = 0usize;
     let mut translucent_pixels = 0usize;
     let mut water_pixels = 0usize;
     let mut water_sum = [0u64; 3];
@@ -1145,6 +1374,14 @@ pub fn render_offscreen_smoke(
             // Opaque crimson .bmd building
             if r > 90 && r > g + 35 && r > b + 35 {
                 scenery_pixels += 1;
+            }
+            // Synthetic emerald-green tree canopy (vegetation.wgsl)
+            if g > 90 && g > r + 40 && g > b + 35 {
+                tree_pixels += 1;
+            }
+            // Synthetic lime-yellow grass patch (vegetation.wgsl)
+            if r > 95 && g > 105 && g > b + 50 && r > b + 45 {
+                grass_pixels += 1;
             }
             // Translucent magenta-violet test quad
             if r > 80 && b > 80 && r > g + 25 && b > g + 25 {
@@ -1196,6 +1433,8 @@ pub fn render_offscreen_smoke(
         sky_pixels,
         non_clear_pixels,
         scenery_pixels,
+        tree_pixels,
+        grass_pixels,
         translucent_pixels,
         water_pixels,
         water_differs_from_non_water,
@@ -1431,6 +1670,7 @@ pub struct TerrainViewportRenderer {
     terrain_pipeline: wgpu::RenderPipeline,
     scenery_opaque_pipeline: wgpu::RenderPipeline,
     scenery_transparent_pipeline: wgpu::RenderPipeline,
+    vegetation_pipeline: wgpu::RenderPipeline,
     water_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     tex_bgl: wgpu::BindGroupLayout,
@@ -1466,6 +1706,8 @@ pub struct TerrainViewportRenderer {
     opaque_batches: Vec<GpuSceneryBatch>,
     transparent_batches: Vec<GpuSceneryBatch>,
     scenery_revision: u64,
+    veg_batches: Vec<GpuSceneryBatch>,
+    veg_revision: u64,
     pub last_world_render_passes: usize,
     pub timestamp_queries_supported: bool,
 }
@@ -1526,6 +1768,7 @@ impl TerrainViewportRenderer {
             create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl, false);
         let scenery_transparent_pipeline =
             create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl, true);
+        let vegetation_pipeline = create_vegetation_pipeline(device, &cam_bgl, &scenery_mat_bgl);
         let water_pipeline = create_water_pipeline(device, &cam_bgl, &water_bgl);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1673,6 +1916,7 @@ impl TerrainViewportRenderer {
             terrain_pipeline,
             scenery_opaque_pipeline,
             scenery_transparent_pipeline,
+            vegetation_pipeline,
             water_pipeline,
             blit_pipeline,
             tex_bgl,
@@ -1708,6 +1952,8 @@ impl TerrainViewportRenderer {
             opaque_batches: Vec::new(),
             transparent_batches: Vec::new(),
             scenery_revision: 0,
+            veg_batches: Vec::new(),
+            veg_revision: 0,
             last_world_render_passes: 1,
             timestamp_queries_supported,
         }
@@ -1940,6 +2186,76 @@ impl TerrainViewportRenderer {
         out
     }
 
+    fn upload_vegetation_batches(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src: &[VegetationDrawBatch],
+    ) -> Vec<GpuSceneryBatch> {
+        let mut out = Vec::with_capacity(src.len());
+        for b in src {
+            if b.vertices.is_empty() || b.indices.is_empty() || b.instances.is_empty() {
+                continue;
+            }
+            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("live-veg-vbuf"),
+                contents: bytemuck::cast_slice(&b.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("live-veg-ibuf"),
+                contents: bytemuck::cast_slice(&b.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("live-veg-inst"),
+                contents: bytemuck::cast_slice(&b.instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let mat_u = VegMaterialUniform {
+                base_color: b.base_color,
+                params: [b.alpha_cutoff, b.wind_amplitude, 0.0, 0.0],
+            };
+            let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("live-veg-mat"),
+                contents: bytemuck::bytes_of(&mat_u),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let owned_view = b
+                .texture
+                .as_ref()
+                .map(|t| Self::upload_rgba_view(device, queue, t.width, t.height, &t.rgba));
+            let tex_view_ref = owned_view.as_ref().unwrap_or(&self.white_view);
+            let mat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("live-veg-mat-bg"),
+                layout: &self.scenery_mat_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(tex_view_ref),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: mat_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            out.push(GpuSceneryBatch {
+                vbuf,
+                ibuf,
+                inst_buf,
+                mat_bg,
+                index_count: b.indices.len() as u32,
+                instance_count: b.instances.len() as u32,
+            });
+        }
+        out
+    }
+
     fn draw_world_geometry<'a>(
         &'a self,
         rpass: &mut wgpu::RenderPass<'a>,
@@ -1975,6 +2291,19 @@ impl TerrainViewportRenderer {
             }
         }
 
+        // 3b. Instanced vegetation (SpeedTree trunks/leaves + grass, alpha-tested)
+        if !self.veg_batches.is_empty() {
+            rpass.set_pipeline(&self.vegetation_pipeline);
+            rpass.set_bind_group(0, &self.cam_bg, &[]);
+            for b in &self.veg_batches {
+                rpass.set_bind_group(1, &b.mat_bg, &[]);
+                rpass.set_vertex_buffer(0, b.vbuf.slice(..));
+                rpass.set_vertex_buffer(1, b.inst_buf.slice(..));
+                rpass.set_index_buffer(b.ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.draw_indexed(0..b.index_count, 0, 0..b.instance_count);
+            }
+        }
+
         // 4. Transparent static scenery (sorted back-to-front, blend ON, depth write OFF)
         if include_transparent && !self.transparent_batches.is_empty() {
             rpass.set_pipeline(&self.scenery_transparent_pipeline);
@@ -2002,6 +2331,7 @@ impl TerrainViewportRenderer {
         day_lightmap: &TerrainTextureSnapshot,
         night_lightmap: &TerrainTextureSnapshot,
         scenery: &SceneryDrawSnapshot,
+        vegetation: &VegetationDrawSnapshot,
         water: &WaterRenderSnapshot,
     ) -> wgpu::CommandBuffer {
         let desired = scaled_render_target(viewport_w, viewport_h, scale_pct);
@@ -2093,6 +2423,11 @@ impl TerrainViewportRenderer {
             self.transparent_batches =
                 self.upload_scenery_batches(device, queue, &scenery.transparent_batches);
             self.scenery_revision = scenery.revision;
+        }
+
+        if self.veg_revision != vegetation.revision {
+            self.veg_batches = self.upload_vegetation_batches(device, queue, &vegetation.batches);
+            self.veg_revision = vegetation.revision;
         }
 
         let vp = Mat4::from_cols_array_2d(&uniform.view_proj);

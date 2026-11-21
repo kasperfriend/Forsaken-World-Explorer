@@ -24,12 +24,22 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Check for placeholder text or broken links
+        run: |
+          PATTERN="[invalid"" URL]"
+          if grep -rnF --exclude="pr-checks.yml" "$PATTERN" README.md Findings/ src/ tools/ .github/; then
+            echo "ERROR: Found placeholder link text in repository!"
+            exit 1
+          fi
+          echo "Placeholder text check passed."
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run all cargo tests (lib and bins)
         run: cargo test --locked
+      - name: Check 32-bit SpeedTree helper crate compiles on Linux
+        run: cargo check --manifest-path tools/speedtree/fw-speedtree-helper/Cargo.toml
       - name: Run dependency-free CPU core checks
         run: sh tools/check-core.sh
       - name: Run --self-test, --smoke-launch, and terrain-memory-check on Linux
@@ -61,7 +71,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers
-      - name: Run offscreen terrain render smoke test on lavapipe
+      - name: Run offscreen world render smoke test on lavapipe
         env:
           WGPU_BACKEND: vulkan
         run: cargo run --locked --bin terrain-render-smoke
@@ -84,7 +94,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Run library, viewer, shader, and memory-budget tests
         run: |
@@ -94,13 +104,16 @@ jobs:
           cargo run --locked --bin terrain-memory-check
       - name: Check all binary targets
         run: cargo check --locked --bins
-      - name: Build Windows release executable
+      - name: Build 32-bit SpeedTree helper (i686-pc-windows-msvc)
+        run: cargo build --manifest-path tools/speedtree/fw-speedtree-helper/Cargo.toml --release --target i686-pc-windows-msvc
+      - name: Build Windows release executable (x86_64-pc-windows-msvc)
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin forsaken-world-explorer
       - name: Stage portable ZIP and SHA256SUMS.txt
         shell: pwsh
         run: |
           ./tools/package-windows.ps1 `
             -Executable target/x86_64-pc-windows-msvc/release/forsaken-world-explorer.exe `
+            -SpeedTreeHelper tools/speedtree/fw-speedtree-helper/target/i686-pc-windows-msvc/release/fw-speedtree-helper.exe `
             -Modules Modules `
             -OutputDirectory release `
             -ArchivePath release/Forsaken-World-Explorer-Windows-x64.zip
@@ -142,21 +155,26 @@ jobs:
             Write-Host "forsaken-world-explorer.exe stayed running cleanly for 3s (PID $($proc.Id)); stopping."
             Stop-Process -Id $proc.Id -Force
           }
-      - name: Verify SHA256SUMS.txt matches packaged files
+      - name: Verify SHA256SUMS.txt matches packaged files (including 32-bit helper)
         shell: pwsh
         run: |
           $root = Resolve-Path "./release/Forsaken World Explorer"
           $lines = Get-Content (Join-Path $root 'SHA256SUMS.txt') | Where-Object { $_.Trim().Length -gt 0 }
+          $foundHelper = $false
           foreach ($line in $lines) {
             $parts = $line -split '\s+', 2
             $expected = $parts[0].ToLowerInvariant()
             $rel = $parts[1]
+            if ($rel -match 'fw-speedtree-helper\.exe$') { $foundHelper = $true }
             $actual = (Get-FileHash -LiteralPath (Join-Path $root $rel) -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($actual -ne $expected) {
               throw "Checksum mismatch for ${rel}: expected $expected, got $actual"
             }
           }
-          Write-Host "Verified $($lines.Count) file checksums in SHA256SUMS.txt"
+          if (-not $foundHelper) {
+            throw "fw-speedtree-helper.exe was not listed in SHA256SUMS.txt!"
+          }
+          Write-Host "Verified $($lines.Count) file checksums in SHA256SUMS.txt (including 32-bit helper)"
       - name: Upload Windows portable package artifact
         uses: actions/upload-artifact@v4
         with:

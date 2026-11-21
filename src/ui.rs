@@ -4,6 +4,7 @@
 //! camera, resolution scaling, Settings, 1 Hz Diagnostics panel, and Modules.
 
 use std::{
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -22,18 +23,27 @@ use forsaken_world_explorer::{
     pck::PckArchive,
     scenery::{self, SceneryDiagnostics, SceneryModelCache},
     settings::{
-        PortablePaths, ViewerSettings, WaterQuality, DEFAULT_FOG_DIST_MULT_PCT,
+        GrassDensity, PortablePaths, ViewerSettings, WaterQuality, DEFAULT_FOG_DIST_MULT_PCT,
         DEFAULT_SCENERY_LOADS_PER_FRAME, DEFAULT_SCENERY_MAX_INSTANCES, DEFAULT_SCENERY_RADIUS_M,
-        DEFAULT_TERRAIN_RAM_MIB, DEFAULT_TEX_BUDGET_MIB, MAX_FOG_DIST_MULT_PCT,
-        MAX_RESOLUTION_SCALE_PCT, MAX_SCENERY_LOADS_PER_FRAME, MAX_SCENERY_MAX_INSTANCES,
-        MAX_SCENERY_RADIUS_M, MIN_FOG_DIST_MULT_PCT, MIN_RESOLUTION_SCALE_PCT,
-        MIN_SCENERY_LOADS_PER_FRAME, MIN_SCENERY_MAX_INSTANCES, MIN_SCENERY_RADIUS_M,
+        DEFAULT_TERRAIN_RAM_MIB, DEFAULT_TEX_BUDGET_MIB, DEFAULT_TREE_LOD_DIST_MULT_PCT,
+        DEFAULT_VEG_LOADS_PER_FRAME, DEFAULT_VEG_MAX_INSTANCES, DEFAULT_VEG_RADIUS_M,
+        MAX_FOG_DIST_MULT_PCT, MAX_RESOLUTION_SCALE_PCT, MAX_SCENERY_LOADS_PER_FRAME,
+        MAX_SCENERY_MAX_INSTANCES, MAX_SCENERY_RADIUS_M, MAX_TREE_LOD_DIST_MULT_PCT,
+        MAX_VEG_LOADS_PER_FRAME, MAX_VEG_MAX_INSTANCES, MAX_VEG_RADIUS_M, MIN_FOG_DIST_MULT_PCT,
+        MIN_RESOLUTION_SCALE_PCT, MIN_SCENERY_LOADS_PER_FRAME, MIN_SCENERY_MAX_INSTANCES,
+        MIN_SCENERY_RADIUS_M, MIN_TREE_LOD_DIST_MULT_PCT, MIN_VEG_LOADS_PER_FRAME,
+        MIN_VEG_MAX_INSTANCES, MIN_VEG_RADIUS_M,
     },
     terrain_gpu::{
-        build_scenery_batches_for_model, CameraUniform, SceneryDrawSnapshot, TerrainMeshSnapshot,
-        TerrainSession, TerrainTextureSnapshot, TerrainViewportRenderer, WaterRenderSnapshot,
+        build_scenery_batches_for_model, build_tree_batches, CameraUniform, SceneryDrawSnapshot,
+        SceneryInstance, TerrainMeshSnapshot, TerrainSession, TerrainTextureSnapshot,
+        TerrainViewportRenderer, VegetationDrawBatch, VegetationDrawSnapshot, WaterRenderSnapshot,
     },
     tex_cache::{DecodedTexture, TextureCache},
+    vegetation::{
+        self, FwstTreeMesh, GrassPlacement, GrassTypeDef, HelperRequest, TreePlacement,
+        TreeTypeDef, DEFAULT_HELPER_TIMEOUT_SECS, SPEEDTREE_CACHE_SUBDIR,
+    },
     world_objects::{self, OrnamentPlacement},
 };
 
@@ -63,6 +73,7 @@ struct TerrainCallback {
     day_lightmap: Arc<TerrainTextureSnapshot>,
     night_lightmap: Arc<TerrainTextureSnapshot>,
     scenery: Arc<SceneryDrawSnapshot>,
+    vegetation: Arc<VegetationDrawSnapshot>,
     water: Arc<WaterRenderSnapshot>,
 }
 
@@ -89,6 +100,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             &self.day_lightmap,
             &self.night_lightmap,
             &self.scenery,
+            &self.vegetation,
             &self.water,
         )]
     }
@@ -437,6 +449,341 @@ impl ActiveSceneryState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct VegetationDiagnostics {
+    trees_total: usize,
+    trees_in_range: usize,
+    trees_loaded: usize,
+    helper_status: String,
+    grass_total: usize,
+    grass_in_range: usize,
+    grass_drawn: usize,
+    speedtree_cache_bytes: u64,
+}
+
+struct ActiveVegetationState {
+    client_root: Option<PathBuf>,
+    helper_exe: PathBuf,
+    cache_root: PathBuf,
+    tree_types: Vec<TreeTypeDef>,
+    tree_placements: Vec<TreePlacement>,
+    grass_types: Vec<GrassTypeDef>,
+    grass_placements: Vec<GrassPlacement>,
+    tree_meshes: BTreeMap<(u32, u32), FwstTreeMesh>,
+    failed_tree_keys: HashSet<(u32, u32)>,
+    helper_ready: bool,
+    dll_ready: bool,
+    missing_notice: Option<String>,
+    last_helper_status: String,
+    revision: u64,
+}
+
+impl ActiveVegetationState {
+    fn open_zone(
+        client_root: &Path,
+        zone: &str,
+        portable_paths: &PortablePaths,
+        logger: &mut Option<RunLogger>,
+    ) -> Result<Self, String> {
+        let zone_dir = client_root.join("maps").join(zone);
+        let wld_bytes = fs::read(zone_dir.join(format!("{zone}.ecwld")))
+            .map_err(|e| format!("failed to read {zone}.ecwld: {e}"))?;
+        let bsd_bytes = fs::read(zone_dir.join(format!("{zone}.ecbsd")))
+            .map_err(|e| format!("failed to read {zone}.ecbsd: {e}"))?;
+        let (_, _, tree_types, tree_placements, grass_types, grass_placements) =
+            vegetation::parse_ecwld_ecbsd_vegetation(&wld_bytes, &bsd_bytes)?;
+
+        let helper_exe = vegetation::resolve_helper_path(&portable_paths.root);
+        let helper_ready = helper_exe.is_file();
+        let dll_check = vegetation::verify_client_speedtree_dll(client_root);
+        let dll_ready = dll_check.is_ok();
+
+        let mut notices = Vec::new();
+        if !helper_ready {
+            let msg = format!(
+                "32-bit SpeedTree helper not found at {} — trees disabled; terrain, scenery, and grass continue normally.",
+                helper_exe.display()
+            );
+            if let Some(log) = logger.as_mut() {
+                log.warn(&msg);
+            }
+            notices.push(msg);
+        }
+        if let Err(err) = &dll_check {
+            let msg = format!("{err} — trees disabled; viewer continues normally.");
+            if let Some(log) = logger.as_mut() {
+                log.warn(&msg);
+            }
+            notices.push(msg);
+        }
+        let missing_notice = (!notices.is_empty()).then(|| notices.join(" | "));
+        let last_helper_status = if !helper_ready {
+            "missing helper (tools/fw-speedtree-helper.exe)".to_string()
+        } else if !dll_ready {
+            "client update/speedtreert.dll missing or untrusted".to_string()
+        } else if tree_placements.is_empty() {
+            "idle (zone has 0 tree placements)".to_string()
+        } else {
+            "ready".to_string()
+        };
+
+        Ok(Self {
+            client_root: Some(client_root.to_path_buf()),
+            helper_exe,
+            cache_root: portable_paths.cache_dir.clone(),
+            tree_types,
+            tree_placements,
+            grass_types,
+            grass_placements,
+            tree_meshes: BTreeMap::new(),
+            failed_tree_keys: HashSet::new(),
+            helper_ready,
+            dll_ready,
+            missing_notice,
+            last_helper_status,
+            revision: 0,
+        })
+    }
+
+    fn open_synthetic(portable_paths: &PortablePaths) -> Self {
+        let mut tree_meshes = BTreeMap::new();
+        for lod in 0..=2u32 {
+            tree_meshes.insert(
+                (0, lod),
+                vegetation::synthetic::build_synthetic_tree_fwst(0, lod),
+            );
+        }
+        let tree_placements = vec![
+            TreePlacement {
+                tree_type: 0,
+                position: [72.0, 100.0, 86.0],
+            },
+            TreePlacement {
+                tree_type: 0,
+                position: [132.0, 102.0, 92.0],
+            },
+        ];
+        let mut grass_placements = Vec::new();
+        for i in 0..16u32 {
+            let gx = (i % 4) as f32;
+            let gz = (i / 4) as f32;
+            grass_placements.push(GrassPlacement {
+                export_id: 1000 + i,
+                grass_type: 0,
+                position: [82.0 + gx * 8.0, 100.0, 82.0 + gz * 8.0],
+                grid_size: 2.0,
+                grid_cols: 1,
+                grid_rows: 1,
+            });
+        }
+        let grass_types = vec![GrassTypeDef {
+            type_id: 0,
+            alpha_blend: false,
+            alpha_ref: 84,
+            size: 2.2,
+            size_var: 0.3,
+            softness: 1.0,
+            sight_range: 50.0,
+            texture_path: "synthetic/grass.dds".into(),
+        }];
+        Self {
+            client_root: None,
+            helper_exe: vegetation::resolve_helper_path(&portable_paths.root),
+            cache_root: portable_paths.cache_dir.clone(),
+            tree_types: vec![TreeTypeDef {
+                type_id: 0,
+                spt_path: "synthetic/tree0.spt".into(),
+                dds_path: "synthetic/tree0.dds".into(),
+            }],
+            tree_placements,
+            grass_types,
+            grass_placements,
+            tree_meshes,
+            failed_tree_keys: HashSet::new(),
+            helper_ready: true,
+            dll_ready: true,
+            missing_notice: None,
+            last_helper_status: "synthetic preview (in-memory FWST v1)".to_string(),
+            revision: 0,
+        }
+    }
+
+    fn step_frame(
+        &mut self,
+        camera_pos: glam::Vec3,
+        settings: &ViewerSettings,
+        logger: &mut Option<RunLogger>,
+    ) -> (VegetationDrawSnapshot, VegetationDiagnostics) {
+        let mut batches = Vec::new();
+        let mut trees_in_range = 0usize;
+        let mut grass_in_range = 0usize;
+        let mut grass_drawn = 0usize;
+
+        if settings.trees_enabled && !self.tree_placements.is_empty() {
+            let grouped = vegetation::dedup_trees_by_type_and_lod(
+                &self.tree_placements,
+                camera_pos,
+                settings.veg_radius_m as f32,
+                settings.veg_max_instances as usize,
+                settings.tree_lod_distance_multiplier(),
+            );
+            trees_in_range = grouped.values().map(Vec::len).sum();
+
+            let mut loads_left = settings.veg_loads_per_frame as usize;
+            let cache_dir = self.cache_root.join(SPEEDTREE_CACHE_SUBDIR);
+
+            for (&(tree_type, lod), transforms) in &grouped {
+                let key = (tree_type, lod);
+                if !self.tree_meshes.contains_key(&key)
+                    && !self.failed_tree_keys.contains(&key)
+                    && loads_left > 0
+                {
+                    let cache_file = cache_dir.join(format!("tree-{tree_type}-lod{lod}.fwst"));
+                    if let Ok(bytes) = fs::read(&cache_file) {
+                        match FwstTreeMesh::decode(&bytes) {
+                            Ok(mesh) => {
+                                self.tree_meshes.insert(key, mesh);
+                                loads_left = loads_left.saturating_sub(1);
+                            }
+                            Err(err) => {
+                                self.failed_tree_keys.insert(key);
+                                if let Some(log) = logger.as_mut() {
+                                    log.warn(&format!(
+                                        "Corrupt FWST cache {}: {err}",
+                                        cache_file.display()
+                                    ));
+                                }
+                            }
+                        }
+                    } else if self.helper_ready && self.dll_ready {
+                        if let (Some(client_root), Some(tdef)) = (
+                            self.client_root.as_deref(),
+                            self.tree_types.iter().find(|t| t.type_id == tree_type),
+                        ) {
+                            let _ = fs::create_dir_all(&cache_dir);
+                            let req = HelperRequest {
+                                tree_type,
+                                spt_path: tdef.spt_path.clone(),
+                                lod,
+                                out_cache_file: cache_file.clone(),
+                            };
+                            loads_left = loads_left.saturating_sub(1);
+                            match vegetation::run_speedtree_helper(
+                                &self.helper_exe,
+                                client_root,
+                                &req,
+                                Duration::from_secs(DEFAULT_HELPER_TIMEOUT_SECS),
+                            ) {
+                                Ok(rep) => {
+                                    self.last_helper_status = if rep.timed_out {
+                                        format!("timeout after {} ms", rep.duration_ms)
+                                    } else {
+                                        format!(
+                                            "exit={:?} in {} ms",
+                                            rep.exit_code, rep.duration_ms
+                                        )
+                                    };
+                                    if rep.exit_code == Some(0) && !rep.timed_out {
+                                        if let Ok(bytes) = fs::read(&cache_file) {
+                                            if let Ok(mesh) = FwstTreeMesh::decode(&bytes) {
+                                                self.tree_meshes.insert(key, mesh);
+                                            } else {
+                                                self.failed_tree_keys.insert(key);
+                                            }
+                                        } else {
+                                            self.failed_tree_keys.insert(key);
+                                        }
+                                    } else {
+                                        self.failed_tree_keys.insert(key);
+                                        if let Some(log) = logger.as_mut() {
+                                            log.warn(&format!(
+                                                "SpeedTree helper failed for type {tree_type} lod {lod}: {} ({})",
+                                                self.last_helper_status, rep.stderr_summary
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    self.last_helper_status = format!("error: {err}");
+                                    self.failed_tree_keys.insert(key);
+                                    if let Some(log) = logger.as_mut() {
+                                        log.warn(&format!("SpeedTree helper launch error: {err}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(mesh) = self.tree_meshes.get(&key) {
+                    batches.extend(build_tree_batches(
+                        mesh,
+                        transforms,
+                        [0.42, 0.28, 0.14, 1.0],
+                        [0.18, 0.56, 0.20, 1.0],
+                        None,
+                    ));
+                }
+            }
+        }
+
+        if settings.grass_enabled && !self.grass_placements.is_empty() {
+            let selected = vegetation::select_visible_grass(
+                &self.grass_placements,
+                camera_pos,
+                settings.veg_radius_m as f32,
+                settings.veg_max_instances as usize,
+                settings.grass_density,
+            );
+            grass_in_range = selected.len();
+            let grouped = vegetation::dedup_grass_by_type(&selected);
+            for (gtype, mats) in grouped {
+                let gdef = self.grass_types.iter().find(|g| g.type_id == gtype);
+                let size = gdef.map(|g| g.size).unwrap_or(1.5).clamp(0.5, 6.0);
+                let alpha_cutoff = gdef
+                    .map(|g| (g.alpha_ref as f32 / 255.0).clamp(0.05, 0.9))
+                    .unwrap_or(0.33);
+                let (verts, idxs) = vegetation::synthetic::build_grass_tuft_mesh(size);
+                let instances: Vec<SceneryInstance> = mats
+                    .iter()
+                    .map(|m| SceneryInstance {
+                        model_cols: m.to_cols_array_2d(),
+                    })
+                    .collect();
+                grass_drawn += instances.len();
+                batches.push(VegetationDrawBatch {
+                    vertices: verts,
+                    indices: idxs,
+                    instances,
+                    base_color: [0.32, 0.64, 0.22, 1.0],
+                    alpha_cutoff,
+                    wind_amplitude: 0.22,
+                    texture: None,
+                });
+            }
+        }
+
+        self.revision = self.revision.wrapping_add(1);
+        let diag = VegetationDiagnostics {
+            trees_total: self.tree_placements.len(),
+            trees_in_range,
+            trees_loaded: self.tree_meshes.len(),
+            helper_status: self.last_helper_status.clone(),
+            grass_total: self.grass_placements.len(),
+            grass_in_range,
+            grass_drawn,
+            speedtree_cache_bytes: vegetation::speedtree_cache_bytes(&self.cache_root),
+        };
+        (
+            VegetationDrawSnapshot {
+                batches,
+                revision: self.revision,
+            },
+            diag,
+        )
+    }
+}
+
 pub struct ExplorerApp {
     page: Page,
     paths: PortablePaths,
@@ -455,13 +802,17 @@ pub struct ExplorerApp {
     started_at: Instant,
     terrain_session: Option<TerrainSession>,
     scenery_state: Option<ActiveSceneryState>,
+    veg_state: Option<ActiveVegetationState>,
     mesh_arc: Arc<TerrainMeshSnapshot>,
     day_lm_arc: Arc<TerrainTextureSnapshot>,
     night_lm_arc: Arc<TerrainTextureSnapshot>,
     scenery_arc: Arc<SceneryDrawSnapshot>,
+    veg_arc: Arc<VegetationDrawSnapshot>,
     water_arc: Arc<WaterRenderSnapshot>,
     latest_diag: SceneryDiagnostics,
     displayed_diag: SceneryDiagnostics,
+    latest_veg_diag: VegetationDiagnostics,
+    displayed_veg_diag: VegetationDiagnostics,
     last_diag_refresh: Instant,
 }
 
@@ -565,13 +916,17 @@ impl ExplorerApp {
             started_at: Instant::now(),
             terrain_session: None,
             scenery_state: None,
+            veg_state: None,
             mesh_arc: Arc::new(TerrainMeshSnapshot::default()),
             day_lm_arc: Arc::new(TerrainTextureSnapshot::default()),
             night_lm_arc: Arc::new(TerrainTextureSnapshot::default()),
             scenery_arc: Arc::new(SceneryDrawSnapshot::default()),
+            veg_arc: Arc::new(VegetationDrawSnapshot::default()),
             water_arc: Arc::new(WaterRenderSnapshot::default()),
             latest_diag: default_diag.clone(),
             displayed_diag: default_diag,
+            latest_veg_diag: VegetationDiagnostics::default(),
+            displayed_veg_diag: VegetationDiagnostics::default(),
             last_diag_refresh: Instant::now(),
         }
     }
@@ -624,6 +979,7 @@ impl ExplorerApp {
         self.detected_client = Some(result);
         self.terrain_session = None;
         self.scenery_state = None;
+        self.veg_state = None;
         self.save_settings();
     }
 
@@ -646,8 +1002,15 @@ impl ExplorerApp {
             });
             self.latest_diag = diag;
         }
+        if let Some(veg) = self.veg_state.as_mut() {
+            let (vsnap, vdiag) =
+                veg.step_frame(self.camera.position, &self.settings, &mut self.logger);
+            self.veg_arc = Arc::new(vsnap);
+            self.latest_veg_diag = vdiag;
+        }
         if self.last_diag_refresh.elapsed() >= Duration::from_secs(1) {
             self.displayed_diag = self.latest_diag.clone();
+            self.displayed_veg_diag = self.latest_veg_diag.clone();
             self.last_diag_refresh = Instant::now();
         }
     }
@@ -684,9 +1047,17 @@ impl ExplorerApp {
                         format!("scenery unavailable ({err})")
                     }
                 };
+                self.veg_state = ActiveVegetationState::open_zone(
+                    &client.root,
+                    &zone,
+                    &self.paths,
+                    &mut self.logger,
+                )
+                .ok();
                 let vp = self.camera.view_proj(16.0 / 9.0);
                 self.step_scenery(vp, 1080, 680);
                 self.displayed_diag = self.latest_diag.clone();
+                self.displayed_veg_diag = self.latest_veg_diag.clone();
                 self.last_diag_refresh = Instant::now();
                 let msg = format!(
                     "Loaded zone '{}' ({}x{} blocks, {})",
@@ -723,9 +1094,11 @@ impl ExplorerApp {
                 {
                     self.scenery_state = Some(st);
                 }
+                self.veg_state = Some(ActiveVegetationState::open_synthetic(&self.paths));
                 let vp = self.camera.view_proj(16.0 / 9.0);
                 self.step_scenery(vp, 1080, 680);
                 self.displayed_diag = self.latest_diag.clone();
+                self.displayed_veg_diag = self.latest_veg_diag.clone();
                 self.last_diag_refresh = Instant::now();
                 let msg = format!(
                     "Loaded synthetic world preview ({} blocks, {} scenery instances, {} water plane)",
@@ -1026,6 +1399,7 @@ impl ExplorerApp {
                 day_lightmap: Arc::clone(&self.day_lm_arc),
                 night_lightmap: Arc::clone(&self.night_lm_arc),
                 scenery: Arc::clone(&self.scenery_arc),
+                vegetation: Arc::clone(&self.veg_arc),
                 water: Arc::clone(&self.water_arc),
             },
         );
@@ -1042,6 +1416,9 @@ impl ExplorerApp {
                         self.mesh_arc.streamed_blocks,
                         self.mesh_arc.hot_ram_bytes / 1024
                     ));
+                    if let Some(notice) = self.veg_state.as_ref().and_then(|v| v.missing_notice.as_deref()) {
+                        ui.small(format!("SpeedTree notice: {notice}"));
+                    }
                 });
             });
 
@@ -1093,6 +1470,22 @@ impl ExplorerApp {
                             } else {
                                 ""
                             }
+                        ));
+                        let vd = &self.displayed_veg_diag;
+                        ui.small(format!(
+                            "Trees: {} in range / {} total ({} LOD meshes loaded)",
+                            vd.trees_in_range, vd.trees_total, vd.trees_loaded
+                        ));
+                        ui.small(format!(
+                            "SpeedTree helper: {}",
+                            if vd.helper_status.is_empty() { "idle" } else { &vd.helper_status }
+                        ));
+                        ui.small(format!(
+                            "Grass: {} drawn / {} in range ({} total) | speedtree-v1 cache: {:.1} KiB",
+                            vd.grass_drawn,
+                            vd.grass_in_range,
+                            vd.grass_total,
+                            vd.speedtree_cache_bytes as f64 / 1024.0
                         ));
                         if !d.gpu_timing_note.is_empty() {
                             ui.small(format!("GPU timing: {}", d.gpu_timing_note));
@@ -1259,6 +1652,19 @@ impl ExplorerApp {
                             )),
                     )
                     .changed();
+                ui.separator();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.tree_lod_dist_mult_pct,
+                            MIN_TREE_LOD_DIST_MULT_PCT..=MAX_TREE_LOD_DIST_MULT_PCT,
+                        )
+                        .suffix("%")
+                        .text(format!(
+                            "Tree LOD distance multiplier (default {DEFAULT_TREE_LOD_DIST_MULT_PCT}%)"
+                        )),
+                    )
+                    .changed();
             }
             SettingsTab::World => {
                 ui.label("Static scenery streaming and transparency controls.");
@@ -1318,6 +1724,67 @@ impl ExplorerApp {
                 if self.settings.scenery_whole_world {
                     ui.label("Warning: whole-world loading ignores the streaming radius and max-instance cap, which can consume large amounts of RAM/VRAM on dense zones and is not verified on full-zone memory use.");
                 }
+                ui.separator();
+                ui.strong("Vegetation (SpeedTree & Grass)");
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.trees_enabled,
+                        "Show trees (via 32-bit SpeedTree helper; wind sway approximate)",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.settings.grass_enabled, "Show grass")
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Grass density:");
+                    for (d, label) in [
+                        (GrassDensity::Low, "Low (35%)"),
+                        (GrassDensity::Medium, "Medium (65%)"),
+                        (GrassDensity::High, "High (100%)"),
+                    ] {
+                        if ui
+                            .selectable_label(self.settings.grass_density == d, label)
+                            .clicked()
+                        {
+                            self.settings.grass_density = d;
+                            changed = true;
+                        }
+                    }
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.veg_radius_m,
+                            MIN_VEG_RADIUS_M..=MAX_VEG_RADIUS_M,
+                        )
+                        .suffix(" m")
+                        .text(format!(
+                            "Vegetation streaming radius (default {DEFAULT_VEG_RADIUS_M} m)"
+                        )),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.veg_max_instances,
+                            MIN_VEG_MAX_INSTANCES..=MAX_VEG_MAX_INSTANCES,
+                        )
+                        .text(format!(
+                            "Max vegetation instances (default {DEFAULT_VEG_MAX_INSTANCES})"
+                        )),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.veg_loads_per_frame,
+                            MIN_VEG_LOADS_PER_FRAME..=MAX_VEG_LOADS_PER_FRAME,
+                        )
+                        .text(format!(
+                            "New vegetation loads per frame (default {DEFAULT_VEG_LOADS_PER_FRAME})"
+                        )),
+                    )
+                    .changed();
             }
             SettingsTab::Sound => {
                 ui.label("Sound settings (audio backend arrives in Phase 7).");

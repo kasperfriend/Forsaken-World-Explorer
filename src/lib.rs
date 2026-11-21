@@ -13,4 +13,5 @@ pub mod terrain_block;
 pub mod terrain_gpu;
 pub mod terrain_store;
 pub mod tex_cache;
+pub mod vegetation;
 pub mod world_objects;

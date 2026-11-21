@@ -1,6 +1,7 @@
 //! Offscreen GPU world render smoke test (designed for Mesa `lavapipe` on Linux CI).
 //!
 //! Renders sky, streamed terrain (day+night lightmap blend), opaque static `.bmd` building,
+//! synthetic SpeedTree mesh (trunk + alpha-tested leaves) and grass patch (`vegetation.wgsl`),
 //! translucent test quad, and an animated water plane with scissored reflection/refraction
 //! passes. Checks that all expected pixel regions are non-empty and that the water region
 //! differs from the non-water region.
@@ -72,7 +73,7 @@ fn main() -> ExitCode {
         };
 
     println!(
-        "Rendered {}x{} (3D pass {}x{} @ {}% scale), {} blocks, sky={} px, non_clear={} px, bmd={} px, translucent={} px, water={} px (differs={}), distinct_colors={}",
+        "Rendered {}x{} (3D pass {}x{} @ {}% scale), {} blocks, sky={} px, non_clear={} px, bmd={} px, tree={} px, grass={} px, translucent={} px, water={} px (differs={}), distinct_colors={}",
         metrics.width,
         metrics.height,
         metrics.scaled_width,
@@ -82,6 +83,8 @@ fn main() -> ExitCode {
         metrics.sky_pixels,
         metrics.non_clear_pixels,
         metrics.scenery_pixels,
+        metrics.tree_pixels,
+        metrics.grass_pixels,
         metrics.translucent_pixels,
         metrics.water_pixels,
         metrics.water_differs_from_non_water,
@@ -100,6 +103,20 @@ fn main() -> ExitCode {
         eprintln!(
             "error: static .bmd mesh pixels not detected ({} px)",
             metrics.scenery_pixels
+        );
+        return ExitCode::FAILURE;
+    }
+    if metrics.tree_pixels < 40 {
+        eprintln!(
+            "error: synthetic tree pixels not detected ({} px)",
+            metrics.tree_pixels
+        );
+        return ExitCode::FAILURE;
+    }
+    if metrics.grass_pixels < 20 {
+        eprintln!(
+            "error: synthetic grass pixels not detected ({} px)",
+            metrics.grass_pixels
         );
         return ExitCode::FAILURE;
     }
@@ -123,7 +140,7 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "[PASS] Offscreen sky + terrain + static/transparent .bmd + water smoke test passed (pipeline execution only; not visual parity)."
+        "[PASS] Offscreen sky + terrain + static/transparent .bmd + vegetation (tree+grass) + water smoke test passed (pipeline execution only; not visual parity)."
     );
     ExitCode::SUCCESS
 }
