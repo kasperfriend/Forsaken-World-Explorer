@@ -6,7 +6,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{dxt, logging, modules, pck, settings, terrain_block, terrain_store};
+use glam::Vec3;
+
+use crate::{
+    bmd, dxt, logging, modules, pck, scenery, settings, terrain_block, terrain_store, tex_cache,
+    world_objects,
+};
 
 #[derive(Debug)]
 pub struct CheckResult {
@@ -32,6 +37,11 @@ fn check_portable_settings_and_logs() -> Result<CheckResult, String> {
         resolution_scale_pct: 110,
         terrain_ram_mib: 4,
         tex_budget_mib: 32,
+        scenery_enabled: true,
+        scenery_radius_m: 320,
+        scenery_max_instances: 1500,
+        scenery_loads_per_frame: 6,
+        scenery_whole_world: false,
         music_volume: 65,
         ambience_volume: 50,
         effects_volume: 85,
@@ -196,6 +206,75 @@ fn check_synthetic_world_decoders() -> Result<CheckResult, String> {
     res
 }
 
+fn check_synthetic_scenery_pipeline() -> Result<CheckResult, String> {
+    let cache_dir = unique_temp_dir("fw-selftest-scenery")?;
+    let res = (|| -> Result<CheckResult, String> {
+        let raw_bmd = bmd::synthetic::build_bmd_v5_box("textures/stone_tower.dds", 4.0, 12.0);
+        let model = bmd::BmdModel::parse(&raw_bmd).map_err(|e| e.to_string())?;
+        if model.submeshes.len() != 1 || model.submeshes[0].indices.len() != 36 {
+            return Err("unexpected synthetic BMD mesh counts".into());
+        }
+
+        let placements = vec![
+            world_objects::OrnamentPlacement {
+                export_id: 1,
+                asset_path: "1\\tower.bmd".into(),
+                position: [10.0, 0.0, 10.0],
+                direction: [0.0, 0.0, 1.0],
+                up: [0.0, 1.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+                reflect: false,
+                refract: false,
+                optimize: false,
+            },
+            world_objects::OrnamentPlacement {
+                export_id: 2,
+                asset_path: "1\\tower.bmd".into(),
+                position: [30.0, 0.0, 10.0],
+                direction: [1.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+                reflect: false,
+                refract: false,
+                optimize: false,
+            },
+        ];
+        let visible = scenery::select_visible_placements(&placements, Vec3::ZERO, 128.0, 64, false);
+        let batches = scenery::dedup_instances_by_model(&visible);
+        if batches.len() != 1 || batches[0].transforms.len() != 2 {
+            return Err("instance deduplication did not merge identical BMD paths".into());
+        }
+
+        let mut model_cache = scenery::SceneryModelCache::open(&cache_dir)?;
+        let (decoded, errs, drawn, _) =
+            scenery::step_streaming_frame(&mut model_cache, &batches, 4, |_| Ok(raw_bmd.clone()));
+        if decoded != 1 || !errs.is_empty() || drawn != 2 {
+            return Err("scenery streaming frame counts mismatch".into());
+        }
+
+        let mut tex = tex_cache::TextureCache::new(4096);
+        tex.begin_visible_batch();
+        tex.get_or_insert_pinned("textures/stone_tower.dds", || {
+            Ok(tex_cache::DecodedTexture {
+                width: 32,
+                height: 32,
+                rgba: vec![255u8; 4096],
+            })
+        })?;
+        let _ = tex.enforce_budget_after_batch();
+        if tex.stats().count != 1 {
+            return Err("texture cache failed to retain pinned texture".into());
+        }
+
+        Ok(CheckResult {
+            name: "synthetic-scenery-pipeline",
+            detail: "verified .bmd decode, instance dedup, multi-frame streaming, and pinned texture cache".into(),
+        })
+    })();
+    let _ = fs::remove_dir_all(&cache_dir);
+    res
+}
+
 fn check_optional_client_env() -> CheckResult {
     match env::var_os(settings::ENV_CLIENT_DIR).filter(|v| !v.is_empty()) {
         Some(path) => {
@@ -236,6 +315,7 @@ pub fn run() -> Result<Vec<CheckResult>, String> {
         check_module_discovery()?,
         check_synthetic_pck_archive()?,
         check_synthetic_world_decoders()?,
+        check_synthetic_scenery_pipeline()?,
         check_optional_client_env(),
     ])
 }
@@ -247,6 +327,6 @@ mod tests {
     #[test]
     fn self_test_passes_on_cpu() {
         let results = run().expect("self-test should pass");
-        assert!(results.len() >= 5);
+        assert!(results.len() >= 6);
     }
 }
