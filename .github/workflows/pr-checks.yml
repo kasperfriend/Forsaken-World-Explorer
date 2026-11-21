@@ -73,10 +73,14 @@ jobs:
             -Modules Modules `
             -OutputDirectory release `
             -ArchivePath release/Forsaken-World-Explorer-Windows-x64.zip
-      - name: Smoke run --self-test and --smoke-launch on packaged Windows executable
+      - name: Verify packaged Windows executable startup (--self-test, --smoke-launch, --version)
         shell: pwsh
         run: |
           $exe = "./release/Forsaken World Explorer/forsaken-world-explorer.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged executable --version failed with exit code $LASTEXITCODE"
+          }
           & $exe --self-test
           if ($LASTEXITCODE -ne 0) {
             throw "Packaged executable --self-test failed with exit code $LASTEXITCODE"
@@ -85,7 +89,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Packaged executable --smoke-launch failed with exit code $LASTEXITCODE"
           }
-      - name: Verify packaged Windows executable starts without crashing
+      - name: Verify packaged Windows executable launches without crashing or panicking
         shell: pwsh
         run: |
           $exe = (Resolve-Path "./release/Forsaken World Explorer/forsaken-world-explorer.exe").Path
@@ -96,10 +100,13 @@ jobs:
           if ($proc.HasExited) {
             $code = $proc.ExitCode
             $err = if (Test-Path $stderrLog) { Get-Content $stderrLog -Raw } else { '' }
-            if ($code -ne 0) {
-              throw "forsaken-world-explorer.exe exited immediately with code ${code}: $err"
+            if ($code -eq 0) {
+              Write-Host "forsaken-world-explorer.exe exited cleanly with code 0"
+            } elseif ($code -eq 1 -and $err -match 'Failed to create wgpu adapter' -and $err -notmatch 'panicked at') {
+              Write-Host "forsaken-world-explorer.exe started cleanly and reported no GPU adapter on headless runner (no panic/crash)."
+            } else {
+              throw "forsaken-world-explorer.exe crashed or failed unexpectedly (exit code ${code}): $err"
             }
-            Write-Host "forsaken-world-explorer.exe exited cleanly with code 0"
           } else {
             Write-Host "forsaken-world-explorer.exe stayed running cleanly for 3s (PID $($proc.Id)); stopping."
             Stop-Process -Id $proc.Id -Force
