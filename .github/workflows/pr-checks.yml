@@ -38,6 +38,34 @@ jobs:
           cargo run --locked --bin forsaken-world-explorer -- --smoke-launch
           cargo run --locked --bin terrain-memory-check
 
+  shader-validation:
+    name: Offline WGSL shader validation (naga)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate all WGSL shaders with naga
+        run: cargo run --locked --bin shader-validate
+
+  lavapipe-smoke:
+    name: Offscreen terrain render smoke test (Mesa lavapipe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Mesa Vulkan software driver (lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+      - name: Run offscreen terrain render smoke test on lavapipe
+        env:
+          WGPU_BACKEND: vulkan
+        run: cargo run --locked --bin terrain-render-smoke
+
   dependency-audit:
     name: Dependency security audit
     runs-on: ubuntu-latest
@@ -58,10 +86,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      - name: Run library, viewer, and memory-budget tests
+      - name: Run library, viewer, shader, and memory-budget tests
         run: |
           cargo test --locked --lib
           cargo test --locked --bin forsaken-world-explorer
+          cargo run --locked --bin shader-validate
           cargo run --locked --bin terrain-memory-check
       - name: Check all binary targets
         run: cargo check --locked --bins

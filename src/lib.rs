@@ -1,3 +1,4 @@
+pub mod camera;
 pub mod client_detect;
 pub mod dxt;
 pub mod logging;
@@ -6,5 +7,6 @@ pub mod pck;
 pub mod self_test;
 pub mod settings;
 pub mod terrain_block;
+pub mod terrain_gpu;
 pub mod terrain_store;
 pub mod world_objects;
