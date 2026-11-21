@@ -1,6 +1,6 @@
 //! Desktop window, menu, client folder validation, Settings tabs, and Modules view.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use eframe::egui;
 use forsaken_world_explorer::{
@@ -355,10 +355,42 @@ pub fn run_smoke_launch() -> Result<(), String> {
 }
 
 pub fn run_window() -> Result<(), String> {
+    // Prefer hardware GPUs first, falling back to software adapters (such as
+    // Microsoft Basic Render Driver / WARP on headless Windows runners) so the
+    // app launches cleanly even without a discrete GPU.
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+            eframe::egui_wgpu::WgpuSetupCreateNew {
+                native_adapter_selector: Some(Arc::new(|adapters, surface| {
+                    let rank = |device_type: eframe::wgpu::DeviceType| match device_type {
+                        eframe::wgpu::DeviceType::DiscreteGpu => 0,
+                        eframe::wgpu::DeviceType::IntegratedGpu => 1,
+                        eframe::wgpu::DeviceType::VirtualGpu => 2,
+                        eframe::wgpu::DeviceType::Cpu => 3,
+                        eframe::wgpu::DeviceType::Other => 4,
+                    };
+                    adapters
+                        .iter()
+                        .filter(|adapter| {
+                            surface
+                                .map(|s| adapter.is_surface_supported(s))
+                                .unwrap_or(true)
+                        })
+                        .min_by_key(|adapter| rank(adapter.get_info().device_type))
+                        .cloned()
+                        .ok_or_else(|| "no compatible wgpu adapter found".to_string())
+                })),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 620.0])
             .with_title("Forsaken World Explorer"),
+        wgpu_options,
         ..Default::default()
     };
     eframe::run_native(
