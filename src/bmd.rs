@@ -668,3 +668,91 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod version_matrix_tests {
+    use super::*;
+
+    fn build_minimal_bmd_for_version(
+        with_brush_header: bool,
+        model_version: u32,
+        mesh_version: u32,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&AFILE_BINARY_MAGIC.to_le_bytes());
+        if with_brush_header {
+            out.extend_from_slice(&BRUSH_BUILDING_VERSION.to_le_bytes());
+            out.push(0u8);
+        }
+        out.extend_from_slice(&model_version.to_le_bytes());
+        for v in [
+            1.0f32, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&1u32.to_le_bytes()); // 1 submesh
+        out.extend_from_slice(&mesh_version.to_le_bytes());
+        out.extend_from_slice(&[0u8; 320]); // name + texture
+        out.extend_from_slice(&3u32.to_le_bytes()); // 3 verts
+        out.extend_from_slice(&1u32.to_le_bytes()); // 1 face
+        let stride = if mesh_version >= 0x1000_0004 { 24 } else { 28 };
+        for i in 0..3usize {
+            let mut rec = vec![0u8; stride];
+            rec[0..4].copy_from_slice(&(i as f32).to_le_bytes());
+            rec[12..16].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+            out.extend_from_slice(&rec);
+        }
+        for idx in [0u16, 1, 2] {
+            out.extend_from_slice(&idx.to_le_bytes());
+        }
+        for _ in 0..3 {
+            for c in [0.0f32, 1.0, 0.0] {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        if mesh_version >= 0x1000_0003 {
+            for _ in 0..6 {
+                out.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&[0u8; 48]); // AABB
+        if mesh_version >= 0x1000_0005 {
+            out.extend_from_slice(b"mat\0");
+            for v in [
+                0.2f32, 0.2, 0.2, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+                8.0,
+            ] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.push(0u8);
+        }
+        out
+    }
+
+    #[test]
+    fn reads_every_supported_bmd_header_and_mesh_version() {
+        for with_brush in [false, true] {
+            for model_ver in [LITMODEL_VERSION_1, LITMODEL_VERSION_2] {
+                for mesh_ver in [0x1000_0002u32, 0x1000_0003, 0x1000_0004, 0x1000_0005] {
+                    let raw = build_minimal_bmd_for_version(with_brush, model_ver, mesh_ver);
+                    let parsed = BmdModel::parse(&raw).unwrap_or_else(|e| {
+                        panic!("failed for brush={with_brush} model={model_ver:#x} mesh={mesh_ver:#x}: {e}")
+                    });
+                    assert_eq!(parsed.model_version, model_ver);
+                    assert_eq!(parsed.submeshes.len(), 1);
+                    assert_eq!(parsed.submeshes[0].version, mesh_ver);
+                    assert_eq!(
+                        parsed.submeshes[0].material.is_some(),
+                        mesh_ver >= 0x1000_0005
+                    );
+                }
+            }
+        }
+        // Unsupported mesh version must fail cleanly with UnsupportedMeshVersion
+        let bad = build_minimal_bmd_for_version(false, LITMODEL_VERSION_2, 0x1000_0001);
+        assert_eq!(
+            BmdModel::parse(&bad),
+            Err(BmdError::UnsupportedMeshVersion(0x1000_0001))
+        );
+    }
+}

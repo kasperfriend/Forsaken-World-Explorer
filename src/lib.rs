@@ -1,3 +1,4 @@
+pub mod atmosphere;
 pub mod bmd;
 pub mod camera;
 pub mod client_detect;

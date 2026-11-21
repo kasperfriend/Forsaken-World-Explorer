@@ -1,6 +1,10 @@
-//! GPU terrain and instanced static `.bmd` scenery renderer using `wgpu`, streaming terrain
-//! blocks through `TerrainStore` (`cache/terrain-v1`) and rendering 3D world geometry at the
-//! configured resolution scale (10%–200%).
+//! GPU world renderer using `wgpu`:
+//! - Sky dome/gradient (`sky.wgsl`)
+//! - Streamed terrain with day/night `t2lm` + `t2lm1` lightmap blending (`terrain.wgsl`)
+//! - Instanced opaque/alpha-tested & back-to-front transparent `.bmd` scenery (`scenery.wgsl`)
+//! - Experimental animated water with scissored visible-only reflection & refraction passes,
+//!   shoreline edge blend, and underwater tint (`water.wgsl`)
+//! - Resolution scaling (`10%–200%`) with native `egui` UI overlay (`blit.wgsl`)
 
 use std::{
     env, fs,
@@ -13,17 +17,21 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::{
+    atmosphere::{self, BoxAreaAtmosphere, ScissorRect, WaterPlane},
     bmd::{self, AlphaMode, BmdModel},
     camera::{scaled_render_target, streaming_blocks, FreeCamera},
     dxt,
+    settings::WaterQuality,
     terrain_block::{self, T2bkFile},
     terrain_store::{TerrainPage, TerrainStore, DEFAULT_HOT_RAM_BYTES},
     tex_cache::DecodedTexture,
     world_objects::placement_transform_matrix,
 };
 
+pub const SKY_WGSL: &str = include_str!("shaders/sky.wgsl");
 pub const TERRAIN_WGSL: &str = include_str!("shaders/terrain.wgsl");
 pub const SCENERY_WGSL: &str = include_str!("shaders/scenery.wgsl");
+pub const WATER_WGSL: &str = include_str!("shaders/water.wgsl");
 pub const BLIT_WGSL: &str = include_str!("shaders/blit.wgsl");
 
 #[repr(C)]
@@ -40,7 +48,8 @@ pub struct TerrainVertex {
 pub struct SceneryVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
-    pub color: [f32; 4],
+    pub day_color: [f32; 4],
+    pub night_color: [f32; 4],
     pub uv: [f32; 2],
 }
 
@@ -54,15 +63,111 @@ pub struct SceneryInstance {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct SceneryMaterialUniform {
     pub diffuse_rgba: [f32; 4],
+    /// x = alpha_cutoff (0.0 opaque/blended, 0.5 alpha-tested)
+    /// y = has_vertex_lighting (1.0 client day/night, 0.0 approximate fallback)
     pub params: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct WaterVertex {
+    pub position: [f32; 3],
+    pub uv: [f32; 2],
+    pub edge_factor: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct WaterUniform {
+    pub water_color: [f32; 4],
+    /// x = refl_enabled, y = refr_enabled, z = wave_scale, w = shore_fade
+    pub flags: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
+    /// xyz = normalized sun dir, w = dn_factor (0=day, 1=night)
     pub sun_dir: [f32; 4],
+    /// rgb = active fog color, a = elapsed time seconds
     pub fog_color: [f32; 4],
+    /// x = fog_start, y = fog_end, z = fog_enabled (0/1), w = underwater (0/1)
+    pub fog_params: [f32; 4],
+    /// rgb = sky zenith, a = water_height
+    pub sky_zenith: [f32; 4],
+    /// rgb = sky horizon, a = camera_y
+    pub sky_horizon: [f32; 4],
+    /// rgb = sun disc color, a = 1.0
+    pub sun_color: [f32; 4],
+}
+
+impl CameraUniform {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        view_proj: Mat4,
+        camera_pos: Vec3,
+        hours: f32,
+        elapsed_sec: f32,
+        fog_enabled: bool,
+        fog_mult: f32,
+        box_area: Option<&BoxAreaAtmosphere>,
+        water_height: Option<f32>,
+    ) -> Self {
+        let dn = atmosphere::day_night_factor(hours);
+        let sun = atmosphere::sun_direction_for_time(hours);
+        let default_box = BoxAreaAtmosphere::default();
+        let area = box_area.unwrap_or(&default_box);
+
+        let underwater = water_height.is_some_and(|wh| camera_pos.y < wh);
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| {
+            [
+                lerp(a[0], b[0], t),
+                lerp(a[1], b[1], t),
+                lerp(a[2], b[2], t),
+            ]
+        };
+
+        let (fog_start, fog_end, fog_rgb) = if underwater {
+            (
+                area.uw_fog_start,
+                area.uw_fog_end,
+                atmosphere::unpack_argb_rgb(area.uw_fog_color),
+            )
+        } else {
+            let mult = fog_mult.clamp(0.25, 4.0);
+            let s = lerp(area.day_fog_start, area.night_fog_start, dn) * mult;
+            let e = lerp(area.day_fog_end, area.night_fog_end, dn) * mult;
+            let c = lerp3(
+                atmosphere::unpack_argb_rgb(area.day_fog_color),
+                atmosphere::unpack_argb_rgb(area.night_fog_color),
+                dn,
+            );
+            (s, e.max(s + 1.0), c)
+        };
+
+        let (zenith, horizon, sun_col) = atmosphere::sky_colors_for_time(hours, Some(area));
+        Self {
+            view_proj: view_proj.to_cols_array_2d(),
+            sun_dir: [sun.x, sun.y, sun.z, dn],
+            fog_color: [fog_rgb[0], fog_rgb[1], fog_rgb[2], elapsed_sec],
+            fog_params: [
+                fog_start,
+                fog_end,
+                if fog_enabled || underwater { 1.0 } else { 0.0 },
+                if underwater { 1.0 } else { 0.0 },
+            ],
+            sky_zenith: [
+                zenith[0],
+                zenith[1],
+                zenith[2],
+                water_height.unwrap_or(-1e6),
+            ],
+            sky_horizon: [horizon[0], horizon[1], horizon[2], camera_pos.y],
+            sun_color: [sun_col[0], sun_col[1], sun_col[2], 1.0],
+        }
+    }
 }
 
 /// One deduplicated static submesh batch (one vertex/index buffer shared across N instances).
@@ -73,14 +178,39 @@ pub struct SceneryDrawBatch {
     pub instances: Vec<SceneryInstance>,
     pub diffuse_rgba: [f32; 4],
     pub alpha_cutoff: f32,
+    pub is_transparent: bool,
+    pub has_vertex_lighting: bool,
+    pub sort_center: Vec3,
+    pub sort_id: u64,
     pub texture: Option<Arc<DecodedTexture>>,
 }
 
-/// Complete set of deduplicated static scenery draw batches for the current frame.
+/// Complete set of deduplicated opaque and back-to-front sorted transparent scenery batches.
 #[derive(Clone, Debug, Default)]
 pub struct SceneryDrawSnapshot {
-    pub batches: Vec<SceneryDrawBatch>,
+    pub opaque_batches: Vec<SceneryDrawBatch>,
+    pub transparent_batches: Vec<SceneryDrawBatch>,
     pub revision: u64,
+}
+
+/// Water render configuration for the current frame.
+#[derive(Clone, Debug)]
+pub struct WaterRenderSnapshot {
+    pub planes: Vec<WaterPlane>,
+    pub reflection_enabled: bool,
+    pub refraction_enabled: bool,
+    pub quality: WaterQuality,
+}
+
+impl Default for WaterRenderSnapshot {
+    fn default() -> Self {
+        Self {
+            planes: Vec::new(),
+            reflection_enabled: true,
+            refraction_enabled: true,
+            quality: WaterQuality::Medium,
+        }
+    }
 }
 
 fn unpack_argb_to_rgba_f32(argb: u32) -> [f32; 4] {
@@ -91,18 +221,21 @@ fn unpack_argb_to_rgba_f32(argb: u32) -> [f32; 4] {
     [r, g, b, a]
 }
 
-/// Convert a parsed `BmdModel` + its deduplicated world instance transforms into GPU draw batches,
-/// skipping `collide_only` models and `AlphaMode::TransparentDeferred` submeshes (Phase 5).
+/// Convert a parsed `BmdModel` + its deduplicated world instance transforms into opaque and
+/// per-instance back-to-front sortable transparent draw batches.
+/// Returns `(opaque_batches, transparent_batches, approximate_lighting_submeshes, transparent_skipped)`.
 pub fn build_scenery_batches_for_model<F>(
     model: &BmdModel,
     transforms: &[Mat4],
+    transparent_enabled: bool,
+    base_sort_id: u64,
     mut resolve_tex: F,
-) -> Vec<SceneryDrawBatch>
+) -> (Vec<SceneryDrawBatch>, Vec<SceneryDrawBatch>, usize, usize)
 where
     F: FnMut(&str) -> Option<Arc<DecodedTexture>>,
 {
     if model.collide_only || transforms.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new(), 0, 0);
     }
     let instances: Vec<SceneryInstance> = transforms
         .iter()
@@ -111,14 +244,27 @@ where
         })
         .collect();
 
-    let mut out = Vec::new();
-    for sm in &model.submeshes {
-        if sm.alpha_mode == AlphaMode::TransparentDeferred
-            || sm.vertices.is_empty()
-            || sm.indices.is_empty()
-        {
+    let mut opaque = Vec::new();
+    let mut transparent = Vec::new();
+    let mut approx_count = 0usize;
+    let mut trans_skipped = 0usize;
+
+    for (sm_idx, sm) in model.submeshes.iter().enumerate() {
+        if sm.vertices.is_empty() || sm.indices.is_empty() {
             continue;
         }
+        let is_transparent = sm.alpha_mode == AlphaMode::TransparentDeferred;
+        if is_transparent && !transparent_enabled {
+            trans_skipped += transforms.len();
+            continue;
+        }
+
+        // v3–v5 carry per-vertex day/night diffuse arrays; v2 falls back to approximate directional lighting
+        let has_vertex_lighting = sm.version >= 0x1000_0003;
+        if !has_vertex_lighting {
+            approx_count += 1;
+        }
+
         let alpha_cutoff = if sm.alpha_mode == AlphaMode::AlphaTested {
             0.5
         } else {
@@ -135,7 +281,8 @@ where
             .map(|v| SceneryVertex {
                 position: v.position,
                 normal: v.normal,
-                color: unpack_argb_to_rgba_f32(v.day_diffuse),
+                day_color: unpack_argb_to_rgba_f32(v.day_diffuse),
+                night_color: unpack_argb_to_rgba_f32(v.night_diffuse),
                 uv: v.uv,
             })
             .collect();
@@ -144,16 +291,44 @@ where
         } else {
             resolve_tex(&sm.texture)
         };
-        out.push(SceneryDrawBatch {
-            vertices,
-            indices: sm.indices.clone(),
-            instances: instances.clone(),
-            diffuse_rgba,
-            alpha_cutoff,
-            texture,
-        });
+
+        if is_transparent {
+            // Emit one sortable entry per instance and per submesh for accurate back-to-front sorting
+            let local_center =
+                (Vec3::from_array(sm.aabb_min) + Vec3::from_array(sm.aabb_max)) * 0.5;
+            for (inst_i, &mat) in transforms.iter().enumerate() {
+                let world_center = mat.transform_point3(local_center);
+                transparent.push(SceneryDrawBatch {
+                    vertices: vertices.clone(),
+                    indices: sm.indices.clone(),
+                    instances: vec![SceneryInstance {
+                        model_cols: mat.to_cols_array_2d(),
+                    }],
+                    diffuse_rgba,
+                    alpha_cutoff: 0.0,
+                    is_transparent: true,
+                    has_vertex_lighting,
+                    sort_center: world_center,
+                    sort_id: base_sort_id.wrapping_add(((sm_idx as u64) << 20) + (inst_i as u64)),
+                    texture: texture.clone(),
+                });
+            }
+        } else {
+            opaque.push(SceneryDrawBatch {
+                vertices,
+                indices: sm.indices.clone(),
+                instances: instances.clone(),
+                diffuse_rgba,
+                alpha_cutoff,
+                is_transparent: false,
+                has_vertex_lighting,
+                sort_center: Vec3::ZERO,
+                sort_id: base_sort_id + (sm_idx as u64),
+                texture,
+            });
+        }
     }
-    out
+    (opaque, transparent, approx_count, trans_skipped)
 }
 
 /// Build an indexed triangle mesh for one terrain block from a streamed `TerrainPage`.
@@ -219,6 +394,65 @@ pub fn build_block_mesh(
     (vertices, indices)
 }
 
+/// Build a subdivided water plane mesh with `edge_factor` fading to 0 at shoreline borders.
+pub fn build_water_plane_mesh(plane: &WaterPlane) -> (Vec<WaterVertex>, Vec<u16>) {
+    let segs = 8usize;
+    let side = segs + 1;
+    let mut verts = Vec::with_capacity(side * side);
+    for iz in 0..side {
+        let vz = iz as f32 / segs as f32;
+        let wz = plane.center_z + (vz * 2.0 - 1.0) * plane.half_z;
+        let ez = (vz.min(1.0 - vz) * 4.0).clamp(0.0, 1.0);
+        for ix in 0..side {
+            let vx = ix as f32 / segs as f32;
+            let wx = plane.center_x + (vx * 2.0 - 1.0) * plane.half_x;
+            let ex = (vx.min(1.0 - vx) * 4.0).clamp(0.0, 1.0);
+            verts.push(WaterVertex {
+                position: [wx, plane.height_y, wz],
+                uv: [vx, vz],
+                edge_factor: ex.min(ez),
+            });
+        }
+    }
+    let mut idxs = Vec::with_capacity(segs * segs * 6);
+    for iz in 0..segs {
+        for ix in 0..segs {
+            let i0 = (iz * side + ix) as u16;
+            let i1 = i0 + 1;
+            let i2 = ((iz + 1) * side + ix) as u16;
+            let i3 = i2 + 1;
+            idxs.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
+        }
+    }
+    (verts, idxs)
+}
+
+/// Generate a procedural 64x64 tileable tangent-space water normal map (RGBA8) as fallback
+/// when client water normal textures are not loaded.
+pub fn generate_procedural_water_normal_map() -> DecodedTexture {
+    let size = 64u32;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    let tau = std::f32::consts::TAU;
+    for y in 0..size {
+        let v = y as f32 / size as f32;
+        for x in 0..size {
+            let u = x as f32 / size as f32;
+            let dx = (u * tau * 2.0).cos() * 0.25 + ((u + v) * tau * 3.0).sin() * 0.15;
+            let dy = (v * tau * 2.0).sin() * 0.25 + ((u - v) * tau * 3.0).cos() * 0.15;
+            let n = Vec3::new(dx, dy, 1.0).normalize();
+            rgba.push(((n.x * 0.5 + 0.5) * 255.0) as u8);
+            rgba.push(((n.y * 0.5 + 0.5) * 255.0) as u8);
+            rgba.push(((n.z * 0.5 + 0.5) * 255.0) as u8);
+            rgba.push(255);
+        }
+    }
+    DecodedTexture {
+        width: size,
+        height: size,
+        rgba,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct OffscreenSmokeMetrics {
     pub width: u32,
@@ -227,9 +461,63 @@ pub struct OffscreenSmokeMetrics {
     pub scaled_height: u32,
     pub streamed_blocks: usize,
     pub total_pixels: usize,
+    pub sky_pixels: usize,
     pub non_clear_pixels: usize,
     pub scenery_pixels: usize,
+    pub translucent_pixels: usize,
+    pub water_pixels: usize,
+    pub water_differs_from_non_water: bool,
     pub distinct_colors: usize,
+}
+
+fn create_cam_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("camera-bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+fn create_terrain_lm_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("terrain-lm-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
 }
 
 fn create_scenery_mat_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -266,13 +554,118 @@ fn create_scenery_mat_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+fn create_water_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("water-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_sky_pipeline(
+    device: &wgpu::Device,
+    cam_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sky-shader"),
+        source: wgpu::ShaderSource::Wgsl(SKY_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sky-pipeline-layout"),
+        bind_group_layouts: &[cam_bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sky-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
 fn create_scenery_pipeline(
     device: &wgpu::Device,
     cam_bgl: &wgpu::BindGroupLayout,
     mat_bgl: &wgpu::BindGroupLayout,
+    transparent: bool,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("scenery-shader"),
+        label: Some(if transparent {
+            "scenery-transparent-shader"
+        } else {
+            "scenery-opaque-shader"
+        }),
         source: wgpu::ShaderSource::Wgsl(SCENERY_WGSL.into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -281,7 +674,11 @@ fn create_scenery_pipeline(
         push_constant_ranges: &[],
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("scenery-pipeline"),
+        label: Some(if transparent {
+            "scenery-transparent-pipeline"
+        } else {
+            "scenery-opaque-pipeline"
+        }),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -308,9 +705,14 @@ fn create_scenery_pipeline(
                             shader_location: 2,
                         },
                         wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
+                            format: wgpu::VertexFormat::Float32x4,
                             offset: 40,
                             shader_location: 3,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 56,
+                            shader_location: 4,
                         },
                     ],
                 },
@@ -321,22 +723,22 @@ fn create_scenery_pipeline(
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32x4,
                             offset: 0,
-                            shader_location: 4,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 16,
                             shader_location: 5,
                         },
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32x4,
-                            offset: 32,
+                            offset: 16,
                             shader_location: 6,
                         },
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32x4,
-                            offset: 48,
+                            offset: 32,
                             shader_location: 7,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 48,
+                            shader_location: 8,
                         },
                     ],
                 },
@@ -348,7 +750,11 @@ fn create_scenery_pipeline(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                blend: None,
+                blend: if transparent {
+                    Some(wgpu::BlendState::ALPHA_BLENDING)
+                } else {
+                    None
+                },
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -359,7 +765,7 @@ fn create_scenery_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
+            depth_write_enabled: !transparent,
             depth_compare: wgpu::CompareFunction::Less,
             stencil: Default::default(),
             bias: Default::default(),
@@ -370,12 +776,82 @@ fn create_scenery_pipeline(
     })
 }
 
-/// Render one offscreen terrain + static `.bmd` scenery frame at a fixed camera using a `wgpu`
-/// device (such as Mesa `lavapipe` on Linux CI), streaming synthetic v6 terrain blocks through
-/// `TerrainStore` (`cache/terrain-v1`), placing one synthetic `.bmd` building instance on the
-/// terrain, and executing both the 3D depth-tested pass and resolution-scale blit pass.
+fn create_water_pipeline(
+    device: &wgpu::Device,
+    cam_bgl: &wgpu::BindGroupLayout,
+    water_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("water-shader"),
+        source: wgpu::ShaderSource::Wgsl(WATER_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("water-pipeline-layout"),
+        bind_group_layouts: &[cam_bgl, water_bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("water-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<WaterVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 12,
+                        shader_location: 1,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32,
+                        offset: 20,
+                        shader_location: 2,
+                    },
+                ],
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// Offscreen smoke test (for Mesa `lavapipe` CI): renders sky, streamed terrain (day+night
+/// lightmap blend), opaque `.bmd` building, translucent test quad, and an animated water
+/// plane with scissored reflection/refraction passes.
 ///
-/// Proves pipelines compile and execute on CPU; does **not** establish visual parity.
+/// Proves pipelines compile and execute on CPU; does **not** prove visual parity.
 pub fn render_offscreen_smoke(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -398,10 +874,12 @@ pub fn render_offscreen_smoke(
     let t2bk_bytes = terrain_block::synthetic::build_t2bk_v6(grid, 4);
     let t2bk = T2bkFile::parse_header(&t2bk_bytes)?;
 
+    // Fixed camera showing sky in upper band, terrain across mid/lower, building on left-center,
+    // translucent quad in upper-right-center, and water lake in foreground-right.
     let camera = FreeCamera {
-        position: Vec3::new(10.0, 155.0, 10.0),
+        position: Vec3::new(10.0, 140.0, 10.0),
         yaw: 0.78,
-        pitch: -0.52,
+        pitch: -0.22,
         ..Default::default()
     };
     let visible = streaming_blocks(camera.position, block_size, 2, 2, 2);
@@ -425,311 +903,139 @@ pub fn render_offscreen_smoke(
     }
     let _ = fs::remove_dir_all(&cache_root);
 
-    // Build one synthetic static .bmd building sitting on the terrain in the camera center.
-    let raw_bmd = bmd::synthetic::build_bmd_v5_box("textures/smoke_tower.dds", 14.0, 46.0);
+    let vp: Mat4 = camera.view_proj(width as f32 / height as f32);
+    let uniform = CameraUniform::build(vp, camera.position, 13.0, 1.5, true, 1.0, None, None);
+
+    // Opaque .bmd building (vivid crimson) + translucent test quad (vivid magenta-violet, alpha 0.65)
+    let raw_bmd = bmd::synthetic::build_bmd_v5_box("textures/smoke_tower.dds", 12.0, 42.0);
     let bmd_model = BmdModel::parse(&raw_bmd).map_err(|e| e.to_string())?;
     let tower_mat = placement_transform_matrix(
-        [64.0, 95.0, 64.0],
+        [52.0, 95.0, 74.0],
         [0.0, 0.0, 1.0],
         [0.0, 1.0, 0.0],
         [1.0, 1.0, 1.0],
     );
-    let mut scenery_batches = build_scenery_batches_for_model(&bmd_model, &[tower_mat], |_| None);
-    for b in &mut scenery_batches {
-        // Distinct crimson/terracotta tint so the readback check confirms the .bmd mesh rendered
+    let (mut opaque_batches, _, _, _) =
+        build_scenery_batches_for_model(&bmd_model, &[tower_mat], true, 1, |_| None);
+    for b in &mut opaque_batches {
         b.diffuse_rgba = [0.95, 0.14, 0.10, 1.0];
     }
+
+    let trans_quad = SceneryDrawBatch {
+        vertices: vec![
+            SceneryVertex {
+                position: [-10.0, 0.0, 0.0],
+                normal: [0.0, 0.0, -1.0],
+                day_color: [1.0, 1.0, 1.0, 1.0],
+                night_color: [0.5, 0.5, 0.7, 1.0],
+                uv: [0.0, 1.0],
+            },
+            SceneryVertex {
+                position: [10.0, 0.0, 0.0],
+                normal: [0.0, 0.0, -1.0],
+                day_color: [1.0, 1.0, 1.0, 1.0],
+                night_color: [0.5, 0.5, 0.7, 1.0],
+                uv: [1.0, 1.0],
+            },
+            SceneryVertex {
+                position: [10.0, 26.0, 0.0],
+                normal: [0.0, 0.0, -1.0],
+                day_color: [1.0, 1.0, 1.0, 1.0],
+                night_color: [0.5, 0.5, 0.7, 1.0],
+                uv: [1.0, 0.0],
+            },
+            SceneryVertex {
+                position: [-10.0, 26.0, 0.0],
+                normal: [0.0, 0.0, -1.0],
+                day_color: [1.0, 1.0, 1.0, 1.0],
+                night_color: [0.5, 0.5, 0.7, 1.0],
+                uv: [0.0, 0.0],
+            },
+        ],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        instances: vec![SceneryInstance {
+            model_cols: placement_transform_matrix(
+                [76.0, 118.0, 56.0],
+                [-0.7, 0.0, -0.7],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+            )
+            .to_cols_array_2d(),
+        }],
+        diffuse_rgba: [0.88, 0.15, 0.92, 0.65],
+        alpha_cutoff: 0.0,
+        is_transparent: true,
+        has_vertex_lighting: true,
+        sort_center: Vec3::new(76.0, 130.0, 56.0),
+        sort_id: 99,
+        texture: None,
+    };
+
+    // Synthetic water plane sitting above lower terrain in the foreground-right
+    let water_plane = WaterPlane {
+        id: 1,
+        center_x: 78.0,
+        center_z: 78.0,
+        half_x: 42.0,
+        half_z: 42.0,
+        height_y: 112.0,
+        color_rgba: [0.05, 0.58, 0.88, 0.88],
+    };
+
+    let mut renderer = TerrainViewportRenderer::new(device, queue, wgpu::TextureFormat::Rgba8Unorm);
 
     let dxt1_block = [0xef, 0xf7, 0x20, 0x84, 0xe4, 0x1b, 0xe4, 0x1b];
     let dds = dxt::synthetic::build_dds(4, 4, b"DXT1", &dxt1_block);
     let surf = dxt::parse_dds(&dds)?;
     let lm_rgba = dxt::decode_rgba8(&surf);
-
-    let lm_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("smoke-lightmap"),
-        size: wgpu::Extent3d {
-            width: surf.width,
-            height: surf.height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &lm_tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &lm_rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(surf.width * 4),
-            rows_per_image: Some(surf.height),
-        },
-        wgpu::Extent3d {
-            width: surf.width,
-            height: surf.height,
-            depth_or_array_layers: 1,
-        },
-    );
-    let lm_view = lm_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let white_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("smoke-white-tex"),
-        size: wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &white_tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &[255, 255, 255, 255],
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4),
-            rows_per_image: Some(1),
-        },
-        wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-    );
-    let white_view = white_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("smoke-sampler"),
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        ..Default::default()
-    });
-
-    let vp: Mat4 = camera.view_proj(width as f32 / height as f32);
-    let uniform = CameraUniform {
-        view_proj: vp.to_cols_array_2d(),
-        sun_dir: [0.4, 0.85, 0.35, 0.0],
-        fog_color: [0.15, 0.25, 0.40, 1.0],
+    let day_lm = TerrainTextureSnapshot {
+        width: surf.width,
+        height: surf.height,
+        rgba: lm_rgba.clone(),
+        revision: 1,
     };
-    let cam_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("camera-uniform"),
-        contents: bytemuck::bytes_of(&uniform),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let night_lm = TerrainTextureSnapshot {
+        width: surf.width,
+        height: surf.height,
+        rgba: lm_rgba.iter().map(|&b| b / 2).collect(),
+        revision: 1,
+    };
 
-    let cam_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("camera-bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-    let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("camera-bg"),
-        layout: &cam_bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: cam_buf.as_entire_binding(),
-        }],
-    });
+    let mesh_snap = TerrainMeshSnapshot {
+        vertices: all_verts,
+        indices: all_indices,
+        revision: 1,
+        streamed_blocks: visible.len(),
+        hot_ram_bytes: 0,
+    };
+    let scenery_snap = SceneryDrawSnapshot {
+        opaque_batches,
+        transparent_batches: vec![trans_quad],
+        revision: 1,
+    };
+    let water_snap = WaterRenderSnapshot {
+        planes: vec![water_plane.clone()],
+        reflection_enabled: true,
+        refraction_enabled: true,
+        quality: WaterQuality::Medium,
+    };
 
-    let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("tex-bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
-    let lm_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("lm-bg"),
-        layout: &tex_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&lm_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
+    let world_cmd = renderer.prepare_frame(
+        device,
+        queue,
+        width,
+        height,
+        scale_pct,
+        &uniform,
+        &mesh_snap,
+        &day_lm,
+        &night_lm,
+        &scenery_snap,
+        &water_snap,
+    );
 
-    let scenery_mat_bgl = create_scenery_mat_bgl(device);
-    let scenery_pipeline = create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl);
-
-    let terrain_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("terrain-shader"),
-        source: wgpu::ShaderSource::Wgsl(TERRAIN_WGSL.into()),
-    });
-    let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("terrain-pipeline-layout"),
-        bind_group_layouts: &[&cam_bgl, &tex_bgl],
-        push_constant_ranges: &[],
-    });
-    let terrain_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("terrain-pipeline"),
-        layout: Some(&terrain_layout),
-        vertex: wgpu::VertexState {
-            module: &terrain_shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<TerrainVertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &[
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: 12,
-                        shader_location: 1,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 24,
-                        shader_location: 2,
-                    },
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x2,
-                        offset: 40,
-                        shader_location: 3,
-                    },
-                ],
-            }],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &terrain_shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None,
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: Default::default(),
-        multiview: None,
-        cache: None,
-    });
-
-    let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("blit-shader"),
-        source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
-    });
-    let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("blit-pipeline-layout"),
-        bind_group_layouts: &[&tex_bgl],
-        push_constant_ranges: &[],
-    });
-    let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("blit-pipeline"),
-        layout: Some(&blit_layout),
-        vertex: wgpu::VertexState {
-            module: &blit_shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &blit_shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: Default::default(),
-        depth_stencil: None,
-        multisample: Default::default(),
-        multiview: None,
-        cache: None,
-    });
-
-    let scene_color = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scaled-scene-color"),
-        size: wgpu::Extent3d {
-            width: scaled_w,
-            height: scaled_h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let scene_depth = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scaled-scene-depth"),
-        size: wgpu::Extent3d {
-            width: scaled_w,
-            height: scaled_h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
     let final_color = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("final-output-color"),
+        label: Some("smoke-final-color"),
         size: wgpu::Extent3d {
             width,
             height,
@@ -742,144 +1048,14 @@ pub fn render_offscreen_smoke(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-
-    let scene_view = scene_color.create_view(&wgpu::TextureViewDescriptor::default());
-    let depth_view = scene_depth.create_view(&wgpu::TextureViewDescriptor::default());
     let final_view = final_color.create_view(&wgpu::TextureViewDescriptor::default());
-    let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blit-bg"),
-        layout: &tex_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&scene_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
-    });
 
-    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("terrain-vbuf"),
-        contents: bytemuck::cast_slice(&all_verts),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("terrain-ibuf"),
-        contents: bytemuck::cast_slice(&all_indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-
-    // Upload the synthetic .bmd batch
-    let mut gpu_scenery = Vec::new();
-    for b in &scenery_batches {
-        let svb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("smoke-scenery-vbuf"),
-            contents: bytemuck::cast_slice(&b.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let sib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("smoke-scenery-ibuf"),
-            contents: bytemuck::cast_slice(&b.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("smoke-scenery-inst"),
-            contents: bytemuck::cast_slice(&b.instances),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let mat_u = SceneryMaterialUniform {
-            diffuse_rgba: b.diffuse_rgba,
-            params: [b.alpha_cutoff, 0.0, 0.0, 0.0],
-        };
-        let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("smoke-scenery-mat"),
-            contents: bytemuck::bytes_of(&mat_u),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let mat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("smoke-scenery-mat-bg"),
-            layout: &scenery_mat_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&white_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: mat_buf.as_entire_binding(),
-                },
-            ],
-        });
-        gpu_scenery.push((
-            svb,
-            sib,
-            inst_buf,
-            mat_bg,
-            b.indices.len() as u32,
-            b.instances.len() as u32,
-        ));
-    }
-
-    let clear_r = 0.08;
-    let clear_g = 0.14;
-    let clear_b = 0.24;
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("terrain-smoke-encoder"),
+    let mut blit_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("smoke-blit-encoder"),
     });
     {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("terrain-and-scenery-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &scene_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: clear_r,
-                        g: clear_g,
-                        b: clear_b,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
-        rpass.set_pipeline(&terrain_pipeline);
-        rpass.set_bind_group(0, &cam_bg, &[]);
-        rpass.set_bind_group(1, &lm_bg, &[]);
-        rpass.set_vertex_buffer(0, vbuf.slice(..));
-        rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-        rpass.draw_indexed(0..all_indices.len() as u32, 0, 0..1);
-
-        rpass.set_pipeline(&scenery_pipeline);
-        rpass.set_bind_group(0, &cam_bg, &[]);
-        for (svb, sib, inst_buf, mat_bg, idx_cnt, inst_cnt) in &gpu_scenery {
-            rpass.set_bind_group(1, mat_bg, &[]);
-            rpass.set_vertex_buffer(0, svb.slice(..));
-            rpass.set_vertex_buffer(1, inst_buf.slice(..));
-            rpass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint16);
-            rpass.draw_indexed(0..*idx_cnt, 0, 0..*inst_cnt);
-        }
-    }
-    {
-        let mut bpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("blit-pass"),
+        let mut bpass = blit_enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("smoke-blit-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &final_view,
                 resolve_target: None,
@@ -891,13 +1067,10 @@ pub fn render_offscreen_smoke(
             depth_stencil_attachment: None,
             ..Default::default()
         });
-        bpass.set_pipeline(&blit_pipeline);
-        bpass.set_bind_group(0, &blit_bg, &[]);
-        bpass.draw(0..3, 0..1);
+        renderer.paint_blit(&mut bpass);
     }
 
-    let bytes_per_pixel = 4u32;
-    let unpadded_bpr = width * bytes_per_pixel;
+    let unpadded_bpr = width * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_bpr = unpadded_bpr.div_ceil(align) * align;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -906,7 +1079,7 @@ pub fn render_offscreen_smoke(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    encoder.copy_texture_to_buffer(
+    blit_enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &final_color,
             mip_level: 0,
@@ -927,7 +1100,7 @@ pub fn render_offscreen_smoke(
             depth_or_array_layers: 1,
         },
     );
-    queue.submit(Some(encoder.finish()));
+    queue.submit([world_cmd, blit_enc.finish()]);
 
     let slice = readback.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -940,40 +1113,78 @@ pub fn render_offscreen_smoke(
         .map_err(|e| format!("readback map error: {e:?}"))?;
 
     let data = slice.get_mapped_range();
-    let clear_px = [
-        (clear_r * 255.0).round() as i32,
-        (clear_g * 255.0).round() as i32,
-        (clear_b * 255.0).round() as i32,
-    ];
+    let water_rect =
+        atmosphere::compute_water_scissor(&water_plane, vp, width, height).unwrap_or(ScissorRect {
+            x: 0,
+            y: height / 2,
+            width,
+            height: height / 2,
+        });
+
+    let mut sky_pixels = 0usize;
     let mut non_clear_pixels = 0usize;
     let mut scenery_pixels = 0usize;
+    let mut translucent_pixels = 0usize;
+    let mut water_pixels = 0usize;
+    let mut water_sum = [0u64; 3];
+    let mut water_cnt = 0u64;
+    let mut non_water_sum = [0u64; 3];
+    let mut non_water_cnt = 0u64;
     let mut distinct = std::collections::HashSet::new();
-    let margin_x = (width / 8) as usize;
-    let margin_y = (height / 8) as usize;
+
     for y in 0..height as usize {
         let row = &data[y * padded_bpr as usize..y * padded_bpr as usize + unpadded_bpr as usize];
         for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
-            let dr = (px[0] as i32 - clear_px[0]).abs();
-            let dg = (px[1] as i32 - clear_px[1]).abs();
-            let db = (px[2] as i32 - clear_px[2]).abs();
-            if dr > 4 || dg > 4 || db > 4 {
+            let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+            if r > 5 || g > 5 || b > 5 {
                 non_clear_pixels += 1;
             }
-            if x >= margin_x
-                && x < (width as usize - margin_x)
-                && y >= margin_y
-                && y < (height as usize - margin_y)
-                && px[0] > 90
-                && (px[0] as i32) > (px[1] as i32) + 35
-                && (px[0] as i32) > (px[2] as i32) + 35
-            {
+            if y < (height as usize) / 4 && b > 80 {
+                sky_pixels += 1;
+            }
+            // Opaque crimson .bmd building
+            if r > 90 && r > g + 35 && r > b + 35 {
                 scenery_pixels += 1;
+            }
+            // Translucent magenta-violet test quad
+            if r > 80 && b > 80 && r > g + 25 && b > g + 25 {
+                translucent_pixels += 1;
+            }
+            let in_water_box = (x as u32) >= water_rect.x
+                && (x as u32) < water_rect.x + water_rect.width
+                && (y as u32) >= water_rect.y
+                && (y as u32) < water_rect.y + water_rect.height;
+            if in_water_box {
+                water_sum[0] += px[0] as u64;
+                water_sum[1] += px[1] as u64;
+                water_sum[2] += px[2] as u64;
+                water_cnt += 1;
+                if b > r + 15 && g > r + 5 {
+                    water_pixels += 1;
+                }
+            } else if y >= (height as usize) / 2 {
+                non_water_sum[0] += px[0] as u64;
+                non_water_sum[1] += px[1] as u64;
+                non_water_sum[2] += px[2] as u64;
+                non_water_cnt += 1;
             }
             distinct.insert([px[0], px[1], px[2]]);
         }
     }
     drop(data);
     readback.unmap();
+
+    let water_differs_from_non_water = if water_cnt > 0 && non_water_cnt > 0 {
+        let wr = water_sum[0] as f64 / water_cnt as f64;
+        let wg = water_sum[1] as f64 / water_cnt as f64;
+        let wb = water_sum[2] as f64 / water_cnt as f64;
+        let nr = non_water_sum[0] as f64 / non_water_cnt as f64;
+        let ng = non_water_sum[1] as f64 / non_water_cnt as f64;
+        let nb = non_water_sum[2] as f64 / non_water_cnt as f64;
+        ((wr - nr).abs() + (wg - ng).abs() + (wb - nb).abs()) > 8.0
+    } else {
+        water_pixels > 50
+    };
 
     Ok(OffscreenSmokeMetrics {
         width,
@@ -982,8 +1193,12 @@ pub fn render_offscreen_smoke(
         scaled_height: scaled_h,
         streamed_blocks: visible.len(),
         total_pixels: (width as usize) * (height as usize),
+        sky_pixels,
         non_clear_pixels,
         scenery_pixels,
+        translucent_pixels,
+        water_pixels,
+        water_differs_from_non_water,
         distinct_colors: distinct.len(),
     })
 }
@@ -1019,6 +1234,7 @@ impl Default for TerrainTextureSnapshot {
 }
 
 /// Camera-centered streaming session backed by `TerrainStore` (`cache/terrain-v1`).
+/// Loads both day (`t2lm`) and night (`t2lm1`) lightmaps when present.
 pub struct TerrainSession {
     pub zone_name: String,
     pub block_size: f32,
@@ -1030,7 +1246,24 @@ pub struct TerrainSession {
     store: TerrainStore,
     last_center: Option<(i32, i32, i32)>,
     pub mesh: TerrainMeshSnapshot,
-    pub lightmap: TerrainTextureSnapshot,
+    pub day_lightmap: TerrainTextureSnapshot,
+    pub night_lightmap: TerrainTextureSnapshot,
+}
+
+fn load_first_t2lm_dds(path: &std::path::Path, rev: u64) -> Option<TerrainTextureSnapshot> {
+    let lm_bytes = fs::read(path).ok()?;
+    let lm = terrain_block::T2lmHeader::parse(&lm_bytes).ok()?;
+    let &first_off = lm.offsets.first()?;
+    let start = first_off as usize;
+    let end = start + lm.data_size as usize;
+    let dds_slice = lm_bytes.get(start..end)?;
+    let surf = dxt::parse_dds(dds_slice).ok()?;
+    Some(TerrainTextureSnapshot {
+        width: surf.width,
+        height: surf.height,
+        rgba: dxt::decode_rgba8(&surf),
+        revision: rev,
+    })
 }
 
 impl TerrainSession {
@@ -1053,26 +1286,15 @@ impl TerrainSession {
 
         let store = TerrainStore::open(cache_root, hot_ram_bytes)?;
 
-        let mut lightmap = TerrainTextureSnapshot::default();
-        let t2lm_path = zone_dir.join(format!("{zone}_1.t2lm"));
-        if let Ok(lm_bytes) = fs::read(&t2lm_path) {
-            if let Ok(lm) = terrain_block::T2lmHeader::parse(&lm_bytes) {
-                if let Some(&first_off) = lm.offsets.first() {
-                    let start = first_off as usize;
-                    let end = start + lm.data_size as usize;
-                    if let Some(dds_slice) = lm_bytes.get(start..end) {
-                        if let Ok(surf) = dxt::parse_dds(dds_slice) {
-                            lightmap = TerrainTextureSnapshot {
-                                width: surf.width,
-                                height: surf.height,
-                                rgba: dxt::decode_rgba8(&surf),
-                                revision: 1,
-                            };
-                        }
-                    }
-                }
-            }
-        }
+        let day_lightmap =
+            load_first_t2lm_dds(&zone_dir.join(format!("{zone}_1.t2lm")), 1).unwrap_or_default();
+        let night_lightmap = load_first_t2lm_dds(&zone_dir.join(format!("{zone}_1.t2lm1")), 1)
+            .unwrap_or_else(|| TerrainTextureSnapshot {
+                width: 1,
+                height: 1,
+                rgba: vec![96, 110, 145, 255],
+                revision: 1,
+            });
 
         Ok(Self {
             zone_name: zone.to_string(),
@@ -1085,7 +1307,8 @@ impl TerrainSession {
             store,
             last_center: None,
             mesh: TerrainMeshSnapshot::default(),
-            lightmap,
+            day_lightmap,
+            night_lightmap,
         })
     }
 
@@ -1104,10 +1327,17 @@ impl TerrainSession {
         let dxt1_block = [0xef, 0xf7, 0x20, 0x84, 0xe4, 0x1b, 0xe4, 0x1b];
         let dds = dxt::synthetic::build_dds(4, 4, b"DXT1", &dxt1_block);
         let surf = dxt::parse_dds(&dds)?;
-        let lightmap = TerrainTextureSnapshot {
+        let rgba = dxt::decode_rgba8(&surf);
+        let day_lightmap = TerrainTextureSnapshot {
             width: surf.width,
             height: surf.height,
-            rgba: dxt::decode_rgba8(&surf),
+            rgba: rgba.clone(),
+            revision: 1,
+        };
+        let night_lightmap = TerrainTextureSnapshot {
+            width: surf.width,
+            height: surf.height,
+            rgba: rgba.iter().map(|&b| b / 2).collect(),
             revision: 1,
         };
 
@@ -1122,7 +1352,8 @@ impl TerrainSession {
             store,
             last_center: None,
             mesh: TerrainMeshSnapshot::default(),
-            lightmap,
+            day_lightmap,
+            night_lightmap,
         })
     }
 
@@ -1194,32 +1425,49 @@ struct GpuSceneryBatch {
     instance_count: u32,
 }
 
-/// Live `wgpu` viewport renderer supporting terrain + instanced `.bmd` scenery at 10%–200%
-/// resolution scale with a native-resolution `egui` UI overlay.
+/// Live `wgpu` viewport renderer: Sky -> Terrain -> Opaque Scenery -> Transparent Scenery -> Water.
 pub struct TerrainViewportRenderer {
+    sky_pipeline: wgpu::RenderPipeline,
     terrain_pipeline: wgpu::RenderPipeline,
-    scenery_pipeline: wgpu::RenderPipeline,
+    scenery_opaque_pipeline: wgpu::RenderPipeline,
+    scenery_transparent_pipeline: wgpu::RenderPipeline,
+    water_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     tex_bgl: wgpu::BindGroupLayout,
+    terrain_lm_bgl: wgpu::BindGroupLayout,
     scenery_mat_bgl: wgpu::BindGroupLayout,
+    water_bgl: wgpu::BindGroupLayout,
     cam_buf: wgpu::Buffer,
     cam_bg: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     white_view: wgpu::TextureView,
+    water_normal_view: wgpu::TextureView,
     lm_bg: wgpu::BindGroup,
-    lm_revision: u64,
+    lm_revision: (u64, u64),
     scene_color: wgpu::Texture,
     scene_view: wgpu::TextureView,
     scene_depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    refl_color: wgpu::Texture,
+    refl_view: wgpu::TextureView,
+    refl_depth: wgpu::Texture,
+    refl_depth_view: wgpu::TextureView,
+    refr_color: wgpu::Texture,
+    refr_view: wgpu::TextureView,
+    refr_depth: wgpu::Texture,
+    refr_depth_view: wgpu::TextureView,
+    water_pass_size: (u32, u32),
     blit_bg: wgpu::BindGroup,
     scaled_size: (u32, u32),
     vbuf: Option<wgpu::Buffer>,
     ibuf: Option<wgpu::Buffer>,
     index_count: u32,
     mesh_revision: u64,
-    scenery_batches: Vec<GpuSceneryBatch>,
+    opaque_batches: Vec<GpuSceneryBatch>,
+    transparent_batches: Vec<GpuSceneryBatch>,
     scenery_revision: u64,
+    pub last_world_render_passes: usize,
+    pub timestamp_queries_supported: bool,
 }
 
 impl TerrainViewportRenderer {
@@ -1228,29 +1476,17 @@ impl TerrainViewportRenderer {
         queue: &wgpu::Queue,
         target_format: wgpu::TextureFormat,
     ) -> Self {
-        let initial_uniform = CameraUniform {
-            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
-            sun_dir: [0.4, 0.85, 0.35, 0.0],
-            fog_color: [0.15, 0.25, 0.40, 1.0],
-        };
+        let timestamp_queries_supported =
+            device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+
+        let initial_uniform =
+            CameraUniform::build(Mat4::IDENTITY, Vec3::ZERO, 12.0, 0.0, true, 1.0, None, None);
         let cam_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("live-camera-uniform"),
             contents: bytemuck::bytes_of(&initial_uniform),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let cam_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("live-camera-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let cam_bgl = create_cam_bgl(device);
         let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("live-camera-bg"),
             layout: &cam_bgl,
@@ -1281,50 +1517,35 @@ impl TerrainViewportRenderer {
                 },
             ],
         });
+        let terrain_lm_bgl = create_terrain_lm_bgl(device);
         let scenery_mat_bgl = create_scenery_mat_bgl(device);
-        let scenery_pipeline = create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl);
+        let water_bgl = create_water_bgl(device);
+
+        let sky_pipeline = create_sky_pipeline(device, &cam_bgl);
+        let scenery_opaque_pipeline =
+            create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl, false);
+        let scenery_transparent_pipeline =
+            create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl, true);
+        let water_pipeline = create_water_pipeline(device, &cam_bgl, &water_bgl);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("live-linear-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
-        let white_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("live-white-fallback"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &white_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[255, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
+        let white_view = Self::upload_rgba_view(device, queue, 1, 1, &[255, 255, 255, 255]);
+        let proc_nrm = generate_procedural_water_normal_map();
+        let water_normal_view = Self::upload_rgba_view(
+            device,
+            queue,
+            proc_nrm.width,
+            proc_nrm.height,
+            &proc_nrm.rgba,
         );
-        let white_view = white_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let terrain_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("live-terrain-shader"),
@@ -1332,7 +1553,7 @@ impl TerrainViewportRenderer {
         });
         let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("live-terrain-layout"),
-            bind_group_layouts: &[&cam_bgl, &tex_bgl],
+            bind_group_layouts: &[&cam_bgl, &terrain_lm_bgl],
             push_constant_ranges: &[],
         });
         let terrain_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1432,34 +1653,63 @@ impl TerrainViewportRenderer {
         });
 
         let default_lm = TerrainTextureSnapshot::default();
-        let lm_bg = Self::upload_texture_bg(device, queue, &tex_bgl, &sampler, &default_lm);
+        let lm_bg = Self::upload_dual_lightmap_bg(
+            device,
+            queue,
+            &terrain_lm_bgl,
+            &sampler,
+            &default_lm,
+            &default_lm,
+        );
         let (scene_color, scene_view, scene_depth, depth_view, blit_bg) =
             Self::create_scaled_targets(device, &tex_bgl, &sampler, 64, 64);
+        let (refl_color, refl_view, refl_depth, refl_depth_view) =
+            Self::create_aux_target(device, 32, 32, "water-refl");
+        let (refr_color, refr_view, refr_depth, refr_depth_view) =
+            Self::create_aux_target(device, 32, 32, "water-refr");
 
         Self {
+            sky_pipeline,
             terrain_pipeline,
-            scenery_pipeline,
+            scenery_opaque_pipeline,
+            scenery_transparent_pipeline,
+            water_pipeline,
             blit_pipeline,
             tex_bgl,
+            terrain_lm_bgl,
             scenery_mat_bgl,
+            water_bgl,
             cam_buf,
             cam_bg,
             sampler,
             white_view,
+            water_normal_view,
             lm_bg,
-            lm_revision: 0,
+            lm_revision: (0, 0),
             scene_color,
             scene_view,
             scene_depth,
             depth_view,
+            refl_color,
+            refl_view,
+            refl_depth,
+            refl_depth_view,
+            refr_color,
+            refr_view,
+            refr_depth,
+            refr_depth_view,
+            water_pass_size: (32, 32),
             blit_bg,
             scaled_size: (64, 64),
             vbuf: None,
             ibuf: None,
             index_count: 0,
             mesh_revision: 0,
-            scenery_batches: Vec::new(),
+            opaque_batches: Vec::new(),
+            transparent_batches: Vec::new(),
             scenery_revision: 0,
+            last_world_render_passes: 1,
+            timestamp_queries_supported,
         }
     }
 
@@ -1508,28 +1758,79 @@ impl TerrainViewportRenderer {
         gpu_tex.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
-    fn upload_texture_bg(
+    fn upload_dual_lightmap_bg(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        tex_bgl: &wgpu::BindGroupLayout,
+        bgl: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
-        tex: &TerrainTextureSnapshot,
+        day: &TerrainTextureSnapshot,
+        night: &TerrainTextureSnapshot,
     ) -> wgpu::BindGroup {
-        let view = Self::upload_rgba_view(device, queue, tex.width, tex.height, &tex.rgba);
+        let day_view = Self::upload_rgba_view(device, queue, day.width, day.height, &day.rgba);
+        let night_view =
+            Self::upload_rgba_view(device, queue, night.width, night.height, &night.rgba);
         device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("live-lm-bg"),
-            layout: tex_bgl,
+            label: Some("live-dual-lm-bg"),
+            layout: bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(&day_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&night_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
         })
+    }
+
+    fn create_aux_target(
+        device: &wgpu::Device,
+        w: u32,
+        h: u32,
+        label: &str,
+    ) -> (
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::Texture,
+        wgpu::TextureView,
+    ) {
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("aux-depth"),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let cv = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let dv = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        (color, cv, depth, dv)
     }
 
     fn create_scaled_targets(
@@ -1545,36 +1846,8 @@ impl TerrainViewportRenderer {
         wgpu::TextureView,
         wgpu::BindGroup,
     ) {
-        let color = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("live-scaled-color"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let depth = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("live-scaled-depth"),
-            size: wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let (color, color_view, depth, depth_view) =
+            Self::create_aux_target(device, w, h, "live-scaled-color");
         let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("live-blit-bg"),
             layout: tex_bgl,
@@ -1592,6 +1865,130 @@ impl TerrainViewportRenderer {
         (color, color_view, depth, depth_view, blit_bg)
     }
 
+    fn upload_scenery_batches(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src: &[SceneryDrawBatch],
+    ) -> Vec<GpuSceneryBatch> {
+        let mut out = Vec::with_capacity(src.len());
+        for b in src {
+            if b.vertices.is_empty() || b.indices.is_empty() || b.instances.is_empty() {
+                continue;
+            }
+            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("live-scenery-vbuf"),
+                contents: bytemuck::cast_slice(&b.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("live-scenery-ibuf"),
+                contents: bytemuck::cast_slice(&b.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("live-scenery-inst"),
+                contents: bytemuck::cast_slice(&b.instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let mat_u = SceneryMaterialUniform {
+                diffuse_rgba: b.diffuse_rgba,
+                params: [
+                    b.alpha_cutoff,
+                    if b.has_vertex_lighting { 1.0 } else { 0.0 },
+                    0.0,
+                    0.0,
+                ],
+            };
+            let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("live-scenery-mat"),
+                contents: bytemuck::bytes_of(&mat_u),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let owned_view = b
+                .texture
+                .as_ref()
+                .map(|t| Self::upload_rgba_view(device, queue, t.width, t.height, &t.rgba));
+            let tex_view_ref = owned_view.as_ref().unwrap_or(&self.white_view);
+            let mat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("live-scenery-mat-bg"),
+                layout: &self.scenery_mat_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(tex_view_ref),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: mat_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            out.push(GpuSceneryBatch {
+                vbuf,
+                ibuf,
+                inst_buf,
+                mat_bg,
+                index_count: b.indices.len() as u32,
+                instance_count: b.instances.len() as u32,
+            });
+        }
+        out
+    }
+
+    fn draw_world_geometry<'a>(
+        &'a self,
+        rpass: &mut wgpu::RenderPass<'a>,
+        include_transparent: bool,
+    ) {
+        // 1. Sky dome/gradient
+        rpass.set_pipeline(&self.sky_pipeline);
+        rpass.set_bind_group(0, &self.cam_bg, &[]);
+        rpass.draw(0..3, 0..1);
+
+        // 2. Terrain (day/night lightmap blend)
+        if let (Some(vbuf), Some(ibuf)) = (&self.vbuf, &self.ibuf) {
+            if self.index_count > 0 {
+                rpass.set_pipeline(&self.terrain_pipeline);
+                rpass.set_bind_group(0, &self.cam_bg, &[]);
+                rpass.set_bind_group(1, &self.lm_bg, &[]);
+                rpass.set_vertex_buffer(0, vbuf.slice(..));
+                rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..self.index_count, 0, 0..1);
+            }
+        }
+
+        // 3. Opaque & alpha-tested static scenery
+        if !self.opaque_batches.is_empty() {
+            rpass.set_pipeline(&self.scenery_opaque_pipeline);
+            rpass.set_bind_group(0, &self.cam_bg, &[]);
+            for b in &self.opaque_batches {
+                rpass.set_bind_group(1, &b.mat_bg, &[]);
+                rpass.set_vertex_buffer(0, b.vbuf.slice(..));
+                rpass.set_vertex_buffer(1, b.inst_buf.slice(..));
+                rpass.set_index_buffer(b.ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.draw_indexed(0..b.index_count, 0, 0..b.instance_count);
+            }
+        }
+
+        // 4. Transparent static scenery (sorted back-to-front, blend ON, depth write OFF)
+        if include_transparent && !self.transparent_batches.is_empty() {
+            rpass.set_pipeline(&self.scenery_transparent_pipeline);
+            rpass.set_bind_group(0, &self.cam_bg, &[]);
+            for b in &self.transparent_batches {
+                rpass.set_bind_group(1, &b.mat_bg, &[]);
+                rpass.set_vertex_buffer(0, b.vbuf.slice(..));
+                rpass.set_vertex_buffer(1, b.inst_buf.slice(..));
+                rpass.set_index_buffer(b.ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.draw_indexed(0..b.index_count, 0, 0..b.instance_count);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_frame(
         &mut self,
@@ -1602,8 +1999,10 @@ impl TerrainViewportRenderer {
         scale_pct: u16,
         uniform: &CameraUniform,
         mesh: &TerrainMeshSnapshot,
-        lightmap: &TerrainTextureSnapshot,
+        day_lightmap: &TerrainTextureSnapshot,
+        night_lightmap: &TerrainTextureSnapshot,
         scenery: &SceneryDrawSnapshot,
+        water: &WaterRenderSnapshot,
     ) -> wgpu::CommandBuffer {
         let desired = scaled_render_target(viewport_w, viewport_h, scale_pct);
         if self.scaled_size != desired {
@@ -1622,12 +2021,45 @@ impl TerrainViewportRenderer {
             self.scaled_size = desired;
         }
 
+        let water_pct = water.quality.pass_scale_pct();
+        let desired_water_sz = scaled_render_target(desired.0, desired.1, water_pct);
+        if self.water_pass_size != desired_water_sz {
+            let (rc, rcv, rd, rdv) = Self::create_aux_target(
+                device,
+                desired_water_sz.0,
+                desired_water_sz.1,
+                "water-refl",
+            );
+            let (fc, fcv, fd, fdv) = Self::create_aux_target(
+                device,
+                desired_water_sz.0,
+                desired_water_sz.1,
+                "water-refr",
+            );
+            self.refl_color = rc;
+            self.refl_view = rcv;
+            self.refl_depth = rd;
+            self.refl_depth_view = rdv;
+            self.refr_color = fc;
+            self.refr_view = fcv;
+            self.refr_depth = fd;
+            self.refr_depth_view = fdv;
+            self.water_pass_size = desired_water_sz;
+        }
+
         queue.write_buffer(&self.cam_buf, 0, bytemuck::bytes_of(uniform));
 
-        if self.lm_revision != lightmap.revision {
-            self.lm_bg =
-                Self::upload_texture_bg(device, queue, &self.tex_bgl, &self.sampler, lightmap);
-            self.lm_revision = lightmap.revision;
+        let lm_rev = (day_lightmap.revision, night_lightmap.revision);
+        if self.lm_revision != lm_rev {
+            self.lm_bg = Self::upload_dual_lightmap_bg(
+                device,
+                queue,
+                &self.terrain_lm_bgl,
+                &self.sampler,
+                day_lightmap,
+                night_lightmap,
+            );
+            self.lm_revision = lm_rev;
         }
 
         if self.mesh_revision != mesh.revision {
@@ -1656,73 +2088,163 @@ impl TerrainViewportRenderer {
         }
 
         if self.scenery_revision != scenery.revision {
-            self.scenery_batches.clear();
-            for b in &scenery.batches {
-                if b.vertices.is_empty() || b.indices.is_empty() || b.instances.is_empty() {
-                    continue;
-                }
-                let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("live-scenery-vbuf"),
-                    contents: bytemuck::cast_slice(&b.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("live-scenery-ibuf"),
-                    contents: bytemuck::cast_slice(&b.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-                let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("live-scenery-inst"),
-                    contents: bytemuck::cast_slice(&b.instances),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                let mat_u = SceneryMaterialUniform {
-                    diffuse_rgba: b.diffuse_rgba,
-                    params: [b.alpha_cutoff, 0.0, 0.0, 0.0],
-                };
-                let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("live-scenery-mat"),
-                    contents: bytemuck::bytes_of(&mat_u),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                let owned_view = b
-                    .texture
-                    .as_ref()
-                    .map(|t| Self::upload_rgba_view(device, queue, t.width, t.height, &t.rgba));
-                let tex_view_ref = owned_view.as_ref().unwrap_or(&self.white_view);
-                let mat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("live-scenery-mat-bg"),
-                    layout: &self.scenery_mat_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(tex_view_ref),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: mat_buf.as_entire_binding(),
-                        },
-                    ],
-                });
-                self.scenery_batches.push(GpuSceneryBatch {
-                    vbuf,
-                    ibuf,
-                    inst_buf,
-                    mat_bg,
-                    index_count: b.indices.len() as u32,
-                    instance_count: b.instances.len() as u32,
-                });
-            }
+            self.opaque_batches =
+                self.upload_scenery_batches(device, queue, &scenery.opaque_batches);
+            self.transparent_batches =
+                self.upload_scenery_batches(device, queue, &scenery.transparent_batches);
             self.scenery_revision = scenery.revision;
         }
 
+        let vp = Mat4::from_cols_array_2d(&uniform.view_proj);
+        let vis_water = atmosphere::visible_water_planes(
+            &water.planes,
+            vp,
+            desired_water_sz.0,
+            desired_water_sz.1,
+        );
+
+        let mut world_passes = 0usize;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("live-world-encoder"),
         });
+
+        // Optional scissored water reflection & refraction passes ONLY when water is visible
+        if !vis_water.is_empty() {
+            let union_scissor = vis_water.iter().fold(vis_water[0].1, |acc, &(_, r)| {
+                let x0 = acc.x.min(r.x);
+                let y0 = acc.y.min(r.y);
+                let x1 = (acc.x + acc.width).max(r.x + r.width);
+                let y1 = (acc.y + acc.height).max(r.y + r.height);
+                ScissorRect {
+                    x: x0,
+                    y: y0,
+                    width: x1 - x0,
+                    height: y1 - y0,
+                }
+            });
+
+            if water.reflection_enabled {
+                world_passes += 1;
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("water-reflection-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.refl_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.refl_depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                rpass.set_scissor_rect(
+                    union_scissor.x,
+                    union_scissor.y,
+                    union_scissor.width.max(1),
+                    union_scissor.height.max(1),
+                );
+                self.draw_world_geometry(&mut rpass, false);
+            }
+
+            if water.refraction_enabled {
+                world_passes += 1;
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("water-refraction-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.refr_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.refr_depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                rpass.set_scissor_rect(
+                    union_scissor.x,
+                    union_scissor.y,
+                    union_scissor.width.max(1),
+                    union_scissor.height.max(1),
+                );
+                self.draw_world_geometry(&mut rpass, false);
+            }
+        }
+
+        // Main world pass: Sky -> Terrain -> Opaque Scenery -> Transparent Scenery -> Water
+        world_passes += 1;
+        let mut water_draws = Vec::new();
+        for &(idx, _) in &vis_water {
+            let plane = &water.planes[idx];
+            let (wv, wi) = build_water_plane_mesh(plane);
+            let wvb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("water-vbuf"),
+                contents: bytemuck::cast_slice(&wv),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let wib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("water-ibuf"),
+                contents: bytemuck::cast_slice(&wi),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let wu = WaterUniform {
+                water_color: plane.color_rgba,
+                flags: [
+                    if water.reflection_enabled { 1.0 } else { 0.0 },
+                    if water.refraction_enabled { 1.0 } else { 0.0 },
+                    1.0,
+                    1.0,
+                ],
+            };
+            let wub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("water-uniform"),
+                contents: bytemuck::bytes_of(&wu),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let wbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("water-bg"),
+                layout: &self.water_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.water_normal_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.refl_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.refr_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wub.as_entire_binding(),
+                    },
+                ],
+            });
+            water_draws.push((wvb, wib, wbg, wi.len() as u32));
+        }
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("live-world-pass"),
@@ -1730,12 +2252,7 @@ impl TerrainViewportRenderer {
                     view: &self.scene_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.08,
-                            g: 0.14,
-                            b: 0.24,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1749,28 +2266,22 @@ impl TerrainViewportRenderer {
                 }),
                 ..Default::default()
             });
-            if let (Some(vbuf), Some(ibuf)) = (&self.vbuf, &self.ibuf) {
-                if self.index_count > 0 {
-                    rpass.set_pipeline(&self.terrain_pipeline);
-                    rpass.set_bind_group(0, &self.cam_bg, &[]);
-                    rpass.set_bind_group(1, &self.lm_bg, &[]);
-                    rpass.set_vertex_buffer(0, vbuf.slice(..));
-                    rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.draw_indexed(0..self.index_count, 0, 0..1);
-                }
-            }
-            if !self.scenery_batches.is_empty() {
-                rpass.set_pipeline(&self.scenery_pipeline);
+            self.draw_world_geometry(&mut rpass, true);
+
+            // 5. Water planes (after opaque & transparent scenery, depth-tested against terrain)
+            if !water_draws.is_empty() {
+                rpass.set_pipeline(&self.water_pipeline);
                 rpass.set_bind_group(0, &self.cam_bg, &[]);
-                for b in &self.scenery_batches {
-                    rpass.set_bind_group(1, &b.mat_bg, &[]);
-                    rpass.set_vertex_buffer(0, b.vbuf.slice(..));
-                    rpass.set_vertex_buffer(1, b.inst_buf.slice(..));
-                    rpass.set_index_buffer(b.ibuf.slice(..), wgpu::IndexFormat::Uint16);
-                    rpass.draw_indexed(0..b.index_count, 0, 0..b.instance_count);
+                for (wvb, wib, wbg, icnt) in &water_draws {
+                    rpass.set_bind_group(1, wbg, &[]);
+                    rpass.set_vertex_buffer(0, wvb.slice(..));
+                    rpass.set_index_buffer(wib.slice(..), wgpu::IndexFormat::Uint16);
+                    rpass.draw_indexed(0..*icnt, 0, 0..1);
                 }
             }
         }
+
+        self.last_world_render_passes = world_passes;
         encoder.finish()
     }
 

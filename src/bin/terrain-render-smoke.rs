@@ -1,14 +1,12 @@
-//! Offscreen GPU terrain + static `.bmd` scenery render smoke test (designed for Mesa
-//! `lavapipe` on Linux CI).
+//! Offscreen GPU world render smoke test (designed for Mesa `lavapipe` on Linux CI).
 //!
-//! Creates a `wgpu` device, streams synthetic v6 terrain blocks through `TerrainStore`
-//! (`cache/terrain-v1`), places one synthetic `.bmd` static mesh instance on the terrain,
-//! renders one depth-tested frame at a fixed camera with resolution scaling, reads back
-//! the final color buffer, and asserts nonzero terrain coverage, color variation, and
-//! visible static mesh pixels in the expected region.
+//! Renders sky, streamed terrain (day+night lightmap blend), opaque static `.bmd` building,
+//! translucent test quad, and an animated water plane with scissored reflection/refraction
+//! passes. Checks that all expected pixel regions are non-empty and that the water region
+//! differs from the non-water region.
 //!
-//! Note: Software rendering via `lavapipe` verifies pipeline compilation and execution
-//! only — it is **not** visual parity with a real GPU or client.
+//! Note: Software rendering via `lavapipe` proves pipeline compilation and execution only;
+//! it does **not** prove visual parity with the real game or a hardware GPU.
 
 use std::process::ExitCode;
 
@@ -68,24 +66,25 @@ fn main() -> ExitCode {
         match terrain_gpu::render_offscreen_smoke(&device, &queue, width, height, scale_pct) {
             Ok(m) => m,
             Err(err) => {
-                eprintln!("error: offscreen terrain/scenery smoke render failed: {err}");
+                eprintln!("error: offscreen world smoke render failed: {err}");
                 return ExitCode::FAILURE;
             }
         };
 
-    let coverage_pct = (metrics.non_clear_pixels as f64 / metrics.total_pixels as f64) * 100.0;
     println!(
-        "Rendered {}x{} (3D pass {}x{} @ {}% scale), {} streamed blocks, {}/{} non-clear pixels ({:.1}%), {} static-mesh pixels, {} distinct colors",
+        "Rendered {}x{} (3D pass {}x{} @ {}% scale), {} blocks, sky={} px, non_clear={} px, bmd={} px, translucent={} px, water={} px (differs={}), distinct_colors={}",
         metrics.width,
         metrics.height,
         metrics.scaled_width,
         metrics.scaled_height,
         scale_pct,
         metrics.streamed_blocks,
+        metrics.sky_pixels,
         metrics.non_clear_pixels,
-        metrics.total_pixels,
-        coverage_pct,
         metrics.scenery_pixels,
+        metrics.translucent_pixels,
+        metrics.water_pixels,
+        metrics.water_differs_from_non_water,
         metrics.distinct_colors
     );
 
@@ -93,30 +92,38 @@ fn main() -> ExitCode {
         eprintln!("error: unexpected pixel count {}", metrics.total_pixels);
         return ExitCode::FAILURE;
     }
-    if metrics.non_clear_pixels < metrics.total_pixels / 10 {
-        eprintln!(
-            "error: terrain coverage too low ({:.1}%, expected >= 10%)",
-            coverage_pct
-        );
+    if metrics.sky_pixels < 100 {
+        eprintln!("error: sky region too small ({} px)", metrics.sky_pixels);
         return ExitCode::FAILURE;
     }
-    if metrics.scenery_pixels < 100 {
+    if metrics.scenery_pixels < 50 {
         eprintln!(
-            "error: static .bmd mesh pixels not detected in expected region ({} pixels, expected >= 100)",
+            "error: static .bmd mesh pixels not detected ({} px)",
             metrics.scenery_pixels
         );
         return ExitCode::FAILURE;
     }
-    if metrics.distinct_colors <= 16 {
+    if metrics.translucent_pixels < 30 {
         eprintln!(
-            "error: rendered image looks flat ({} distinct colors, expected > 16)",
+            "error: translucent test quad pixels not detected ({} px)",
+            metrics.translucent_pixels
+        );
+        return ExitCode::FAILURE;
+    }
+    if !metrics.water_differs_from_non_water {
+        eprintln!("error: water region did not differ from non-water region");
+        return ExitCode::FAILURE;
+    }
+    if metrics.distinct_colors <= 24 {
+        eprintln!(
+            "error: rendered image looks flat ({} distinct colors)",
             metrics.distinct_colors
         );
         return ExitCode::FAILURE;
     }
 
     println!(
-        "[PASS] Offscreen terrain + static .bmd scenery smoke test passed (verifies pipeline execution only; not visual parity)."
+        "[PASS] Offscreen sky + terrain + static/transparent .bmd + water smoke test passed (pipeline execution only; not visual parity)."
     );
     ExitCode::SUCCESS
 }

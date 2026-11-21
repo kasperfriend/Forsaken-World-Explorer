@@ -9,8 +9,8 @@ use std::{
 use glam::Vec3;
 
 use crate::{
-    bmd, dxt, logging, modules, pck, scenery, settings, terrain_block, terrain_store, tex_cache,
-    world_objects,
+    atmosphere, bmd, camera, dxt, logging, modules, pck, scenery, settings, terrain_block,
+    terrain_store, tex_cache, world_objects,
 };
 
 #[derive(Debug)]
@@ -38,10 +38,18 @@ fn check_portable_settings_and_logs() -> Result<CheckResult, String> {
         terrain_ram_mib: 4,
         tex_budget_mib: 32,
         scenery_enabled: true,
+        transparent_scenery_enabled: true,
         scenery_radius_m: 320,
         scenery_max_instances: 1500,
         scenery_loads_per_frame: 6,
         scenery_whole_world: false,
+        fog_enabled: true,
+        fog_distance_mult_pct: 120,
+        water_reflection: true,
+        water_refraction: false,
+        water_quality: settings::WaterQuality::High,
+        time_of_day_minutes: 900,
+        follow_real_clock: false,
         music_volume: 65,
         ambience_volume: 50,
         effects_volume: 85,
@@ -275,6 +283,49 @@ fn check_synthetic_scenery_pipeline() -> Result<CheckResult, String> {
     res
 }
 
+fn check_phase5_atmosphere_and_water() -> Result<CheckResult, String> {
+    let wrapped = atmosphere::advance_time_of_day(23.75, 0.5);
+    if (wrapped - 0.25).abs() > 1e-4 {
+        return Err(format!("midnight wraparound failed: {wrapped}"));
+    }
+    if (atmosphere::day_night_factor(5.0) - 0.5).abs() > 1e-4 {
+        return Err("dawn day/night blend factor mismatch".into());
+    }
+    if (atmosphere::evaluate_fog_factor(150.0, 50.0, 250.0, 1.0, true) - 0.5).abs() > 1e-4 {
+        return Err("fog midpoint factor mismatch".into());
+    }
+    let cam = camera::FreeCamera {
+        position: Vec3::new(0.0, 40.0, 0.0),
+        yaw: 0.0,
+        pitch: -0.3,
+        ..Default::default()
+    };
+    let plane = atmosphere::WaterPlane {
+        id: 1,
+        center_x: 0.0,
+        center_z: 80.0,
+        half_x: 30.0,
+        half_z: 30.0,
+        height_y: 10.0,
+        color_rgba: [0.1, 0.4, 0.6, 0.85],
+    };
+    if atmosphere::compute_water_scissor(&plane, cam.view_proj(16.0 / 9.0), 800, 600).is_none() {
+        return Err("visible water plane failed scissor rect computation".into());
+    }
+    let mut order = vec![
+        (1u64, Vec3::new(0.0, 0.0, 5.0)),
+        (2u64, Vec3::new(0.0, 0.0, 50.0)),
+    ];
+    atmosphere::sort_transparent_back_to_front(&mut order, Vec3::ZERO, |x| (x.1, x.0));
+    if order[0].0 != 2 {
+        return Err("transparent back-to-front sort failed".into());
+    }
+    Ok(CheckResult {
+        name: "atmosphere-water-transparency",
+        detail: "verified time-of-day wraparound, dn_factor, fog curves, water culling/scissor, and transparent sort".into(),
+    })
+}
+
 fn check_optional_client_env() -> CheckResult {
     match env::var_os(settings::ENV_CLIENT_DIR).filter(|v| !v.is_empty()) {
         Some(path) => {
@@ -316,6 +367,7 @@ pub fn run() -> Result<Vec<CheckResult>, String> {
         check_synthetic_pck_archive()?,
         check_synthetic_world_decoders()?,
         check_synthetic_scenery_pipeline()?,
+        check_phase5_atmosphere_and_water()?,
         check_optional_client_env(),
     ])
 }
@@ -327,6 +379,6 @@ mod tests {
     #[test]
     fn self_test_passes_on_cpu() {
         let results = run().expect("self-test should pass");
-        assert!(results.len() >= 6);
+        assert!(results.len() >= 7);
     }
 }
