@@ -17,6 +17,8 @@ fn print_help() {
          \t--hexdump <FILE> [--bytes N] --out <FILE.txt>        Write a hex + ASCII dump of the first N bytes (default 256)\n\
          \t--export-terrain-block <ZONE> <BX> <BZ> --out <FILE> Export decoded terrain block header and first 16 heights\n\
          \t--export-texture-png <ARCHIVE> <ENTRY> --out <PNG>   Decode a DDS entry from a .pck archive and save as PNG\n\
+         \t--export-terrain-pngs <ZONE> --out-dir <DIR>         Export diffuse, lightmaps, lit output & layer masks as PNGs + stats\n\
+         \t--bmd-trace <FILE> [--client <PATH>]                 Trace every byte/field of a .bmd file and verify texture resolution\n\
          \t--client <PATH>                                      Client root folder (defaults to FW_CLIENT_DIR)\n\
          \t--out <PATH>                                         Output file path for dump/export commands\n\
          \t--self-test                                          Run CPU-only self-checks and exit\n\
@@ -56,6 +58,46 @@ fn main() -> ExitCode {
     if args.iter().any(|arg| arg == "-V" || arg == "--version") {
         println!("forsaken-world-explorer {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+
+    if let Some(zone) = arg_value(&args, "--export-terrain-pngs") {
+        let client_root = match resolve_client_root(&args, "--export-terrain-pngs") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let Some(out_dir) = arg_value(&args, "--out-dir") else {
+            eprintln!("error: --export-terrain-pngs requires --out-dir <DIR>");
+            return ExitCode::FAILURE;
+        };
+        return match zone_dump::export_terrain_pngs(&client_root, &zone, &PathBuf::from(out_dir)) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(bmd_file) = arg_value(&args, "--bmd-trace") {
+        let client_root = arg_value(&args, "--client")
+            .or_else(|| env::var("FW_CLIENT_DIR").ok())
+            .map(PathBuf::from);
+        return match zone_dump::bmd_trace_file(&PathBuf::from(bmd_file), client_root.as_deref()) {
+            Ok(trace) => {
+                print!("{trace}");
+                ExitCode::SUCCESS
+            }
+            Err(trace) => {
+                eprint!("{trace}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     if let Some(vals) = arg_values_n(&args, "--extract-entry", 2) {

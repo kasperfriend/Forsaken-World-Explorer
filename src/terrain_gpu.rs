@@ -2417,7 +2417,9 @@ impl TerrainViewportRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            // Must be Rgba8Unorm (not Srgb) because scene_color is Rgba8Unorm and blit.wgsl
+            // copies it verbatim without linear->sRGB encoding; Srgb here caused pow(x, 2.2) crushing.
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });

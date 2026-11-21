@@ -286,11 +286,15 @@ impl ActiveSceneryState {
             let tstats = self.tex_cache.stats();
             let diag = SceneryDiagnostics {
                 placements_total: self.placements.len(),
+                placements_not_in_range: self.placements.len(),
                 placements_in_range: 0,
+                placements_loaded: 0,
+                placements_failed: 0,
+                placements_pending: 0,
                 unique_models_in_range: 0,
                 models_loaded: self.model_cache.loaded_count(),
                 instances_drawn: 0,
-                decode_failures: self.model_cache.failed_count(),
+                decode_failures: 0,
                 transparent_submeshes_drawn: 0,
                 transparent_submeshes_skipped: 0,
                 approximate_lighting_meshes: 0,
@@ -449,13 +453,19 @@ impl ActiveSceneryState {
         }
 
         let tstats = self.tex_cache.stats();
+        let (not_in_range, in_range_cnt, p_loaded, p_failed, p_pending) =
+            scenery::compute_placement_counters(self.placements.len(), &visible, &self.model_cache);
         let diag = SceneryDiagnostics {
             placements_total: self.placements.len(),
-            placements_in_range: visible.len(),
+            placements_not_in_range: not_in_range,
+            placements_in_range: in_range_cnt,
+            placements_loaded: p_loaded,
+            placements_failed: p_failed,
+            placements_pending: p_pending,
             unique_models_in_range: dedup.len(),
             models_loaded: self.model_cache.loaded_count(),
             instances_drawn: drawn_instances,
-            decode_failures: self.model_cache.failed_count(),
+            decode_failures: p_failed,
             transparent_submeshes_drawn: transparent_batches.len(),
             transparent_submeshes_skipped: transparent_skipped,
             approximate_lighting_meshes: approx_lighting_meshes,
@@ -1208,12 +1218,15 @@ impl ExplorerApp {
                     .map(|st| st.bmd_tex_failed)
                     .unwrap_or(0);
                 let summary_line = format!(
-                    "[Zone Summary] zone='{}' | placements total={}, loaded={}, drawn={}, failed={} (by_reason: {}) | terrain blocks streamed={} | textures loaded={}, failed={}",
+                    "[Zone Summary] zone='{}' | placements(counted once) total={} (not_in_range={} + in_range={}: loaded={} + failed={} + pending={}), drawn={} (by_reason: {}) | terrain blocks streamed={} | textures loaded={}, failed={}",
                     session.zone_name,
                     self.latest_diag.placements_total,
-                    self.latest_diag.models_loaded,
+                    self.latest_diag.placements_not_in_range,
+                    self.latest_diag.placements_in_range,
+                    self.latest_diag.placements_loaded,
+                    self.latest_diag.placements_failed,
+                    self.latest_diag.placements_pending,
                     self.latest_diag.instances_drawn,
-                    self.latest_diag.decode_failures,
                     reasons_summary,
                     session.mesh.streamed_blocks,
                     session.terrain_layers_loaded + self.latest_diag.textures_cached,
@@ -1735,12 +1748,15 @@ impl ExplorerApp {
                             tex_reason
                         ));
                         ui.small(format!(
-                            "Placements: in_range={}/{}, loaded={}, drawn={}, failed={}{}",
-                            d.placements_in_range,
-                            d.placements_total,
-                            d.models_loaded,
+                            "Placements (counted once): total={} = not_in_range({}) + in_range({})",
+                            d.placements_total, d.placements_not_in_range, d.placements_in_range
+                        ));
+                        ui.small(format!(
+                            "  in_range: loaded({}) + failed({}) + pending({}) | drawn={}{}",
+                            d.placements_loaded,
+                            d.placements_failed,
+                            d.placements_pending,
                             d.instances_drawn,
-                            d.decode_failures,
                             bmd_reason
                         ));
                         if let Some(st) = &self.scenery_state {

@@ -914,9 +914,9 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
     );
     let _ = writeln!(
         out,
-        "  Buildings (.bmd): total_placements={}, unique_models={}, loaded={}, failed={}{}",
+        "  Buildings (.bmd, counting unit: unique placements, whole-zone dump = all in_range): total={} = not_in_range(0) + in_range({}) | in_range: loaded({}) + failed({}) + pending(0){}",
         summary.placements_total,
-        summary.unique_models,
+        summary.placements_total,
         summary.bmd_resolved,
         summary.bmd_failed,
         if summary.bmd_resolved == 0 {
@@ -985,7 +985,7 @@ pub fn dump_zone(client_root: &Path, zone: &str) -> ZoneDumpSummary {
                     );
                     let _ = writeln!(
                         out,
-                        "  First loaded block (0, 0) GPU bindings: @group(1) @binding(0)=day_lightmap_tex ({}x{} Rgba8UnormSrgb, non_zero_rgb_px={non_zero_day}/{total_px}), @group(1) @binding(1)=night_lightmap_tex ({}x{} Rgba8UnormSrgb), @group(1) @binding(2)=live-linear-sampler (Linear, Repeat)",
+                        "  First loaded block (0, 0) GPU bindings: @group(1) @binding(0)=day_lightmap_tex ({}x{} Rgba8Unorm, non_zero_rgb_px={non_zero_day}/{total_px}), @group(1) @binding(1)=night_lightmap_tex ({}x{} Rgba8Unorm), @group(1) @binding(2)=live-linear-sampler (Linear, Repeat)",
                         session.day_lightmap.width,
                         session.day_lightmap.height,
                         session.night_lightmap.width,
@@ -1284,6 +1284,12 @@ pub fn export_terrain_block(
         t2bk.offsets.len(),
         t2bk.offsets[idx]
     );
+    let x0 = -trn2.width * 0.5 + (block_x as f32) * trn2.block_size;
+    let x1 = x0 + trn2.block_size;
+    let z0 = trn2.length * 0.5 - (block_z as f32) * trn2.block_size;
+    let z1 = z0 - trn2.block_size;
+    let origin_col = ((trn2.width * 0.5) / trn2.block_size).floor() as u32;
+    let origin_row = ((trn2.length * 0.5) / trn2.block_size).floor() as u32;
     let _ = writeln!(
         out,
         "block: row={} col={} mask_area={} lod_scale={} verts={} height_range=[{hmin:.3}, {hmax:.3}]",
@@ -1292,6 +1298,11 @@ pub fn export_terrain_block(
         decoded.mask_area,
         decoded.lod_scale,
         decoded.heights.len()
+    );
+    let _ = writeln!(
+        out,
+        "world_bounds: X=[{x0:.1}, {x1:.1}] Z=[{z1:.1}, {z0:.1}] (note: world origin (0.0, 0.0) is in block col={origin_col}, row={origin_row}, idx={})",
+        origin_row * trn2.block_cols + origin_col
     );
     let _ = writeln!(out, "first_16_heights:");
     for (i, h) in decoded.heights.iter().take(16).enumerate() {
@@ -1333,6 +1344,434 @@ pub fn export_texture_png(
         out_path.display(),
         png.len()
     ))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RgbaStats {
+    pub r_min: u8,
+    pub r_max: u8,
+    pub r_mean: f64,
+    pub g_min: u8,
+    pub g_max: u8,
+    pub g_mean: f64,
+    pub b_min: u8,
+    pub b_max: u8,
+    pub b_mean: f64,
+    pub zero_frac: f64,
+}
+
+pub fn compute_rgba_stats(rgba: &[u8]) -> RgbaStats {
+    let mut r_min = 255u8;
+    let mut r_max = 0u8;
+    let mut g_min = 255u8;
+    let mut g_max = 0u8;
+    let mut b_min = 255u8;
+    let mut b_max = 0u8;
+    let mut r_sum = 0u64;
+    let mut g_sum = 0u64;
+    let mut b_sum = 0u64;
+    let mut zeros = 0u64;
+    let pixels = rgba.as_chunks::<4>().0;
+    let n = pixels.len().max(1) as f64;
+    for &[r, g, b, _] in pixels {
+        r_min = r_min.min(r);
+        r_max = r_max.max(r);
+        g_min = g_min.min(g);
+        g_max = g_max.max(g);
+        b_min = b_min.min(b);
+        b_max = b_max.max(b);
+        r_sum += r as u64;
+        g_sum += g as u64;
+        b_sum += b as u64;
+        if r == 0 && g == 0 && b == 0 {
+            zeros += 1;
+        }
+    }
+    RgbaStats {
+        r_min,
+        r_max,
+        r_mean: r_sum as f64 / n,
+        g_min,
+        g_max,
+        g_mean: g_sum as f64 / n,
+        b_min,
+        b_max,
+        b_mean: b_sum as f64 / n,
+        zero_frac: zeros as f64 / n,
+    }
+}
+
+fn crop_rgba(src: &[u8], full_w: u32, x0: u32, y0: u32, w: u32, h: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    for y in 0..(h as usize) {
+        let sy = (y0 as usize) + y;
+        let src_off = (sy * (full_w as usize) + (x0 as usize)) * 4;
+        let dst_off = y * (w as usize) * 4;
+        out[dst_off..dst_off + (w as usize) * 4]
+            .copy_from_slice(&src[src_off..src_off + (w as usize) * 4]);
+    }
+    out
+}
+
+/// CLI helper: `--export-terrain-pngs <zone> --out-dir <dir>`
+/// Exports whole-zone & block (0,0) diffuse, day lightmap, night lightmap, unscaled lit output,
+/// and per-layer masks as PNGs (< 1 MB each) plus a per-channel stats table.
+pub fn export_terrain_pngs(
+    client_root: &Path,
+    zone: &str,
+    out_dir: &Path,
+) -> Result<String, String> {
+    fs::create_dir_all(out_dir)
+        .map_err(|e| format!("failed to create {}: {e}", out_dir.display()))?;
+    let zone_dir = client_root.join("maps").join(zone);
+    let trn2_bytes = fs::read(zone_dir.join(format!("{zone}.trn2")))
+        .map_err(|e| format!("failed to read {zone}.trn2: {e}"))?;
+    let trn2 = Trn2Header::parse(&trn2_bytes)?;
+    let num_ma = trn2.mask_areas.max(1) as usize;
+    let ma_grid = (num_ma as f64).sqrt().round().max(1.0) as usize;
+    let tile_px = 128usize;
+    let full_side = (ma_grid * tile_px) as u32;
+
+    let (mut archives, _) = open_all_resource_pcks(client_root);
+    let mut layer_textures: Vec<Option<(u32, u32, Vec<u8>)>> = vec![None; trn2.texture_paths.len()];
+    for (i, tp) in trn2.texture_paths.iter().enumerate() {
+        for (_, mount, arch) in archives.iter_mut() {
+            if !matches!(
+                mount.as_str(),
+                "textures" | "litmodels" | "building" | "surfaces"
+            ) {
+                continue;
+            }
+            for cand in texture_lookup_candidates_for_archive(tp, Some(mount)) {
+                if let Ok(bytes) = arch.read_entry(&cand) {
+                    if let Ok(surf) = dxt::parse_dds(&bytes) {
+                        layer_textures[i] =
+                            Some((surf.width, surf.height, dxt::decode_rgba8(&surf)));
+                        break;
+                    }
+                }
+            }
+            if layer_textures[i].is_some() {
+                break;
+            }
+        }
+    }
+
+    let full_px = (full_side as usize) * (full_side as usize);
+    let mut diffuse = vec![0u8; full_px * 4];
+    let mut layer_masks: Vec<Vec<u8>> = (0..trn2.texture_paths.len())
+        .map(|_| vec![0u8; full_px * 4])
+        .collect();
+    for m in &mut layer_masks {
+        for px in m.as_chunks_mut::<4>().0.iter_mut() {
+            px[3] = 255;
+        }
+    }
+
+    let mut sample_weights_log = String::new();
+    let t2mk_bytes = fs::read(zone_dir.join(format!("{zone}_1.t2mk")))
+        .map_err(|e| format!("failed to read {zone}_1.t2mk: {e}"))?;
+    let mk = T2mkHeader::parse(&t2mk_bytes)?;
+
+    for ma in 0..num_ma.min(mk.num_areas as usize) {
+        let ma_r = ma / ma_grid;
+        let ma_c = ma % ma_grid;
+        let Ok(layers) = mk.area_layers(&t2mk_bytes, ma) else {
+            continue;
+        };
+        let mut tile_rgb = vec![[0.0f32; 3]; tile_px * tile_px];
+        let mut tile_has_base = false;
+        let mut sample_w = Vec::new();
+        for (li, lyr) in layers.iter().enumerate() {
+            let Ok((m_side, m_bytes)) = mk.decode_layer_mask(&t2mk_bytes, lyr) else {
+                continue;
+            };
+            let lidx = lyr.layer_index as usize;
+            // Record mask image for this layer
+            if let Some(m_img) = layer_masks.get_mut(lidx) {
+                for ty in 0..tile_px {
+                    for tx in 0..tile_px {
+                        let mv = if li == 0 || m_side <= 1 {
+                            255u8
+                        } else {
+                            let mx = (tx * (m_side as usize)) / tile_px;
+                            let my = (ty * (m_side as usize)) / tile_px;
+                            m_bytes
+                                .get(my * (m_side as usize) + mx)
+                                .copied()
+                                .unwrap_or(0)
+                        };
+                        let gx = ma_c * tile_px + tx;
+                        let gy = ma_r * tile_px + ty;
+                        let o = (gy * (full_side as usize) + gx) * 4;
+                        m_img[o] = mv;
+                        m_img[o + 1] = mv;
+                        m_img[o + 2] = mv;
+                        m_img[o + 3] = 255;
+                    }
+                }
+            }
+            if matches!(ma, 0 | 5 | 10) {
+                let mid_val = if li == 0 || m_side <= 1 {
+                    255u8
+                } else {
+                    let mid = (m_side as usize) / 2;
+                    m_bytes
+                        .get(mid * (m_side as usize) + mid)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                sample_w.push(format!("L{lidx}={mid_val}/255"));
+            }
+            let Some(Some((tw_u, th_u, rgba))) = layer_textures.get(lidx) else {
+                continue;
+            };
+            let tw = (*tw_u).max(1) as usize;
+            let th = (*th_u).max(1) as usize;
+            for ty in 0..tile_px {
+                for tx in 0..tile_px {
+                    let sx = ((tx * tw * 8) / tile_px) % tw;
+                    let sy = ((ty * th * 8) / tile_px) % th;
+                    let tidx = (sy * tw + sx) * 4;
+                    let tr = rgba[tidx] as f32;
+                    let tg = rgba[tidx + 1] as f32;
+                    let tb = rgba[tidx + 2] as f32;
+                    let alpha = if !tile_has_base || li == 0 || m_side <= 1 {
+                        1.0f32
+                    } else {
+                        let mx = (tx * (m_side as usize)) / tile_px;
+                        let my = (ty * (m_side as usize)) / tile_px;
+                        m_bytes
+                            .get(my * (m_side as usize) + mx)
+                            .copied()
+                            .unwrap_or(0) as f32
+                            / 255.0
+                    };
+                    let dst = &mut tile_rgb[ty * tile_px + tx];
+                    if !tile_has_base {
+                        *dst = [tr, tg, tb];
+                    } else {
+                        dst[0] = dst[0] * (1.0 - alpha) + tr * alpha;
+                        dst[1] = dst[1] * (1.0 - alpha) + tg * alpha;
+                        dst[2] = dst[2] * (1.0 - alpha) + tb * alpha;
+                    }
+                }
+            }
+            tile_has_base = true;
+        }
+        if !sample_w.is_empty() {
+            let _ = writeln!(
+                sample_weights_log,
+                "  mask_area[{ma}] center weights: {}",
+                sample_w.join(", ")
+            );
+        }
+        for ty in 0..tile_px {
+            for tx in 0..tile_px {
+                let gx = ma_c * tile_px + tx;
+                let gy = ma_r * tile_px + ty;
+                let o = (gy * (full_side as usize) + gx) * 4;
+                let rgb = tile_rgb[ty * tile_px + tx];
+                diffuse[o] = rgb[0].clamp(0.0, 255.0) as u8;
+                diffuse[o + 1] = rgb[1].clamp(0.0, 255.0) as u8;
+                diffuse[o + 2] = rgb[2].clamp(0.0, 255.0) as u8;
+                diffuse[o + 3] = 255;
+            }
+        }
+    }
+
+    let stitch_raw_lm = |suffix: &str| -> Vec<u8> {
+        let mut lm_img = vec![0u8; full_px * 4];
+        for px in lm_img.as_chunks_mut::<4>().0.iter_mut() {
+            px[3] = 255;
+        }
+        if let Ok(lm_bytes) = fs::read(zone_dir.join(format!("{zone}_1.{suffix}"))) {
+            if let Ok(lm) = T2lmHeader::parse(&lm_bytes) {
+                for ma in 0..num_ma.min(lm.num_areas as usize) {
+                    let Ok(dds_bytes) = lm.area_bytes(&lm_bytes, ma) else {
+                        continue;
+                    };
+                    let Ok(surf) = dxt::parse_dds(dds_bytes) else {
+                        continue;
+                    };
+                    let dec = dxt::decode_rgba8(&surf);
+                    let sw = surf.width.max(1) as usize;
+                    let sh = surf.height.max(1) as usize;
+                    let ma_r = ma / ma_grid;
+                    let ma_c = ma % ma_grid;
+                    for ty in 0..tile_px {
+                        for tx in 0..tile_px {
+                            let sx = (tx * sw) / tile_px;
+                            let sy = (ty * sh) / tile_px;
+                            let sidx = (sy * sw + sx) * 4;
+                            let gx = ma_c * tile_px + tx;
+                            let gy = ma_r * tile_px + ty;
+                            let o = (gy * (full_side as usize) + gx) * 4;
+                            lm_img[o] = dec[sidx];
+                            lm_img[o + 1] = dec[sidx + 1];
+                            lm_img[o + 2] = dec[sidx + 2];
+                            lm_img[o + 3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        lm_img
+    };
+
+    let day_lm = stitch_raw_lm("t2lm");
+    let night_lm = stitch_raw_lm("t2lm1");
+    let mut lit_unscaled = vec![0u8; full_px * 4];
+    for i in 0..full_px {
+        let o = i * 4;
+        lit_unscaled[o] = ((diffuse[o] as u16 * day_lm[o] as u16) / 255) as u8;
+        lit_unscaled[o + 1] = ((diffuse[o + 1] as u16 * day_lm[o + 1] as u16) / 255) as u8;
+        lit_unscaled[o + 2] = ((diffuse[o + 2] as u16 * day_lm[o + 2] as u16) / 255) as u8;
+        lit_unscaled[o + 3] = 255;
+    }
+
+    let mut report = String::new();
+    let _ = writeln!(
+        report,
+        "=== Terrain PNG Export & Channel Stats ({zone}, unscaled diffuse * lightmap) ==="
+    );
+    let _ = writeln!(report, "| File | Size | R [min..max mean] | G [min..max mean] | B [min..max mean] | zero_frac | PNG bytes |");
+    let _ = writeln!(report, "| --- | --- | --- | --- | --- | ---: | ---: |");
+
+    let mut save_and_stat = |name: &str, w: u32, h: u32, rgba: &[u8]| -> Result<(), String> {
+        let png = encode_rgba8_png(w, h, rgba)?;
+        let out_p = out_dir.join(name);
+        fs::write(&out_p, &png).map_err(|e| format!("failed to write {}: {e}", out_p.display()))?;
+        let st = compute_rgba_stats(rgba);
+        let _ =
+            writeln!(
+            report,
+            "| {name} | {w}x{h} | {}..{} ({:.1}) | {}..{} ({:.1}) | {}..{} ({:.1}) | {:.4} | {} |",
+            st.r_min, st.r_max, st.r_mean,
+            st.g_min, st.g_max, st.g_mean,
+            st.b_min, st.b_max, st.b_mean,
+            st.zero_frac,
+            png.len()
+        );
+        Ok(())
+    };
+
+    save_and_stat("whole_zone_diffuse.png", full_side, full_side, &diffuse)?;
+    save_and_stat("whole_zone_day_lightmap.png", full_side, full_side, &day_lm)?;
+    save_and_stat(
+        "whole_zone_night_lightmap.png",
+        full_side,
+        full_side,
+        &night_lm,
+    )?;
+    save_and_stat(
+        "whole_zone_lit_unscaled.png",
+        full_side,
+        full_side,
+        &lit_unscaled,
+    )?;
+
+    let bsz = tile_px as u32;
+    save_and_stat(
+        "block_0_0_diffuse.png",
+        bsz,
+        bsz,
+        &crop_rgba(&diffuse, full_side, 0, 0, bsz, bsz),
+    )?;
+    save_and_stat(
+        "block_0_0_day_lightmap.png",
+        bsz,
+        bsz,
+        &crop_rgba(&day_lm, full_side, 0, 0, bsz, bsz),
+    )?;
+    save_and_stat(
+        "block_0_0_night_lightmap.png",
+        bsz,
+        bsz,
+        &crop_rgba(&night_lm, full_side, 0, 0, bsz, bsz),
+    )?;
+    save_and_stat(
+        "block_0_0_lit_unscaled.png",
+        bsz,
+        bsz,
+        &crop_rgba(&lit_unscaled, full_side, 0, 0, bsz, bsz),
+    )?;
+
+    for (li, m_img) in layer_masks.iter().enumerate() {
+        save_and_stat(&format!("mask_layer_{li}.png"), full_side, full_side, m_img)?;
+    }
+
+    let _ = writeln!(
+        report,
+        "\nSample layer mask weights (0..255, blend order: layer[0] base, then alpha-blended):"
+    );
+    report.push_str(&sample_weights_log);
+    fs::write(out_dir.join("terrain_stats.txt"), &report)
+        .map_err(|e| format!("failed to write terrain_stats.txt: {e}"))?;
+    Ok(report)
+}
+
+/// CLI helper: `--bmd-trace <file> [--client <PATH>]`
+pub fn bmd_trace_file(file_path: &Path, client_root: Option<&Path>) -> Result<String, String> {
+    let bytes =
+        fs::read(file_path).map_err(|e| format!("failed to read {}: {e}", file_path.display()))?;
+    let (mut trace, parsed) = crate::bmd::trace_bmd(&bytes);
+    match parsed {
+        Ok(model) => {
+            let total_verts: usize = model.submeshes.iter().map(|s| s.vertices.len()).sum();
+            let total_indices: usize = model.submeshes.iter().map(|s| s.indices.len()).sum();
+            let _ = writeln!(
+                trace,
+                "Parse status: OK | submeshes={} | total_verts={total_verts} | total_indices={total_indices} | collision_hulls={}",
+                model.submeshes.len(),
+                model.collision_hull_count
+            );
+            if let Some(root) = client_root {
+                let (mut archives, _) = open_all_resource_pcks(root);
+                let _ = writeln!(trace, "\nTexture resolution check (Phase 1 normalizer):");
+                for (si, sub) in model.submeshes.iter().enumerate() {
+                    let norm = pck::normalize_archive_path(&sub.texture, Some("building"));
+                    let mut matched = None;
+                    for (aname, mount, arch) in archives.iter_mut() {
+                        if !matches!(mount.as_str(), "building" | "textures" | "litmodels") {
+                            continue;
+                        }
+                        for cand in texture_lookup_candidates_for_archive(&sub.texture, Some(mount))
+                        {
+                            if arch.read_entry(&cand).is_ok() {
+                                matched = Some((aname.clone(), cand));
+                                break;
+                            }
+                        }
+                        if matched.is_some() {
+                            break;
+                        }
+                    }
+                    match matched {
+                        Some((a, c)) => {
+                            let _ = writeln!(
+                                trace,
+                                "  submesh[{si}] `{}` -> FOUND in {a} (`{c}`)",
+                                sub.texture
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                trace,
+                                "  submesh[{si}] `{}` (norm=`{norm}`) -> NOT FOUND",
+                                sub.texture
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(trace)
+        }
+        Err(e) => {
+            let _ = writeln!(trace, "Parse status: ERROR ({e})");
+            Err(trace)
+        }
+    }
 }
 
 #[cfg(test)]

@@ -83,6 +83,9 @@ pub struct BmdSubmesh {
     pub name: String,
     pub version: u32,
     pub texture: String,
+    /// Present for `A3DLitMesh` `0x10000006` (1-byte flag immediately after the 48-byte AABB
+    /// and before the NUL-terminated material name; values 0x40/0xc0/0x41 in sample_litmodel_1000.bmd).
+    pub mesh_flags_v6: Option<u8>,
     pub material: Option<BmdMaterial>,
     pub alpha_mode: AlphaMode,
     pub aabb_min: [f32; 3],
@@ -153,7 +156,7 @@ impl BmdModel {
             let ver = read_u32(data, p, "mesh_version")?;
             p += 4;
             match ver {
-                0x1000_0002..=0x1000_0005 => {}
+                0x1000_0002..=0x1000_0006 => {}
                 other => {
                     return Err(BmdError::UnsupportedMeshVersion {
                         version: other,
@@ -169,6 +172,13 @@ impl BmdModel {
             let num_verts = read_u32(data, p, "num_verts")? as usize;
             let num_faces = read_u32(data, p + 4, "num_faces")? as usize;
             p += 8;
+            let mesh_flags_v6 = if ver >= 0x1000_0006 {
+                let flag = *data.get(p).ok_or(BmdError::Truncated("v6 mesh_flags"))?;
+                p += 1;
+                Some(flag)
+            } else {
+                None
+            };
             if num_verts > 500_000 || num_faces > 1_000_000 {
                 return Err(BmdError::LimitExceeded("vertex or face count"));
             }
@@ -287,6 +297,7 @@ impl BmdModel {
                 name,
                 version: ver,
                 texture,
+                mesh_flags_v6,
                 material,
                 alpha_mode,
                 aabb_min,
@@ -588,6 +599,205 @@ pub mod synthetic {
     }
 }
 
+/// Byte-level field tracer for `.bmd` files (`--bmd-trace <file>`).
+/// Prints the exact byte offset, size, and value of every field up to EOF or the first error.
+pub fn trace_bmd(data: &[u8]) -> (String, Result<BmdModel, BmdError>) {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "=== BMD Byte-Level Trace (total_bytes={}) ===",
+        data.len()
+    );
+    if data.len() < 4 {
+        let _ = writeln!(
+            out,
+            "0x00000000 [0..{}]: TRUNCATED before magic",
+            data.len()
+        );
+        return (out, Err(BmdError::Truncated("magic")));
+    }
+    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let _ = writeln!(
+        out,
+        "0x00000000 (4 B): magic = {magic:#010x} ({:?})",
+        String::from_utf8_lossy(&data[0..4])
+    );
+    if magic != AFILE_BINARY_MAGIC {
+        return (out, Err(BmdError::MissingMagic));
+    }
+    let mut p = 4usize;
+    let first_ver = match read_u32(data, p, "version") {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(out, "{p:#010x}: ERROR {e}");
+            return (out, Err(e));
+        }
+    };
+    let model_ver = if first_ver == BRUSH_BUILDING_VERSION {
+        let _ = writeln!(
+            out,
+            "{p:#010x} (4 B): brush_building_version = {first_ver:#010x}"
+        );
+        let flag = match data.get(p + 4) {
+            Some(&f) => f,
+            None => return (out, Err(BmdError::Truncated("collide_only"))),
+        };
+        let _ = writeln!(out, "{:#010x} (1 B): collide_only = {flag}", p + 4);
+        p += 5;
+        match read_u32(data, p, "model_version") {
+            Ok(v) => {
+                let _ = writeln!(out, "{p:#010x} (4 B): model_version = {v:#010x}");
+                v
+            }
+            Err(e) => return (out, Err(e)),
+        }
+    } else {
+        let _ = writeln!(out, "{p:#010x} (4 B): model_version = {first_ver:#010x}");
+        first_ver
+    };
+    p += 4;
+    if let (Ok(scale), Ok(dir), Ok(up), Ok(pos), Ok(mesh_count)) = (
+        read_vec3(data, p, "scale"),
+        read_vec3(data, p + 12, "direction"),
+        read_vec3(data, p + 24, "up"),
+        read_vec3(data, p + 36, "position"),
+        read_u32(data, p + 48, "mesh_count"),
+    ) {
+        let _ = writeln!(out, "{p:#010x} (12 B): scale = {scale:?}");
+        let _ = writeln!(out, "{:#010x} (12 B): direction = {dir:?}", p + 12);
+        let _ = writeln!(out, "{:#010x} (12 B): up = {up:?}", p + 24);
+        let _ = writeln!(out, "{:#010x} (12 B): position = {pos:?}", p + 36);
+        let _ = writeln!(out, "{:#010x} (4 B): mesh_count = {mesh_count}", p + 48);
+        p += 52;
+
+        for m in 0..(mesh_count as usize) {
+            let ver_off = p;
+            let Ok(ver) = read_u32(data, p, "mesh_version") else {
+                let _ = writeln!(out, "{p:#010x}: TRUNCATED mesh[{m}] version");
+                break;
+            };
+            let _ = writeln!(out, "\n--- Submesh[{m}] ---");
+            let _ = writeln!(out, "{ver_off:#010x} (4 B): mesh_version = {ver:#010x}");
+            p += 4;
+            if !(0x1000_0002..=0x1000_0006).contains(&ver) {
+                let _ = writeln!(out, "{ver_off:#010x}: UNSUPPORTED mesh_version {ver:#010x}");
+                break;
+            }
+            let Ok(name) = read_fixed_gbk(data, p, 64, "mesh_name") else {
+                break;
+            };
+            let _ = writeln!(out, "{p:#010x} (64 B): name = `{name}`");
+            p += 64;
+            let Ok(tex) = read_fixed_gbk(data, p, 256, "texture_name") else {
+                break;
+            };
+            let _ = writeln!(out, "{p:#010x} (256 B): texture = `{tex}`");
+            p += 256;
+            let (Ok(nv), Ok(nf)) = (
+                read_u32(data, p, "num_verts"),
+                read_u32(data, p + 4, "num_faces"),
+            ) else {
+                break;
+            };
+            let _ = writeln!(
+                out,
+                "{p:#010x} (8 B): num_verts = {nv}, num_faces = {nf} (indices = {})",
+                nf * 3
+            );
+            p += 8;
+            if ver >= 0x1000_0006 {
+                if let Some(&fl) = data.get(p) {
+                    let _ = writeln!(
+                        out,
+                        "{p:#010x} (1 B): mesh_flags_v6 = {fl:#04x} (byte-consistent)"
+                    );
+                    p += 1;
+                }
+            }
+            let stride = if ver >= 0x1000_0004 { 24usize } else { 28usize };
+            let vb = (nv as usize) * stride;
+            let _ = writeln!(out, "{p:#010x} ({vb} B): vertices ({nv} x {stride} B)");
+            p += vb;
+            let ib = (nf as usize) * 6;
+            let _ = writeln!(out, "{p:#010x} ({ib} B): indices ({} x u16)", nf * 3);
+            p += ib;
+            let nb = (nv as usize) * 12;
+            let _ = writeln!(out, "{p:#010x} ({nb} B): normals ({nv} x vec3)");
+            p += nb;
+            if ver >= 0x1000_0003 {
+                let lb = (nv as usize) * 8;
+                let _ = writeln!(
+                    out,
+                    "{p:#010x} ({lb} B): day_diffuse + night_diffuse ({nv} x 2 x u32)"
+                );
+                p += lb;
+            }
+            let _ = writeln!(out, "{p:#010x} (48 B): aabb (center, extents, min, max)");
+            p += 48;
+            if ver >= 0x1000_0005 {
+                if let Some(tail) = data.get(p..) {
+                    if let Some(nul) = tail.iter().position(|&c| c == 0) {
+                        let mat_name =
+                            read_fixed_gbk(data, p, nul, "material_name").unwrap_or_default();
+                        let _ = writeln!(
+                            out,
+                            "{p:#010x} ({} B): material_name = `{mat_name}` (+NUL)",
+                            nul + 1
+                        );
+                        p += nul + 1;
+                        let two_sided = data.get(p + 68).copied().unwrap_or(0);
+                        let _ = writeln!(out, "{p:#010x} (69 B): A3DMaterial (ambient/diffuse/emissive/specular/power, two_sided={two_sided})");
+                        p += 69;
+                    }
+                }
+            }
+        }
+        if p < data.len() {
+            if let Ok(hulls) = read_u32(data, p, "hull_count") {
+                let _ = writeln!(out, "\n--- CELBrushBuilding Collision Trailer ---");
+                let _ = writeln!(out, "{p:#010x} (4 B): hull_count = {hulls}");
+                let mut q = p + 4;
+                for _ in 0..(hulls as usize) {
+                    if let Ok(cnt) = read_u32(data, q, "cnt") {
+                        q += 4 + (cnt as usize) * 4;
+                    } else {
+                        break;
+                    }
+                }
+                let _ = writeln!(
+                    out,
+                    "{:#010x} ({} B): hull_mesh_index_lists ({hulls} lists)",
+                    p + 4,
+                    q - (p + 4)
+                );
+                let brushes_start = q;
+                for _ in 0..(hulls as usize) {
+                    if let Ok(sc) = read_u32(data, q + 52, "sides") {
+                        q += 56 + (sc as usize) * 17;
+                    } else {
+                        break;
+                    }
+                }
+                let _ = writeln!(
+                    out,
+                    "{brushes_start:#010x} ({} B): CCDBrush hulls ({hulls} brushes)",
+                    q - brushes_start
+                );
+                p = q;
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\n=== Trace Summary: model_ver={model_ver:#x}, consumed={p} / {} bytes (remaining={}) ===",
+        data.len(),
+        data.len().saturating_sub(p)
+    );
+    let parsed = BmdModel::parse(data);
+    (out, parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +914,9 @@ mod version_matrix_tests {
         out.extend_from_slice(&[0u8; 320]); // name + texture
         out.extend_from_slice(&3u32.to_le_bytes()); // 3 verts
         out.extend_from_slice(&1u32.to_le_bytes()); // 1 face
+        if mesh_version >= 0x1000_0006 {
+            out.push(0x00u8); // v6 1-byte flag before vertices
+        }
         let stride = if mesh_version >= 0x1000_0004 { 24 } else { 28 };
         for i in 0..3usize {
             let mut rec = vec![0u8; stride];
@@ -742,7 +955,13 @@ mod version_matrix_tests {
     fn reads_every_supported_bmd_header_and_mesh_version() {
         for with_brush in [false, true] {
             for model_ver in [LITMODEL_VERSION_1, LITMODEL_VERSION_2] {
-                for mesh_ver in [0x1000_0002u32, 0x1000_0003, 0x1000_0004, 0x1000_0005] {
+                for mesh_ver in [
+                    0x1000_0002u32,
+                    0x1000_0003,
+                    0x1000_0004,
+                    0x1000_0005,
+                    0x1000_0006,
+                ] {
                     let raw = build_minimal_bmd_for_version(with_brush, model_ver, mesh_ver);
                     let parsed = BmdModel::parse(&raw).unwrap_or_else(|e| {
                         panic!("failed for brush={with_brush} model={model_ver:#x} mesh={mesh_ver:#x}: {e}")
@@ -766,13 +985,12 @@ mod version_matrix_tests {
                 offset: 60
             })
         );
-        // Observed real-client version 0x10000006 must fail cleanly with exact byte offset
-        // until verified against real sample_litmodel_1000.bmd bytes.
-        let v6 = build_minimal_bmd_for_version(false, LITMODEL_VERSION_2, 0x1000_0006);
+        // Unsupported future version 0x10000007 must fail cleanly with exact byte offset
+        let v7 = build_minimal_bmd_for_version(false, LITMODEL_VERSION_2, 0x1000_0007);
         assert_eq!(
-            BmdModel::parse(&v6),
+            BmdModel::parse(&v7),
             Err(BmdError::UnsupportedMeshVersion {
-                version: 0x1000_0006,
+                version: 0x1000_0007,
                 offset: 60
             })
         );

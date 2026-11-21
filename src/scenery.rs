@@ -21,7 +21,11 @@ pub const SCENERY_CACHE_SUBDIR: &str = "scenery-v1";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SceneryDiagnostics {
     pub placements_total: usize,
+    pub placements_not_in_range: usize,
     pub placements_in_range: usize,
+    pub placements_loaded: usize,
+    pub placements_failed: usize,
+    pub placements_pending: usize,
     pub unique_models_in_range: usize,
     pub models_loaded: usize,
     pub instances_drawn: usize,
@@ -252,6 +256,31 @@ where
     )
 }
 
+/// Compute exact per-placement counters for the current frame (counting each placement once):
+/// `total = not_in_range + in_range` and `in_range = loaded + failed + pending`.
+pub fn compute_placement_counters(
+    total_placements: usize,
+    in_range: &[&OrnamentPlacement],
+    cache: &SceneryModelCache,
+) -> (usize, usize, usize, usize, usize) {
+    let in_range_cnt = in_range.len().min(total_placements);
+    let not_in_range = total_placements.saturating_sub(in_range_cnt);
+    let mut loaded = 0usize;
+    let mut failed = 0usize;
+    let mut pending = 0usize;
+    for p in in_range.iter().take(in_range_cnt) {
+        let key = p.normalized_bmd_path().to_ascii_lowercase();
+        if cache.get(&key).is_some() {
+            loaded += 1;
+        } else if cache.is_failed(&key) {
+            failed += 1;
+        } else {
+            pending += 1;
+        }
+    }
+    (not_in_range, in_range_cnt, loaded, failed, pending)
+}
+
 pub fn format_bmd_error(model_key: &str, err: &BmdError) -> String {
     format!("{model_key}: {err}")
 }
@@ -341,5 +370,46 @@ mod tests {
         assert_eq!(model.submeshes.len(), 1);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn placement_counters_add_up_and_count_each_placement_once() {
+        let dir = std::env::temp_dir().join(format!("fw_cnt_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut cache = SceneryModelCache::open(&dir).unwrap();
+        let good = synthetic::build_bmd_v5_box("textures/wall.dds", 2.0, 6.0);
+        let _ = cache.load_or_decode("a.bmd", || Ok(good.clone()));
+        let _ = cache.load_or_decode("b.bmd", || Err("unsupported version".into()));
+
+        // 5 total placements: 4 in range (2 share a.bmd loaded, 1 b.bmd failed, 1 c.bmd pending), 1 out of range
+        let mk = |id: u32, path: &str, x: f32| OrnamentPlacement {
+            export_id: id,
+            asset_path: path.into(),
+            position: [x, 0.0, 0.0],
+            direction: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            reflect: false,
+            refract: false,
+            optimize: false,
+        };
+        let all = vec![
+            mk(1, "a.bmd", 10.0),
+            mk(2, "a.bmd", 15.0),
+            mk(3, "b.bmd", 20.0),
+            mk(4, "c.bmd", 25.0),
+            mk(5, "d.bmd", 900.0),
+        ];
+        let in_range = select_visible_placements(&all, Vec3::ZERO, 100.0, 500, false);
+        let (not_in_range, in_range_cnt, loaded, failed, pending) =
+            compute_placement_counters(all.len(), &in_range, &cache);
+        assert_eq!(not_in_range, 1);
+        assert_eq!(in_range_cnt, 4);
+        assert_eq!(loaded, 2);
+        assert_eq!(failed, 1);
+        assert_eq!(pending, 1);
+        assert_eq!(all.len(), not_in_range + in_range_cnt);
+        assert_eq!(in_range_cnt, loaded + failed + pending);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -4,8 +4,9 @@ An experimental, GPU-based, free-flight viewer for a **user-owned Forsaken World
 
 > **Current status (honest assessment):** No rendered feature is marked working until confirmed visually by the user in the Windows artifact on real client files.
 > - **Terrain layer textures:** `decoder verified on real data (dump: dump-s0.txt)` (5/5 `s0` DDS DXT3 layers decoded).
-> - **Terrain rendering (grey terrain):** `not working: cause under investigation (Task 3)` — fixes for polar normals (`login_1.t2bk`), GPU texture re-upload on zone switch, and `terrain.wgsl` washout are awaiting visual confirmation on `s0`.
-> - **Buildings (`.bmd`):** `blocked: version 0x10000006 unsupported (1884/1884 s0 models)` (Phase 4 claim retracted; awaiting `sample_litmodel_1000.bmd` + hexdump from user).
+> - **Terrain rendering:** `not working: black output (Task 1)` — fixed `Rgba8UnormSrgb` crushing and double-lighting in `terrain.wgsl`; added `--export-terrain-pngs` for visual/numeric verification.
+> - **Buildings (`.bmd`):** `not working: v0x10000006 layout unknown (Task 2)` — `sample_litmodel_1000.bmd` (45,318/45,318 B) traced via `--bmd-trace` and decoded; awaiting user visual check and additional samples.
+> - **Counters:** `fixed in this round, pending user check`.
 > - See [Findings/Status.md](Findings/Status.md) for the full table.
 >
 > **No fake worlds in the default path:** The approximate sky gradient and the synthetic preview scene are **not** game worlds and have been removed from the default path.
@@ -46,6 +47,12 @@ All diagnostic and export commands are built into `forsaken-world-explorer.exe` 
 ```powershell
 # Full stage-by-stage zone dump (including first-block terrain bindings & streamed block count)
 .\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --dump-zone s0 --out reports\dump-s0.txt
+
+# Export diffuse, day/night lightmaps, unscaled lit output & all layer masks as PNGs + stats
+.\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --export-terrain-pngs s0 --out-dir reports\terrain_s0
+
+# Byte-level .bmd field trace (with optional --client to check texture resolution)
+.\forsaken-world-explorer.exe --bmd-trace sample_litmodel_1000.bmd --client "C:\Path\To\Forsaken World"
 
 # Extract a single entry from a client .pck archive
 .\forsaken-world-explorer.exe --client "C:\Path\To\Forsaken World" --extract-entry litmodels.pck "s0/1/litmodel_1000.bmd" --out sample_litmodel_1000.bmd
