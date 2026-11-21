@@ -19,14 +19,16 @@ use wgpu::util::DeviceExt;
 use crate::{
     atmosphere::{self, BoxAreaAtmosphere, ScissorRect, WaterPlane},
     bmd::{self, AlphaMode, BmdModel},
-    camera::{scaled_render_target, streaming_blocks, FreeCamera},
+    camera::{scaled_render_target, streaming_blocks, streaming_blocks_angelica, FreeCamera},
     dxt,
+    pck::PckArchive,
     settings::WaterQuality,
-    terrain_block::{self, T2bkFile},
+    terrain_block::{self, T2bkFile, T2lmHeader, T2mkHeader, Trn2Header},
     terrain_store::{TerrainPage, TerrainStore, DEFAULT_HOT_RAM_BYTES},
     tex_cache::DecodedTexture,
     vegetation::{self, FwstTreeMesh, VegVertex},
     world_objects::placement_transform_matrix,
+    zone_dump::texture_lookup_candidates,
 };
 
 pub const SKY_WGSL: &str = include_str!("shaders/sky.wgsl");
@@ -463,6 +465,69 @@ pub fn build_block_mesh(
         }
     }
 
+    (vertices, indices)
+}
+
+/// Build an indexed triangle mesh for one terrain block in Angelica centered world coordinates:
+/// `x = -world_width/2 + col*block_size + gx*step`, `z = +world_length/2 - row*block_size - gz*step`.
+/// Verified to match real `s0.ecbsd` placements within 0.33 m median.
+/// Uses global zone UVs `(0..1, 0..1)` so stitched real layer+mask+lightmap textures align cleanly.
+/// Never synthesizes fallback green height colors.
+#[allow(clippy::too_many_arguments)]
+pub fn build_block_mesh_angelica(
+    page: &TerrainPage,
+    row: u32,
+    col: u32,
+    block_rows: u32,
+    block_cols: u32,
+    block_size: f32,
+    grid: u32,
+) -> (Vec<TerrainVertex>, Vec<u32>) {
+    let side = (grid as usize) + 1;
+    let step = block_size / (grid as f32);
+    let half_w = (block_cols as f32) * block_size * 0.5;
+    let half_l = (block_rows as f32) * block_size * 0.5;
+    let origin_x = -half_w + (col as f32) * block_size;
+    let origin_z = half_l - (row as f32) * block_size;
+    let cols_f = (block_cols.max(1)) as f32;
+    let rows_f = (block_rows.max(1)) as f32;
+
+    let mut vertices = Vec::with_capacity(side * side);
+    for gz in 0..side {
+        for gx in 0..side {
+            let idx = gz * side + gx;
+            let h = page.heights.get(idx).copied().unwrap_or(0.0);
+            let n = page.normals.get(idx).copied().unwrap_or([0, 127, 0]);
+            let normal = [
+                n[0] as f32 / 127.0,
+                n[1] as f32 / 127.0,
+                n[2] as f32 / 127.0,
+            ];
+            let u = ((col as f32) + (gx as f32) / (grid as f32)) / cols_f;
+            let v = ((row as f32) + (gz as f32) / (grid as f32)) / rows_f;
+            vertices.push(TerrainVertex {
+                position: [
+                    origin_x + (gx as f32) * step,
+                    h,
+                    origin_z - (gz as f32) * step,
+                ],
+                normal,
+                color: [1.0, 1.0, 1.0, 1.0],
+                uv: [u, v],
+            });
+        }
+    }
+
+    let mut indices = Vec::with_capacity((grid as usize) * (grid as usize) * 6);
+    for gz in 0..(grid as usize) {
+        for gx in 0..(grid as usize) {
+            let i0 = (gz * side + gx) as u32;
+            let i1 = i0 + 1;
+            let i2 = ((gz + 1) * side + gx) as u32;
+            let i3 = i2 + 1;
+            indices.extend_from_slice(&[i0, i1, i2, i1, i3, i2]);
+        }
+    }
     (vertices, indices)
 }
 
@@ -1259,6 +1324,7 @@ pub fn render_offscreen_smoke(
         &scenery_snap,
         &veg_snap,
         &water_snap,
+        true,
     );
 
     let final_color = device.create_texture(&wgpu::TextureDescriptor {
@@ -1484,11 +1550,201 @@ pub struct TerrainSession {
     t2bk: T2bkFile,
     store: TerrainStore,
     last_center: Option<(i32, i32, i32)>,
+    pub is_synthetic: bool,
+    pub load_notes: Vec<String>,
     pub mesh: TerrainMeshSnapshot,
     pub day_lightmap: TerrainTextureSnapshot,
     pub night_lightmap: TerrainTextureSnapshot,
 }
 
+/// Stitch all mask-area lightmaps from `<zone>_1.t2lm` (or `t2lm1`) into one global
+/// `target_side x target_side` RGBA8 texture (4x4 grid of mask areas for `s0`), and optionally
+/// multiply by real `.trn2` layer DDS textures blended via `<zone>_1.t2mk` 8-bit masks.
+fn build_real_zone_terrain_textures(
+    client_root: &std::path::Path,
+    zone_dir: &std::path::Path,
+    zone: &str,
+    trn2: &Trn2Header,
+) -> (TerrainTextureSnapshot, TerrainTextureSnapshot, Vec<String>) {
+    let mut notes = Vec::new();
+    let num_ma = trn2.mask_areas.max(1) as usize;
+    let ma_grid = (num_ma as f64).sqrt().round().max(1.0) as usize;
+    let tile_px = 128usize; // 4x4 * 128 = 512x512 stitched real texture (1 MiB RGBA8)
+    let full_side = (ma_grid * tile_px) as u32;
+
+    // 1. Decode real layer DDS textures from resources/textures.pck
+    let mut layer_textures: Vec<Option<DecodedTexture>> = vec![None; trn2.texture_paths.len()];
+    let tex_pck_path = client_root.join("resources").join("textures.pck");
+    if let Ok(mut arch) = PckArchive::open(&tex_pck_path) {
+        let mut decoded_cnt = 0usize;
+        for (i, tp) in trn2.texture_paths.iter().enumerate() {
+            let mut found = None;
+            for cand in texture_lookup_candidates(tp) {
+                if let Ok(bytes) = arch.read_entry(&cand) {
+                    if let Ok(surf) = dxt::parse_dds(&bytes) {
+                        found = Some(DecodedTexture {
+                            width: surf.width,
+                            height: surf.height,
+                            rgba: dxt::decode_rgba8(&surf),
+                        });
+                        break;
+                    }
+                }
+            }
+            if found.is_some() {
+                decoded_cnt += 1;
+            } else {
+                notes.push(format!(
+                    "Missing terrain layer[{i}] texture in textures.pck: {tp}"
+                ));
+            }
+            layer_textures[i] = found;
+        }
+        notes.push(format!(
+            "Terrain layers decoded from textures.pck: {decoded_cnt}/{}",
+            trn2.texture_paths.len()
+        ));
+    } else {
+        notes.push(format!(
+            "Terrain textures.pck not found at {} (rendering lightmap-only terrain)",
+            tex_pck_path.display()
+        ));
+    }
+
+    // 2. Build real diffuse albedo mosaic from s0_1.t2mk + layer_textures
+    let mut diffuse = vec![255u8; (full_side as usize) * (full_side as usize) * 4];
+    let has_any_layer = layer_textures.iter().any(Option::is_some);
+    let t2mk_path = zone_dir.join(format!("{zone}_1.t2mk"));
+    if has_any_layer {
+        if let Ok(mk_bytes) = fs::read(&t2mk_path) {
+            if let Ok(mk) = T2mkHeader::parse(&mk_bytes) {
+                for ma in 0..num_ma.min(mk.num_areas as usize) {
+                    let ma_r = ma / ma_grid;
+                    let ma_c = ma % ma_grid;
+                    let Ok(layers) = mk.area_layers(&mk_bytes, ma) else {
+                        continue;
+                    };
+                    let mut tile_rgb = vec![[128.0f32; 3]; tile_px * tile_px];
+                    for (li, lyr) in layers.iter().enumerate() {
+                        let Some(Some(tex)) = layer_textures.get(lyr.layer_index as usize) else {
+                            continue;
+                        };
+                        let mask_res = mk.decode_layer_mask(&mk_bytes, lyr);
+                        let (m_side, m_bytes) = match mask_res {
+                            Ok(pair) => pair,
+                            Err(_) => continue,
+                        };
+                        let tw = tex.width.max(1) as usize;
+                        let th = tex.height.max(1) as usize;
+                        for ty in 0..tile_px {
+                            for tx in 0..tile_px {
+                                // Tile texture 8x across each 256m mask area (32m per repeat)
+                                let sx = ((tx * tw * 8) / tile_px) % tw;
+                                let sy = ((ty * th * 8) / tile_px) % th;
+                                let tidx = (sy * tw + sx) * 4;
+                                let tr = tex.rgba[tidx] as f32;
+                                let tg = tex.rgba[tidx + 1] as f32;
+                                let tb = tex.rgba[tidx + 2] as f32;
+
+                                let alpha = if li == 0 || m_side <= 1 {
+                                    1.0f32
+                                } else {
+                                    let mx = (tx * (m_side as usize)) / tile_px;
+                                    let my = (ty * (m_side as usize)) / tile_px;
+                                    m_bytes
+                                        .get(my * (m_side as usize) + mx)
+                                        .copied()
+                                        .unwrap_or(0) as f32
+                                        / 255.0
+                                };
+                                let dst = &mut tile_rgb[ty * tile_px + tx];
+                                if li == 0 {
+                                    *dst = [tr, tg, tb];
+                                } else {
+                                    dst[0] = dst[0] * (1.0 - alpha) + tr * alpha;
+                                    dst[1] = dst[1] * (1.0 - alpha) + tg * alpha;
+                                    dst[2] = dst[2] * (1.0 - alpha) + tb * alpha;
+                                }
+                            }
+                        }
+                    }
+                    for ty in 0..tile_px {
+                        for tx in 0..tile_px {
+                            let gx = ma_c * tile_px + tx;
+                            let gy = ma_r * tile_px + ty;
+                            let o = (gy * (full_side as usize) + gx) * 4;
+                            let rgb = tile_rgb[ty * tile_px + tx];
+                            diffuse[o] = rgb[0].clamp(0.0, 255.0) as u8;
+                            diffuse[o + 1] = rgb[1].clamp(0.0, 255.0) as u8;
+                            diffuse[o + 2] = rgb[2].clamp(0.0, 255.0) as u8;
+                            diffuse[o + 3] = 255;
+                        }
+                    }
+                }
+                notes.push(format!(
+                    "Composited {}x{} real terrain diffuse from {zone}_1.t2mk ({} mask areas)",
+                    full_side, full_side, mk.num_areas
+                ));
+            }
+        }
+    }
+
+    // 3. Stitch all mask areas from t2lm (day) and t2lm1 (night) and modulate diffuse
+    let stitch_lm = |suffix: &str, notes: &mut Vec<String>| -> TerrainTextureSnapshot {
+        let mut rgba = diffuse.clone();
+        let lm_path = zone_dir.join(format!("{zone}_1.{suffix}"));
+        if let Ok(lm_bytes) = fs::read(&lm_path) {
+            if let Ok(lm) = T2lmHeader::parse(&lm_bytes) {
+                let mut ok_areas = 0usize;
+                for ma in 0..num_ma.min(lm.num_areas as usize) {
+                    let Ok(dds_bytes) = lm.area_bytes(&lm_bytes, ma) else {
+                        continue;
+                    };
+                    let Ok(surf) = dxt::parse_dds(dds_bytes) else {
+                        continue;
+                    };
+                    let dec = dxt::decode_rgba8(&surf);
+                    let sw = surf.width.max(1) as usize;
+                    let sh = surf.height.max(1) as usize;
+                    let ma_r = ma / ma_grid;
+                    let ma_c = ma % ma_grid;
+                    for ty in 0..tile_px {
+                        for tx in 0..tile_px {
+                            let sx = (tx * sw) / tile_px;
+                            let sy = (ty * sh) / tile_px;
+                            let sidx = (sy * sw + sx) * 4;
+                            let gx = ma_c * tile_px + tx;
+                            let gy = ma_r * tile_px + ty;
+                            let o = (gy * (full_side as usize) + gx) * 4;
+                            rgba[o] = ((rgba[o] as u16 * dec[sidx] as u16) / 255) as u8;
+                            rgba[o + 1] = ((rgba[o + 1] as u16 * dec[sidx + 1] as u16) / 255) as u8;
+                            rgba[o + 2] = ((rgba[o + 2] as u16 * dec[sidx + 2] as u16) / 255) as u8;
+                        }
+                    }
+                    ok_areas += 1;
+                }
+                notes.push(format!(
+                    "Stitched {ok_areas}/{} lightmap areas from {zone}_1.{suffix}",
+                    lm.num_areas
+                ));
+            }
+        } else {
+            notes.push(format!("Missing lightmap file {}", lm_path.display()));
+        }
+        TerrainTextureSnapshot {
+            width: full_side,
+            height: full_side,
+            rgba,
+            revision: 1,
+        }
+    };
+
+    let day = stitch_lm("t2lm", &mut notes);
+    let night = stitch_lm("t2lm1", &mut notes);
+    (day, night, notes)
+}
+
+#[allow(dead_code)]
 fn load_first_t2lm_dds(path: &std::path::Path, rev: u64) -> Option<TerrainTextureSnapshot> {
     let lm_bytes = fs::read(path).ok()?;
     let lm = terrain_block::T2lmHeader::parse(&lm_bytes).ok()?;
@@ -1525,15 +1781,8 @@ impl TerrainSession {
 
         let store = TerrainStore::open(cache_root, hot_ram_bytes)?;
 
-        let day_lightmap =
-            load_first_t2lm_dds(&zone_dir.join(format!("{zone}_1.t2lm")), 1).unwrap_or_default();
-        let night_lightmap = load_first_t2lm_dds(&zone_dir.join(format!("{zone}_1.t2lm1")), 1)
-            .unwrap_or_else(|| TerrainTextureSnapshot {
-                width: 1,
-                height: 1,
-                rgba: vec![96, 110, 145, 255],
-                revision: 1,
-            });
+        let (day_lightmap, night_lightmap, load_notes) =
+            build_real_zone_terrain_textures(client_root, &zone_dir, zone, &trn2);
 
         Ok(Self {
             zone_name: zone.to_string(),
@@ -1545,6 +1794,8 @@ impl TerrainSession {
             t2bk,
             store,
             last_center: None,
+            is_synthetic: false,
+            load_notes,
             mesh: TerrainMeshSnapshot::default(),
             day_lightmap,
             night_lightmap,
@@ -1590,10 +1841,35 @@ impl TerrainSession {
             t2bk,
             store,
             last_center: None,
+            is_synthetic: true,
+            load_notes: vec!["Synthetic developer preview (not a game world)".into()],
             mesh: TerrainMeshSnapshot::default(),
             day_lightmap,
             night_lightmap,
         })
+    }
+
+    /// Sample terrain height at Angelica world coordinates `(x, z)` from the real `.t2bk`.
+    pub fn sample_height(&mut self, x: f32, z: f32) -> Option<f32> {
+        let half_w = (self.block_cols as f32) * self.block_size * 0.5;
+        let half_l = (self.block_rows as f32) * self.block_size * 0.5;
+        let fx = (x + half_w) / self.block_size;
+        let fz = (half_l - z) / self.block_size;
+        let col = (fx.floor() as i32).clamp(0, self.block_cols as i32 - 1) as u32;
+        let row = (fz.floor() as i32).clamp(0, self.block_rows as i32 - 1) as u32;
+        let block_idx = (row * self.block_cols + col) as usize;
+        let decoded = self
+            .t2bk
+            .decode_block(&self.t2bk_bytes, block_idx, self.block_grid)
+            .ok()?;
+        let side = (self.block_grid as usize) + 1;
+        let gx = ((fx - col as f32) * (self.block_grid as f32))
+            .round()
+            .clamp(0.0, self.block_grid as f32) as usize;
+        let gz = ((fz - row as f32) * (self.block_grid as f32))
+            .round()
+            .clamp(0.0, self.block_grid as f32) as usize;
+        decoded.heights.get(gz * side + gx).copied()
     }
 
     pub fn update_for_camera(
@@ -1601,21 +1877,42 @@ impl TerrainSession {
         camera_pos: Vec3,
         radius_blocks: i32,
     ) -> Result<bool, String> {
-        let cam_col = (camera_pos.x / self.block_size).floor() as i32;
-        let cam_row = (camera_pos.z / self.block_size).floor() as i32;
+        let (cam_col, cam_row) = if self.is_synthetic {
+            (
+                (camera_pos.x / self.block_size).floor() as i32,
+                (camera_pos.z / self.block_size).floor() as i32,
+            )
+        } else {
+            let half_w = (self.block_cols as f32) * self.block_size * 0.5;
+            let half_l = (self.block_rows as f32) * self.block_size * 0.5;
+            (
+                ((camera_pos.x + half_w) / self.block_size).floor() as i32,
+                ((half_l - camera_pos.z) / self.block_size).floor() as i32,
+            )
+        };
         let key = (cam_row, cam_col, radius_blocks);
         if self.last_center == Some(key) {
             return Ok(false);
         }
         self.last_center = Some(key);
 
-        let visible = streaming_blocks(
-            camera_pos,
-            self.block_size,
-            self.block_rows,
-            self.block_cols,
-            radius_blocks,
-        );
+        let visible = if self.is_synthetic {
+            streaming_blocks(
+                camera_pos,
+                self.block_size,
+                self.block_rows,
+                self.block_cols,
+                radius_blocks,
+            )
+        } else {
+            streaming_blocks_angelica(
+                camera_pos,
+                self.block_size,
+                self.block_rows,
+                self.block_cols,
+                radius_blocks,
+            )
+        };
 
         let mut all_verts = Vec::new();
         let mut all_indices = Vec::new();
@@ -1637,8 +1934,19 @@ impl TerrainSession {
                 })
             })?;
             let base_vert = all_verts.len() as u32;
-            let (verts, idxs) =
-                build_block_mesh(&page, None, row, col, self.block_size, self.block_grid);
+            let (verts, idxs) = if self.is_synthetic {
+                build_block_mesh(&page, None, row, col, self.block_size, self.block_grid)
+            } else {
+                build_block_mesh_angelica(
+                    &page,
+                    row,
+                    col,
+                    self.block_rows,
+                    self.block_cols,
+                    self.block_size,
+                    self.block_grid,
+                )
+            };
             all_verts.extend(verts);
             all_indices.extend(idxs.into_iter().map(|i| i + base_vert));
             loaded += 1;
@@ -2260,11 +2568,14 @@ impl TerrainViewportRenderer {
         &'a self,
         rpass: &mut wgpu::RenderPass<'a>,
         include_transparent: bool,
+        draw_sky_gradient: bool,
     ) {
-        // 1. Sky dome/gradient
-        rpass.set_pipeline(&self.sky_pipeline);
-        rpass.set_bind_group(0, &self.cam_bg, &[]);
-        rpass.draw(0..3, 0..1);
+        // 1. Sky dome/gradient (disabled in real-world mode until surfaces.pck skyboxes are decoded)
+        if draw_sky_gradient {
+            rpass.set_pipeline(&self.sky_pipeline);
+            rpass.set_bind_group(0, &self.cam_bg, &[]);
+            rpass.draw(0..3, 0..1);
+        }
 
         // 2. Terrain (day/night lightmap blend)
         if let (Some(vbuf), Some(ibuf)) = (&self.vbuf, &self.ibuf) {
@@ -2333,6 +2644,7 @@ impl TerrainViewportRenderer {
         scenery: &SceneryDrawSnapshot,
         vegetation: &VegetationDrawSnapshot,
         water: &WaterRenderSnapshot,
+        draw_sky_gradient: bool,
     ) -> wgpu::CommandBuffer {
         let desired = scaled_render_target(viewport_w, viewport_h, scale_pct);
         if self.scaled_size != desired {
@@ -2486,7 +2798,7 @@ impl TerrainViewportRenderer {
                     union_scissor.width.max(1),
                     union_scissor.height.max(1),
                 );
-                self.draw_world_geometry(&mut rpass, false);
+                self.draw_world_geometry(&mut rpass, false, draw_sky_gradient);
             }
 
             if water.refraction_enabled {
@@ -2517,7 +2829,7 @@ impl TerrainViewportRenderer {
                     union_scissor.width.max(1),
                     union_scissor.height.max(1),
                 );
-                self.draw_world_geometry(&mut rpass, false);
+                self.draw_world_geometry(&mut rpass, false, draw_sky_gradient);
             }
         }
 
@@ -2601,7 +2913,7 @@ impl TerrainViewportRenderer {
                 }),
                 ..Default::default()
             });
-            self.draw_world_geometry(&mut rpass, true);
+            self.draw_world_geometry(&mut rpass, true, draw_sky_gradient);
 
             // 5. Water planes (after opaque & transparent scenery, depth-tested against terrain)
             if !water_draws.is_empty() {

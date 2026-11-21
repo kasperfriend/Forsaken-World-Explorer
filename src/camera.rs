@@ -150,6 +150,42 @@ pub fn scaled_render_target(window_w: u32, window_h: u32, scale_pct: u16) -> (u3
     (w, h)
 }
 
+/// Select `(row, col)` terrain blocks within `radius_blocks` of `camera_pos`
+/// using Angelica centered world coordinates (`X in [-W/2, +W/2]`, `Z in [-L/2, +L/2]`,
+/// row 0 at `+L/2` descending toward `-L/2`), sorted nearest-first.
+pub fn streaming_blocks_angelica(
+    camera_pos: Vec3,
+    block_size: f32,
+    rows: u32,
+    cols: u32,
+    radius_blocks: i32,
+) -> Vec<(u32, u32)> {
+    if rows == 0 || cols == 0 || block_size <= 0.0 || !block_size.is_finite() {
+        return Vec::new();
+    }
+    let half_w = (cols as f32) * block_size * 0.5;
+    let half_l = (rows as f32) * block_size * 0.5;
+    let cam_col = ((camera_pos.x + half_w) / block_size).floor() as i32;
+    let cam_row = ((half_l - camera_pos.z) / block_size).floor() as i32;
+    let radius = radius_blocks.max(0);
+    let r_min = (cam_row - radius).max(0) as u32;
+    let r_max = (cam_row + radius).min(rows as i32 - 1).max(0) as u32;
+    let c_min = (cam_col - radius).max(0) as u32;
+    let c_max = (cam_col + radius).min(cols as i32 - 1).max(0) as u32;
+
+    let mut selected = Vec::new();
+    for r in r_min..=r_max {
+        for c in c_min..=c_max {
+            let dr = (r as i32 - cam_row) as i64;
+            let dc = (c as i32 - cam_col) as i64;
+            let dist_sq = dr * dr + dc * dc;
+            selected.push((dist_sq, r, c));
+        }
+    }
+    selected.sort_by_key(|&(d, r, c)| (d, r, c));
+    selected.into_iter().map(|(_, r, c)| (r, c)).collect()
+}
+
 /// Select `(row, col)` terrain blocks within `radius_blocks` of `camera_pos`,
 /// sorted nearest-first by squared distance to the camera.
 pub fn streaming_blocks(
