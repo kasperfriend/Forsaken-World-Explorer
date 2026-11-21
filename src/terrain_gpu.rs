@@ -21,14 +21,13 @@ use crate::{
     bmd::{self, AlphaMode, BmdModel},
     camera::{scaled_render_target, streaming_blocks, streaming_blocks_angelica, FreeCamera},
     dxt,
-    pck::PckArchive,
     settings::WaterQuality,
     terrain_block::{self, T2bkFile, T2lmHeader, T2mkHeader, Trn2Header},
     terrain_store::{TerrainPage, TerrainStore, DEFAULT_HOT_RAM_BYTES},
     tex_cache::DecodedTexture,
     vegetation::{self, FwstTreeMesh, VegVertex},
     world_objects::placement_transform_matrix,
-    zone_dump::texture_lookup_candidates,
+    zone_dump::{open_all_resource_pcks, texture_lookup_candidates_for_archive},
 };
 
 pub const SKY_WGSL: &str = include_str!("shaders/sky.wgsl");
@@ -1247,6 +1246,7 @@ pub fn render_offscreen_smoke(
     let mesh_snap = TerrainMeshSnapshot {
         vertices: all_verts,
         indices: all_indices,
+        wireframe_indices: Vec::new(),
         revision: 1,
         streamed_blocks: visible.len(),
         hot_ram_bytes: 0,
@@ -1325,6 +1325,8 @@ pub fn render_offscreen_smoke(
         &veg_snap,
         &water_snap,
         true,
+        true,
+        false,
     );
 
     let final_color = device.create_texture(&wgpu::TextureDescriptor {
@@ -1513,6 +1515,7 @@ pub fn render_offscreen_smoke(
 pub struct TerrainMeshSnapshot {
     pub vertices: Vec<TerrainVertex>,
     pub indices: Vec<u32>,
+    pub wireframe_indices: Vec<u32>,
     pub revision: u64,
     pub streamed_blocks: usize,
     pub hot_ram_bytes: usize,
@@ -1551,6 +1554,9 @@ pub struct TerrainSession {
     store: TerrainStore,
     last_center: Option<(i32, i32, i32)>,
     pub is_synthetic: bool,
+    pub terrain_layers_loaded: usize,
+    pub terrain_layers_failed: usize,
+    pub terrain_tex_bytes: usize,
     pub load_notes: Vec<String>,
     pub mesh: TerrainMeshSnapshot,
     pub day_lightmap: TerrainTextureSnapshot,
@@ -1565,131 +1571,161 @@ fn build_real_zone_terrain_textures(
     zone_dir: &std::path::Path,
     zone: &str,
     trn2: &Trn2Header,
-) -> (TerrainTextureSnapshot, TerrainTextureSnapshot, Vec<String>) {
+) -> (
+    TerrainTextureSnapshot,
+    TerrainTextureSnapshot,
+    usize,
+    usize,
+    usize,
+    Vec<String>,
+) {
     let mut notes = Vec::new();
     let num_ma = trn2.mask_areas.max(1) as usize;
     let ma_grid = (num_ma as f64).sqrt().round().max(1.0) as usize;
-    let tile_px = 128usize; // 4x4 * 128 = 512x512 stitched real texture (1 MiB RGBA8)
+    let tile_px = 128usize;
     let full_side = (ma_grid * tile_px) as u32;
 
-    // 1. Decode real layer DDS textures from resources/textures.pck
+    let (mut archives, open_errors) = open_all_resource_pcks(client_root);
+    for (name, err) in &open_errors {
+        notes.push(format!("PCK open error for {name}: {err}"));
+    }
+
     let mut layer_textures: Vec<Option<DecodedTexture>> = vec![None; trn2.texture_paths.len()];
-    let tex_pck_path = client_root.join("resources").join("textures.pck");
-    if let Ok(mut arch) = PckArchive::open(&tex_pck_path) {
-        let mut decoded_cnt = 0usize;
-        for (i, tp) in trn2.texture_paths.iter().enumerate() {
-            let mut found = None;
-            for cand in texture_lookup_candidates(tp) {
+    let mut loaded_cnt = 0usize;
+    let mut failed_cnt = 0usize;
+    let mut decoded_bytes = 0usize;
+
+    for (i, tp) in trn2.texture_paths.iter().enumerate() {
+        let mut found: Option<DecodedTexture> = None;
+        for (_, mount, arch) in archives.iter_mut() {
+            if !matches!(
+                mount.as_str(),
+                "textures" | "litmodels" | "building" | "surfaces"
+            ) {
+                continue;
+            }
+            for cand in texture_lookup_candidates_for_archive(tp, Some(mount)) {
                 if let Ok(bytes) = arch.read_entry(&cand) {
                     if let Ok(surf) = dxt::parse_dds(&bytes) {
+                        let rgba = dxt::decode_rgba8(&surf);
+                        decoded_bytes += rgba.len();
                         found = Some(DecodedTexture {
                             width: surf.width,
                             height: surf.height,
-                            rgba: dxt::decode_rgba8(&surf),
+                            rgba,
                         });
                         break;
                     }
                 }
             }
             if found.is_some() {
-                decoded_cnt += 1;
-            } else {
-                notes.push(format!(
-                    "Missing terrain layer[{i}] texture in textures.pck: {tp}"
-                ));
+                break;
             }
-            layer_textures[i] = found;
         }
-        notes.push(format!(
-            "Terrain layers decoded from textures.pck: {decoded_cnt}/{}",
-            trn2.texture_paths.len()
-        ));
-    } else {
-        notes.push(format!(
-            "Terrain textures.pck not found at {} (rendering lightmap-only terrain)",
-            tex_pck_path.display()
-        ));
+        if found.is_some() {
+            loaded_cnt += 1;
+        } else {
+            failed_cnt += 1;
+            notes.push(format!("Missing terrain layer[{i}] texture: `{tp}`"));
+        }
+        layer_textures[i] = found;
+    }
+    notes.push(format!(
+        "Terrain layer textures: loaded={loaded_cnt}, failed={failed_cnt}, bytes={decoded_bytes}"
+    ));
+
+    // No grey fallback: if 0 real layer textures resolved, do NOT synthesize a fallback diffuse.
+    if loaded_cnt == 0 {
+        let empty = TerrainTextureSnapshot {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 0],
+            revision: 1,
+        };
+        return (
+            empty.clone(),
+            empty,
+            loaded_cnt,
+            failed_cnt,
+            decoded_bytes,
+            notes,
+        );
     }
 
-    // 2. Build real diffuse albedo mosaic from s0_1.t2mk + layer_textures
-    let mut diffuse = vec![255u8; (full_side as usize) * (full_side as usize) * 4];
-    let has_any_layer = layer_textures.iter().any(Option::is_some);
+    let mut diffuse = vec![0u8; (full_side as usize) * (full_side as usize) * 4];
     let t2mk_path = zone_dir.join(format!("{zone}_1.t2mk"));
-    if has_any_layer {
-        if let Ok(mk_bytes) = fs::read(&t2mk_path) {
-            if let Ok(mk) = T2mkHeader::parse(&mk_bytes) {
-                for ma in 0..num_ma.min(mk.num_areas as usize) {
-                    let ma_r = ma / ma_grid;
-                    let ma_c = ma % ma_grid;
-                    let Ok(layers) = mk.area_layers(&mk_bytes, ma) else {
+    if let Ok(mk_bytes) = fs::read(&t2mk_path) {
+        if let Ok(mk) = T2mkHeader::parse(&mk_bytes) {
+            for ma in 0..num_ma.min(mk.num_areas as usize) {
+                let ma_r = ma / ma_grid;
+                let ma_c = ma % ma_grid;
+                let Ok(layers) = mk.area_layers(&mk_bytes, ma) else {
+                    continue;
+                };
+                let mut tile_rgb = vec![[0.0f32; 3]; tile_px * tile_px];
+                let mut tile_has_base = false;
+                for (li, lyr) in layers.iter().enumerate() {
+                    // Missing layer texture is skipped (never painted with a fallback color)
+                    let Some(Some(tex)) = layer_textures.get(lyr.layer_index as usize) else {
                         continue;
                     };
-                    let mut tile_rgb = vec![[128.0f32; 3]; tile_px * tile_px];
-                    for (li, lyr) in layers.iter().enumerate() {
-                        let Some(Some(tex)) = layer_textures.get(lyr.layer_index as usize) else {
-                            continue;
-                        };
-                        let mask_res = mk.decode_layer_mask(&mk_bytes, lyr);
-                        let (m_side, m_bytes) = match mask_res {
-                            Ok(pair) => pair,
-                            Err(_) => continue,
-                        };
-                        let tw = tex.width.max(1) as usize;
-                        let th = tex.height.max(1) as usize;
-                        for ty in 0..tile_px {
-                            for tx in 0..tile_px {
-                                // Tile texture 8x across each 256m mask area (32m per repeat)
-                                let sx = ((tx * tw * 8) / tile_px) % tw;
-                                let sy = ((ty * th * 8) / tile_px) % th;
-                                let tidx = (sy * tw + sx) * 4;
-                                let tr = tex.rgba[tidx] as f32;
-                                let tg = tex.rgba[tidx + 1] as f32;
-                                let tb = tex.rgba[tidx + 2] as f32;
+                    let Ok((m_side, m_bytes)) = mk.decode_layer_mask(&mk_bytes, lyr) else {
+                        continue;
+                    };
+                    let tw = tex.width.max(1) as usize;
+                    let th = tex.height.max(1) as usize;
+                    for ty in 0..tile_px {
+                        for tx in 0..tile_px {
+                            let sx = ((tx * tw * 8) / tile_px) % tw;
+                            let sy = ((ty * th * 8) / tile_px) % th;
+                            let tidx = (sy * tw + sx) * 4;
+                            let tr = tex.rgba[tidx] as f32;
+                            let tg = tex.rgba[tidx + 1] as f32;
+                            let tb = tex.rgba[tidx + 2] as f32;
 
-                                let alpha = if li == 0 || m_side <= 1 {
-                                    1.0f32
-                                } else {
-                                    let mx = (tx * (m_side as usize)) / tile_px;
-                                    let my = (ty * (m_side as usize)) / tile_px;
-                                    m_bytes
-                                        .get(my * (m_side as usize) + mx)
-                                        .copied()
-                                        .unwrap_or(0) as f32
-                                        / 255.0
-                                };
-                                let dst = &mut tile_rgb[ty * tile_px + tx];
-                                if li == 0 {
-                                    *dst = [tr, tg, tb];
-                                } else {
-                                    dst[0] = dst[0] * (1.0 - alpha) + tr * alpha;
-                                    dst[1] = dst[1] * (1.0 - alpha) + tg * alpha;
-                                    dst[2] = dst[2] * (1.0 - alpha) + tb * alpha;
-                                }
+                            let alpha = if !tile_has_base || li == 0 || m_side <= 1 {
+                                1.0f32
+                            } else {
+                                let mx = (tx * (m_side as usize)) / tile_px;
+                                let my = (ty * (m_side as usize)) / tile_px;
+                                m_bytes
+                                    .get(my * (m_side as usize) + mx)
+                                    .copied()
+                                    .unwrap_or(0) as f32
+                                    / 255.0
+                            };
+                            let dst = &mut tile_rgb[ty * tile_px + tx];
+                            if !tile_has_base {
+                                *dst = [tr, tg, tb];
+                            } else {
+                                dst[0] = dst[0] * (1.0 - alpha) + tr * alpha;
+                                dst[1] = dst[1] * (1.0 - alpha) + tg * alpha;
+                                dst[2] = dst[2] * (1.0 - alpha) + tb * alpha;
                             }
                         }
                     }
-                    for ty in 0..tile_px {
-                        for tx in 0..tile_px {
-                            let gx = ma_c * tile_px + tx;
-                            let gy = ma_r * tile_px + ty;
-                            let o = (gy * (full_side as usize) + gx) * 4;
-                            let rgb = tile_rgb[ty * tile_px + tx];
-                            diffuse[o] = rgb[0].clamp(0.0, 255.0) as u8;
-                            diffuse[o + 1] = rgb[1].clamp(0.0, 255.0) as u8;
-                            diffuse[o + 2] = rgb[2].clamp(0.0, 255.0) as u8;
-                            diffuse[o + 3] = 255;
-                        }
+                    tile_has_base = true;
+                }
+                for ty in 0..tile_px {
+                    for tx in 0..tile_px {
+                        let gx = ma_c * tile_px + tx;
+                        let gy = ma_r * tile_px + ty;
+                        let o = (gy * (full_side as usize) + gx) * 4;
+                        let rgb = tile_rgb[ty * tile_px + tx];
+                        diffuse[o] = rgb[0].clamp(0.0, 255.0) as u8;
+                        diffuse[o + 1] = rgb[1].clamp(0.0, 255.0) as u8;
+                        diffuse[o + 2] = rgb[2].clamp(0.0, 255.0) as u8;
+                        diffuse[o + 3] = 255;
                     }
                 }
-                notes.push(format!(
-                    "Composited {}x{} real terrain diffuse from {zone}_1.t2mk ({} mask areas)",
-                    full_side, full_side, mk.num_areas
-                ));
             }
+            notes.push(format!(
+                "Composited {full_side}x{full_side} real terrain diffuse from {zone}_1.t2mk ({} mask areas)",
+                mk.num_areas
+            ));
         }
     }
 
-    // 3. Stitch all mask areas from t2lm (day) and t2lm1 (night) and modulate diffuse
     let stitch_lm = |suffix: &str, notes: &mut Vec<String>| -> TerrainTextureSnapshot {
         let mut rgba = diffuse.clone();
         let lm_path = zone_dir.join(format!("{zone}_1.{suffix}"));
@@ -1741,7 +1777,7 @@ fn build_real_zone_terrain_textures(
 
     let day = stitch_lm("t2lm", &mut notes);
     let night = stitch_lm("t2lm1", &mut notes);
-    (day, night, notes)
+    (day, night, loaded_cnt, failed_cnt, decoded_bytes, notes)
 }
 
 #[allow(dead_code)]
@@ -1781,8 +1817,14 @@ impl TerrainSession {
 
         let store = TerrainStore::open(cache_root, hot_ram_bytes)?;
 
-        let (day_lightmap, night_lightmap, load_notes) =
-            build_real_zone_terrain_textures(client_root, &zone_dir, zone, &trn2);
+        let (
+            day_lightmap,
+            night_lightmap,
+            terrain_layers_loaded,
+            terrain_layers_failed,
+            terrain_tex_bytes,
+            load_notes,
+        ) = build_real_zone_terrain_textures(client_root, &zone_dir, zone, &trn2);
 
         Ok(Self {
             zone_name: zone.to_string(),
@@ -1795,6 +1837,9 @@ impl TerrainSession {
             store,
             last_center: None,
             is_synthetic: false,
+            terrain_layers_loaded,
+            terrain_layers_failed,
+            terrain_tex_bytes,
             load_notes,
             mesh: TerrainMeshSnapshot::default(),
             day_lightmap,
@@ -1842,6 +1887,9 @@ impl TerrainSession {
             store,
             last_center: None,
             is_synthetic: true,
+            terrain_layers_loaded: 1,
+            terrain_layers_failed: 0,
+            terrain_tex_bytes: 64,
             load_notes: vec!["Synthetic developer preview (not a game world)".into()],
             mesh: TerrainMeshSnapshot::default(),
             day_lightmap,
@@ -1952,9 +2000,14 @@ impl TerrainSession {
             loaded += 1;
         }
 
+        let mut wireframe_indices = Vec::with_capacity(all_indices.len() * 2);
+        for tri in all_indices.as_chunks::<3>().0 {
+            wireframe_indices.extend_from_slice(&[tri[0], tri[1], tri[1], tri[2], tri[2], tri[0]]);
+        }
         self.mesh = TerrainMeshSnapshot {
             vertices: all_verts,
             indices: all_indices,
+            wireframe_indices,
             revision: self.mesh.revision.wrapping_add(1),
             streamed_blocks: loaded,
             hot_ram_bytes: self.store.stats().owned_ram_bytes,
@@ -1976,6 +2029,7 @@ struct GpuSceneryBatch {
 pub struct TerrainViewportRenderer {
     sky_pipeline: wgpu::RenderPipeline,
     terrain_pipeline: wgpu::RenderPipeline,
+    terrain_wireframe_pipeline: wgpu::RenderPipeline,
     scenery_opaque_pipeline: wgpu::RenderPipeline,
     scenery_transparent_pipeline: wgpu::RenderPipeline,
     vegetation_pipeline: wgpu::RenderPipeline,
@@ -2009,7 +2063,9 @@ pub struct TerrainViewportRenderer {
     scaled_size: (u32, u32),
     vbuf: Option<wgpu::Buffer>,
     ibuf: Option<wgpu::Buffer>,
+    wibuf: Option<wgpu::Buffer>,
     index_count: u32,
+    wireframe_index_count: u32,
     mesh_revision: u64,
     opaque_batches: Vec<GpuSceneryBatch>,
     transparent_batches: Vec<GpuSceneryBatch>,
@@ -2168,6 +2224,68 @@ impl TerrainViewportRenderer {
             cache: None,
         });
 
+        let terrain_wireframe_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("live-terrain-wireframe-pipeline"),
+                layout: Some(&terrain_layout),
+                vertex: wgpu::VertexState {
+                    module: &terrain_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<TerrainVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 24,
+                                shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 40,
+                                shader_location: 3,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &terrain_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            });
+
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("live-blit-shader"),
             source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
@@ -2222,6 +2340,7 @@ impl TerrainViewportRenderer {
         Self {
             sky_pipeline,
             terrain_pipeline,
+            terrain_wireframe_pipeline,
             scenery_opaque_pipeline,
             scenery_transparent_pipeline,
             vegetation_pipeline,
@@ -2255,7 +2374,9 @@ impl TerrainViewportRenderer {
             scaled_size: (64, 64),
             vbuf: None,
             ibuf: None,
+            wibuf: None,
             index_count: 0,
+            wireframe_index_count: 0,
             mesh_revision: 0,
             opaque_batches: Vec::new(),
             transparent_batches: Vec::new(),
@@ -2569,6 +2690,8 @@ impl TerrainViewportRenderer {
         rpass: &mut wgpu::RenderPass<'a>,
         include_transparent: bool,
         draw_sky_gradient: bool,
+        terrain_has_real_textures: bool,
+        terrain_wireframe_debug: bool,
     ) {
         // 1. Sky dome/gradient (disabled in real-world mode until surfaces.pck skyboxes are decoded)
         if draw_sky_gradient {
@@ -2577,15 +2700,29 @@ impl TerrainViewportRenderer {
             rpass.draw(0..3, 0..1);
         }
 
-        // 2. Terrain (day/night lightmap blend)
-        if let (Some(vbuf), Some(ibuf)) = (&self.vbuf, &self.ibuf) {
-            if self.index_count > 0 {
-                rpass.set_pipeline(&self.terrain_pipeline);
-                rpass.set_bind_group(0, &self.cam_bg, &[]);
-                rpass.set_bind_group(1, &self.lm_bg, &[]);
-                rpass.set_vertex_buffer(0, vbuf.slice(..));
-                rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..self.index_count, 0, 0..1);
+        // 2. Terrain: draw textured solid ONLY when real layer textures resolved;
+        //    otherwise draw nothing unless explicit wireframe debug mode is enabled.
+        if terrain_has_real_textures {
+            if let (Some(vbuf), Some(ibuf)) = (&self.vbuf, &self.ibuf) {
+                if self.index_count > 0 {
+                    rpass.set_pipeline(&self.terrain_pipeline);
+                    rpass.set_bind_group(0, &self.cam_bg, &[]);
+                    rpass.set_bind_group(1, &self.lm_bg, &[]);
+                    rpass.set_vertex_buffer(0, vbuf.slice(..));
+                    rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..self.index_count, 0, 0..1);
+                }
+            }
+        } else if terrain_wireframe_debug {
+            if let (Some(vbuf), Some(wibuf)) = (&self.vbuf, &self.wibuf) {
+                if self.wireframe_index_count > 0 {
+                    rpass.set_pipeline(&self.terrain_wireframe_pipeline);
+                    rpass.set_bind_group(0, &self.cam_bg, &[]);
+                    rpass.set_bind_group(1, &self.lm_bg, &[]);
+                    rpass.set_vertex_buffer(0, vbuf.slice(..));
+                    rpass.set_index_buffer(wibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(0..self.wireframe_index_count, 0, 0..1);
+                }
             }
         }
 
@@ -2645,6 +2782,8 @@ impl TerrainViewportRenderer {
         vegetation: &VegetationDrawSnapshot,
         water: &WaterRenderSnapshot,
         draw_sky_gradient: bool,
+        terrain_has_real_textures: bool,
+        terrain_wireframe_debug: bool,
     ) -> wgpu::CommandBuffer {
         let desired = scaled_render_target(viewport_w, viewport_h, scale_pct);
         if self.scaled_size != desired {
@@ -2708,7 +2847,9 @@ impl TerrainViewportRenderer {
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
                 self.vbuf = None;
                 self.ibuf = None;
+                self.wibuf = None;
                 self.index_count = 0;
+                self.wireframe_index_count = 0;
             } else {
                 self.vbuf = Some(
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2725,6 +2866,19 @@ impl TerrainViewportRenderer {
                     }),
                 );
                 self.index_count = mesh.indices.len() as u32;
+                if mesh.wireframe_indices.is_empty() {
+                    self.wibuf = None;
+                    self.wireframe_index_count = 0;
+                } else {
+                    self.wibuf = Some(device.create_buffer_init(
+                        &wgpu::util::BufferInitDescriptor {
+                            label: Some("live-terrain-wibuf"),
+                            contents: bytemuck::cast_slice(&mesh.wireframe_indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        },
+                    ));
+                    self.wireframe_index_count = mesh.wireframe_indices.len() as u32;
+                }
             }
             self.mesh_revision = mesh.revision;
         }
@@ -2798,7 +2952,13 @@ impl TerrainViewportRenderer {
                     union_scissor.width.max(1),
                     union_scissor.height.max(1),
                 );
-                self.draw_world_geometry(&mut rpass, false, draw_sky_gradient);
+                self.draw_world_geometry(
+                    &mut rpass,
+                    false,
+                    draw_sky_gradient,
+                    terrain_has_real_textures,
+                    terrain_wireframe_debug,
+                );
             }
 
             if water.refraction_enabled {
@@ -2829,7 +2989,13 @@ impl TerrainViewportRenderer {
                     union_scissor.width.max(1),
                     union_scissor.height.max(1),
                 );
-                self.draw_world_geometry(&mut rpass, false, draw_sky_gradient);
+                self.draw_world_geometry(
+                    &mut rpass,
+                    false,
+                    draw_sky_gradient,
+                    terrain_has_real_textures,
+                    terrain_wireframe_debug,
+                );
             }
         }
 
@@ -2913,7 +3079,13 @@ impl TerrainViewportRenderer {
                 }),
                 ..Default::default()
             });
-            self.draw_world_geometry(&mut rpass, true, draw_sky_gradient);
+            self.draw_world_geometry(
+                &mut rpass,
+                true,
+                draw_sky_gradient,
+                terrain_has_real_textures,
+                terrain_wireframe_debug,
+            );
 
             // 5. Water planes (after opaque & transparent scenery, depth-tested against terrain)
             if !water_draws.is_empty() {
