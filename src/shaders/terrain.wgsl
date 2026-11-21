@@ -58,14 +58,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let dn = clamp(cam.sun_dir.w, 0.0, 1.0);
     let lm = mix(day_lm, night_lm, dn);
 
-    let n = normalize(in.world_normal);
-    let sun = normalize(cam.sun_dir.xyz);
-    let ndotl = max(dot(n, sun), 0.0);
-    let day_hemi = 0.40 + 0.60 * ndotl;
-    let night_hemi = 0.22 + 0.25 * ndotl;
-    let shade = mix(day_hemi, night_hemi, dn);
-
-    let base_rgb = in.color.rgb * lm * shade;
+    // Unscaled diffuse * lightmap product (lm already carries composited terrain diffuse * t2lm/t2lm1).
+    // Do not multiply by an extra synthetic hemisphere shade on top of the baked client lightmap.
+    let _n = normalize(in.world_normal);
+    let base_rgb = in.color.rgb * lm;
 
     var final_rgb = base_rgb;
     if (cam.fog_params.z > 0.5) {
