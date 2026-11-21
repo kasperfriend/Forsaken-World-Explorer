@@ -274,11 +274,16 @@ impl T2bkFile {
                 }
                 data[nor_start..diff_start].to_vec()
             };
-            let nor_ver = u32le(&nor_bytes, 0)?;
+            // Verified byte-for-byte on real maps/s0/s0_1.t2bk and maps/login/login_1.t2bk:
+            // offset 0 is a 1-byte u8 version/flag (0x01), offsets 1..4 are 3 bytes of
+            // uninitialized MSVC struct padding (0x00,0x00,0x00 in s0_1.t2bk; 0x1a,0x12,0x4c
+            // = 0x4c121a01 in login_1.t2bk), and offsets 4..8 are u32le vertex count.
+            let nor_ver = nor_bytes[0];
+            let nor_raw_hdr = u32le(&nor_bytes, 0)?;
             let nor_cnt = u32le(&nor_bytes, 4)? as usize;
             if nor_ver != 1 || nor_cnt != verts {
                 return Err(format!(
-                    "unexpected polar normal header (ver={nor_ver}, cnt={nor_cnt}, expected {verts})"
+                    "block {index}: unexpected polar normal header (ver={nor_ver}, raw_hdr={nor_raw_hdr:#010x}, cnt={nor_cnt}, expected {verts})"
                 ));
             }
             decode_polar_normals(&nor_bytes[8..])
@@ -686,5 +691,71 @@ mod tests {
             }
             assert!(T2bkFile::parse_header(&buf).is_err());
         }
+    }
+
+    #[test]
+    fn polar_normal_header_with_real_login_1_t2bk_padding_bytes() {
+        // Exact first 64 bytes of decompressed polar normal stream from real
+        // maps/login/login_1.t2bk block 0 (ver=6, num_blocks=256, flags=0x35):
+        // byte 0 = 0x01 (version), bytes 1..4 = 0x1a 0x12 0x4c (MSVC struct padding,
+        // previously misread as u32le 1276254721), bytes 4..8 = 0x00000441 (1089 verts).
+        const REAL_LOGIN_1_T2BK_BLK0_NOR_64: [u8; 64] = [
+            0x01, 0x1a, 0x12, 0x4c, 0x41, 0x04, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x40, 0x02,
+            0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+            0x40, 0x01, 0x40, 0x04, 0x40, 0x08, 0x40, 0x0c, 0x40, 0x11, 0x40, 0x13, 0x40, 0x15,
+            0x40, 0x14, 0x40, 0x12, 0x40, 0x0f, 0x40, 0x0b,
+        ];
+        assert_eq!(REAL_LOGIN_1_T2BK_BLK0_NOR_64[0], 1);
+        assert_eq!(
+            u32le(&REAL_LOGIN_1_T2BK_BLK0_NOR_64, 0).unwrap(),
+            1_276_254_721
+        );
+        assert_eq!(u32le(&REAL_LOGIN_1_T2BK_BLK0_NOR_64, 4).unwrap(), 1089);
+
+        // Build a full 32x32-grid (1089-vertex) uncompressed polar normal block using
+        // the exact 64-byte real header + payload prefix and verify decode_block succeeds.
+        let grid = 32u32;
+        let verts = 1089usize;
+        let mut nor_raw = vec![0u8; 8 + verts * 2];
+        nor_raw[..64].copy_from_slice(&REAL_LOGIN_1_T2BK_BLK0_NOR_64);
+        let hei_raw = vec![0u8; verts * 4];
+
+        let table_end = 16usize + 4;
+        let mut out = Vec::new();
+        out.extend_from_slice(&T2BK_MAGIC.to_le_bytes());
+        out.extend_from_slice(&6u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(FLAG_POLAR_NORMALS as u32).to_le_bytes());
+        out.extend_from_slice(&(table_end as u32).to_le_bytes());
+        // 36-byte block v6 header
+        out.extend_from_slice(&0i16.to_le_bytes()); // mask_area
+        out.extend_from_slice(&0i16.to_le_bytes()); // pad
+        out.extend_from_slice(&0i16.to_le_bytes()); // row
+        out.extend_from_slice(&0i16.to_le_bytes()); // col
+        out.extend_from_slice(&0.25f32.to_le_bytes()); // lod_scale
+        out.extend_from_slice(&1u32.to_le_bytes()); // flags
+        out.extend_from_slice(&(hei_raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(nor_raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&hei_raw);
+        out.extend_from_slice(&nor_raw);
+
+        let t2bk = T2bkFile::parse_header(&out).expect("parse header");
+        let blk = t2bk
+            .decode_block(&out, 0, grid)
+            .expect("decode block with login_1.t2bk padding bytes");
+        assert_eq!(blk.heights.len(), verts);
+        assert_eq!(blk.normals.len(), verts);
+        // Verify first few decoded quantized normals are non-zero unit-ish vectors
+        let n0 = blk.normals[0];
+        let mag0 =
+            ((n0[0] as f32).powi(2) + (n0[1] as f32).powi(2) + (n0[2] as f32).powi(2)).sqrt();
+        assert!(
+            mag0 > 100.0 && mag0 <= 130.0,
+            "unexpected normal magnitude {mag0}"
+        );
     }
 }

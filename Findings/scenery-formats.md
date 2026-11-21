@@ -12,7 +12,11 @@ This document records the binary formats used for static scenery and building pl
 
 ## 2. Static Mesh Format (`.bmd` — `CELBrushBuilding` + `A3DLitModel` + `A3DLitMesh`)
 
-**Evidence:** `CELBrushBuilding` container header (`0x80000001` + `bCollideOnly`) and collision hull trailer verified directly from `EL_BrushBuilding.cpp`. Inner `A3DLitModel` / `A3DLitMesh` layouts are covered by CI synthetic fixtures for every supported version (`src/bmd.rs::version_matrix_tests`).
+**Evidence & Source-Tree Search (`ForsakenWorldv260ClientSource`):**
+- `EL_BrushBuilding.cpp` (verified `CELBrushBuilding` container wrapper `0x80000001` + `bCollideOnly` and collision hull trailer) and `EC_Ornament.cpp` (verified `.lmd` -> `.bmd` rewrite) are present in `SMElement/`.
+- Angelica3D engine source (`A3DLitModel.cpp` / `A3DLitMesh`) is **not** included in `ForsakenWorldv260ClientSource/SMElement/` (only game-side client/editor code is present; Angelica3D is linked via precompiled headers/libs).
+- Real client run (`dump-s0.txt` on `Forsaken World 0.525 Client`) confirmed that **1,884 / 1,884** `s0` placements resolve in `litmodels.pck` and use `A3DLitMesh` version `0x10000006` (also observed in `login` in `fw-explorer-1795292949842-21708.log`).
+- Per strict no-guessing rules, `src/bmd.rs` keeps `0x10000002`–`0x10000005` unchanged and returns `BmdError::UnsupportedMeshVersion { version: 0x10000006, offset }` with the exact byte offset until real `sample_litmodel_1000.bmd` bytes and hexdump are supplied by the user via `--extract-entry` and `--hexdump`.
 
 ### Supported Version Matrix (CI Synthetic Fixtures vs Real Corpus)
 
@@ -20,18 +24,18 @@ This document records the binary formats used for static scenery and building pl
 | --- | --- | --- | --- |
 | `CELBrushBuilding` `0x80000001` (`bCollideOnly`) | Tested (`src/bmd.rs`) | Verified in `EL_BrushBuilding.cpp` | Optional 5-byte prefix after `MOXB` |
 | `A3DLitModel` `0x10000001` | Tested (`src/bmd.rs`) | Unverified on full archive | Identical 48-byte transform header |
-| `A3DLitModel` `0x10000002` | Tested (`src/bmd.rs`) | Unverified on full archive | Identical 48-byte transform header |
+| `A3DLitModel` `0x10000002` | Tested (`src/bmd.rs`) | Observed in `dump-s0.txt` | Identical 48-byte transform header |
 | `A3DLitMesh` `0x10000002` | Tested (`src/bmd.rs`) | Unverified on full archive | 28 B vertex stride, no day/night light arrays, no material tail |
 | `A3DLitMesh` `0x10000003` | Tested (`src/bmd.rs`) | Unverified on full archive | 28 B vertex stride, day/night light arrays, no material tail |
 | `A3DLitMesh` `0x10000004` | Tested (`src/bmd.rs`) | Unverified on full archive | 24 B vertex stride, day/night light arrays, no material tail |
 | `A3DLitMesh` `0x10000005` | Tested (`src/bmd.rs`) | Unverified on full archive | 24 B vertex stride, day/night light arrays, 69 B + name material tail |
-| `A3DLitMesh` `0x10000001` / `>= 0x10000006` | Rejected cleanly (`UnsupportedMeshVersion`) | Unverified on full archive | Returned as typed `BmdError`, never panics |
+| `A3DLitMesh` `0x10000006` | Rejected cleanly with byte offset (`UnsupportedMeshVersion`) | **Observed on 1,884 / 1,884 `s0` models (`dump-s0.txt`)** | **Blocked:** awaiting `sample_litmodel_1000.bmd` + hexdump from user (no guessed fields) |
 
 ## 3. Alpha Handling & Phase 5 Transparent Scenery
 
 - **Opaque & alpha-tested submeshes:** Drawn in the opaque pass (`alpha_cutoff = 0.0` or `0.5` discard) with depth test and depth write enabled.
-- **Transparent / alpha-blended submeshes (`AlphaMode::TransparentDeferred`):** Now drawn in **Phase 5** after the opaque pass and before water, sorted back-to-front per instance and per submesh, with alpha blending enabled and depth write disabled (toggled via **Settings → World → Transparent scenery**).
-- **Per-vertex day/night lighting:** Submeshes with `v3`–`v5` vertex light arrays blend `day_diffuse` and `night_diffuse` using the `EC_SunMoon` time-of-day `dn_factor`. Meshes without vertex light arrays (`v2`) fall back to directional + hemisphere lighting and are labeled `approximate` in Diagnostics.
+- **Transparent / alpha-blended submeshes (`AlphaMode::TransparentDeferred`):** Sorted back-to-front per instance and per submesh, with alpha blending enabled and depth write disabled (toggled via **Settings → World → Transparent scenery**).
+- **Per-vertex day/night lighting:** Submeshes with `v3`–`v5` vertex light arrays blend `day_diffuse` and `night_diffuse` using the `EC_SunMoon` time-of-day `dn_factor`.
 
 ## Placement Height & Axis-Mapping Verification (`maps/s0/`)
 

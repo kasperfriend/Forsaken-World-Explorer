@@ -65,7 +65,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let night_hemi = 0.22 + 0.25 * ndotl;
     let shade = mix(day_hemi, night_hemi, dn);
 
-    let base_rgb = in.color.rgb * mix(vec3<f32>(1.0), lm, 0.70) * shade;
+    let base_rgb = in.color.rgb * lm * shade;
 
     var final_rgb = base_rgb;
     if (cam.fog_params.z > 0.5) {

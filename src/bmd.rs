@@ -15,7 +15,7 @@ pub const LITMODEL_VERSION_2: u32 = 0x1000_0002;
 pub enum BmdError {
     MissingMagic,
     UnsupportedModelVersion(u32),
-    UnsupportedMeshVersion(u32),
+    UnsupportedMeshVersion { version: u32, offset: usize },
     Truncated(&'static str),
     InvalidFloat(&'static str),
     InvalidString(&'static str),
@@ -28,7 +28,10 @@ impl fmt::Display for BmdError {
         match self {
             Self::MissingMagic => write!(f, "missing MOXB binary AFile marker"),
             Self::UnsupportedModelVersion(v) => write!(f, "unsupported A3DLitModel version {v:#x}"),
-            Self::UnsupportedMeshVersion(v) => write!(f, "unsupported A3DLitMesh version {v:#x}"),
+            Self::UnsupportedMeshVersion { version, offset } => write!(
+                f,
+                "unsupported A3DLitMesh version {version:#x} at byte offset {offset}"
+            ),
             Self::Truncated(ctx) => write!(f, "truncated BMD data ({ctx})"),
             Self::InvalidFloat(ctx) => write!(f, "non-finite float in BMD ({ctx})"),
             Self::InvalidString(ctx) => write!(f, "invalid GBK string in BMD ({ctx})"),
@@ -146,11 +149,17 @@ impl BmdModel {
 
         let mut submeshes = Vec::with_capacity(mesh_count);
         for _ in 0..mesh_count {
+            let ver_offset = p;
             let ver = read_u32(data, p, "mesh_version")?;
             p += 4;
             match ver {
                 0x1000_0002..=0x1000_0005 => {}
-                other => return Err(BmdError::UnsupportedMeshVersion(other)),
+                other => {
+                    return Err(BmdError::UnsupportedMeshVersion {
+                        version: other,
+                        offset: ver_offset,
+                    })
+                }
             }
 
             let name = read_fixed_gbk(data, p, 64, "mesh_name")?;
@@ -752,7 +761,20 @@ mod version_matrix_tests {
         let bad = build_minimal_bmd_for_version(false, LITMODEL_VERSION_2, 0x1000_0001);
         assert_eq!(
             BmdModel::parse(&bad),
-            Err(BmdError::UnsupportedMeshVersion(0x1000_0001))
+            Err(BmdError::UnsupportedMeshVersion {
+                version: 0x1000_0001,
+                offset: 60
+            })
+        );
+        // Observed real-client version 0x10000006 must fail cleanly with exact byte offset
+        // until verified against real sample_litmodel_1000.bmd bytes.
+        let v6 = build_minimal_bmd_for_version(false, LITMODEL_VERSION_2, 0x1000_0006);
+        assert_eq!(
+            BmdModel::parse(&v6),
+            Err(BmdError::UnsupportedMeshVersion {
+                version: 0x1000_0006,
+                offset: 60
+            })
         );
     }
 }
