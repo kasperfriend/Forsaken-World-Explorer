@@ -32,10 +32,11 @@ jobs:
         run: cargo test --locked
       - name: Run dependency-free CPU core checks
         run: sh tools/check-core.sh
-      - name: Run --self-test and --smoke-launch on Linux build
+      - name: Run --self-test, --smoke-launch, and terrain-memory-check on Linux
         run: |
           cargo run --locked --bin forsaken-world-explorer -- --self-test
           cargo run --locked --bin forsaken-world-explorer -- --smoke-launch
+          cargo run --locked --bin terrain-memory-check
 
   dependency-audit:
     name: Dependency security audit
@@ -57,10 +58,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      - name: Run library and viewer unit tests
+      - name: Run library, viewer, and memory-budget tests
         run: |
           cargo test --locked --lib
           cargo test --locked --bin forsaken-world-explorer
+          cargo run --locked --bin terrain-memory-check
       - name: Check all binary targets
         run: cargo check --locked --bins
       - name: Build Windows release executable

@@ -2,7 +2,7 @@
 
 An experimental, GPU-based, free-flight viewer for a user-owned **Forsaken World** client, recreated from the architecture and principles of [`kasperfriend/Perfect-World-Explorer`](https://github.com/kasperfriend/Perfect-World-Explorer). It reads world data from a client you already own; it is **not** a game client, editor, server, or gameplay implementation.
 
-> **Work in progress (Phase 1 — Client Discovery & Archive Layer):** Client layout validation (`update/pem.exe`, `resources/`, `maps/`) and the verified Forsaken World `.pck`/`.pkx` archive reader + `pck-survey` tool are implemented and CPU-verified. No 3D world rendering or visual parity exists yet; all CI checks run without a GPU. See [Findings/README.md](Findings/README.md) and [Findings/Status.md](Findings/Status.md) for evidence, limits, and open gates.
+> **Work in progress (Phase 2 — CPU World Decoders):** Client layout validation, verified `.pck`/`.pkx` archive reading, CPU terrain/lightmap/mask/placement/DDS decoders, and the RAM-first `cache/terrain-v1` (2 MiB default hot set) are implemented and CPU-verified. No 3D GPU rendering or visual parity exists yet; all CI checks run without a GPU. See [Findings/README.md](Findings/README.md) and [Findings/Status.md](Findings/Status.md) for evidence, limits, and open gates.
 
 ## Legal & Non-Affiliation Notice
 
@@ -17,8 +17,8 @@ An experimental, GPU-based, free-flight viewer for a user-owned **Forsaken World
 | --- | --- | --- |
 | Phase 0 | Build/CI skeleton, settings persistence, window/menu, `--self-test`, `--smoke-launch`, Drive client inventory | `verified-cpu` |
 | Phase 1 | Client folder detection (`update/pem.exe`), verified `.pck`/`.pkx` archive reader, `pck-survey` tool | `verified-cpu` |
-| Phase 2 | CPU world decoders (terrain, placements, static meshes, DDS) | `not-started` |
-| Phase 3–8 | GPU rendering, scenery, sky/water, SpeedTree bridge, effects/audio/maps, optional Modules | `not-started` |
+| Phase 2 | CPU world decoders (`.trn2`, `.t2bk` v6, `.t2lm`/`.t2lm1`, `.t2mk`, `.ecwld`, `.ecbsd`, DDS `DXT1`/`DXT3`/`DXT5`), `cache/terrain-v1`, `terrain-survey`, `terrain-memory-check` | `verified-cpu` |
+| Phase 3–8 | GPU terrain rendering & free flight, static scenery, sky/water, SpeedTree bridge, effects/audio/maps, optional Modules | `not-started` |
 
 See [Findings/Status.md](Findings/Status.md) for per-subsystem evidence and open gates.
 
@@ -44,15 +44,15 @@ cargo check --locked --bins
 ./tools/check-core.sh
 cargo run --locked --bin forsaken-world-explorer -- --self-test
 cargo run --locked --bin forsaken-world-explorer -- --smoke-launch
+cargo run --locked --bin terrain-memory-check
 ```
 
-### Survey a Local Client's Archives
+### Local Client Survey Tools
 
 ```sh
 cargo run --locked --bin pck-survey -- <path-to-forsaken-world-client> --out archive-survey.md
+cargo run --locked --bin terrain-survey -- <path-to-forsaken-world-client> --out terrain-survey.md
 ```
-
-Add `--verify-payloads` to decompress and verify every entry payload across all `.pck`/`.pkx` archives.
 
 ## Portable Windows Package
 
@@ -69,5 +69,3 @@ Forsaken World Explorer/
   SHA256SUMS.txt
   THIRD_PARTY_NOTICES.md
 ```
-
-Run `forsaken-world-explorer.exe --self-test` and `forsaken-world-explorer.exe --smoke-launch` inside the extracted folder to verify settings persistence, `Modules/` discovery, synthetic `.pck`/`.pkx` reading, and UI initialization without needing a GPU or game client.
