@@ -1,5 +1,6 @@
 pub mod client_detect;
 pub mod dxt;
+pub mod logging;
 pub mod modules;
 pub mod pck;
 pub mod self_test;

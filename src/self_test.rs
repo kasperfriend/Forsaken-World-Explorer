@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{dxt, modules, pck, settings, terrain_block, terrain_store};
+use crate::{dxt, logging, modules, pck, settings, terrain_block, terrain_store};
 
 #[derive(Debug)]
 pub struct CheckResult {
@@ -24,8 +24,9 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn check_settings_round_trip() -> Result<CheckResult, String> {
-    let dir = unique_temp_dir("fw-selftest-settings")?;
+fn check_portable_settings_and_logs() -> Result<CheckResult, String> {
+    let root = unique_temp_dir("fw-selftest-portable")?;
+    let paths = settings::PortablePaths::from_root(root.clone());
     let expected = settings::ViewerSettings {
         client_dir: Some(PathBuf::from("C:\\Games\\ForsakenWorld")),
         resolution_scale_pct: 110,
@@ -37,22 +38,28 @@ fn check_settings_round_trip() -> Result<CheckResult, String> {
         show_minimap: true,
         show_zone_notices: false,
     };
-    let saved = expected.save_to_dir(&dir);
-    let loaded = saved
-        .as_ref()
-        .map_err(|e| e.clone())
-        .and_then(|_| settings::ViewerSettings::load_from_dir(&dir));
-    let _ = fs::remove_dir_all(&dir);
-
-    let loaded = loaded?;
-    if loaded != expected {
-        return Err(format!(
-            "settings mismatch after round-trip: expected {expected:?}, got {loaded:?}"
-        ));
-    }
+    let result = (|| -> Result<(), String> {
+        paths.check_writable()?;
+        expected.save_to_paths(&paths)?;
+        let loaded = settings::ViewerSettings::load_from_paths(&paths)?;
+        if loaded != expected {
+            return Err(format!(
+                "settings mismatch after round-trip: expected {expected:?}, got {loaded:?}"
+            ));
+        }
+        let mut logger = logging::RunLogger::open(&paths.logs_dir)?;
+        logger.info("self-test log entry");
+        if !logger.log_path().is_file() {
+            return Err("expected per-run log file to exist".into());
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result?;
     Ok(CheckResult {
-        name: "settings-round-trip",
-        detail: "wrote and re-read viewer-settings.txt cleanly".into(),
+        name: "portable-settings-and-logs",
+        detail: "verified <root>/settings/viewer-settings.txt round-trip and <root>/logs/ creation"
+            .into(),
     })
 }
 
@@ -222,10 +229,10 @@ fn check_optional_client_env() -> CheckResult {
     }
 }
 
-/// Run all CPU-only self-tests.
+/// Run all CPU-only self-tests. Never opens any interactive UI dialog.
 pub fn run() -> Result<Vec<CheckResult>, String> {
     Ok(vec![
-        check_settings_round_trip()?,
+        check_portable_settings_and_logs()?,
         check_module_discovery()?,
         check_synthetic_pck_archive()?,
         check_synthetic_world_decoders()?,

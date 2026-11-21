@@ -10,6 +10,7 @@ eframe = { version = "0.31", default-features = false, features = ["wgpu", "defa
 encoding_rs = "0.8"
 flate2 = "1"
 pollster = "0.4"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 sha2 = "0.10"
 
 [profile.release]

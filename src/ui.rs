@@ -1,12 +1,13 @@
-//! Desktop window, menu, client folder validation, Settings tabs, and Modules view.
+//! Desktop window, menu, native folder picker, portable root layout, Settings, and Modules.
 
 use std::{path::PathBuf, sync::Arc};
 
 use eframe::{egui, wgpu};
 use forsaken_world_explorer::{
     client_detect::{self, DetectedClient},
+    logging::{self, RunLogger},
     modules::Registry,
-    settings::{ViewerSettings, MAX_RESOLUTION_SCALE_PCT, MIN_RESOLUTION_SCALE_PCT},
+    settings::{PortablePaths, ViewerSettings, MAX_RESOLUTION_SCALE_PCT, MIN_RESOLUTION_SCALE_PCT},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,9 +28,10 @@ enum SettingsTab {
 
 pub struct ExplorerApp {
     page: Page,
-    settings_root: PathBuf,
+    paths: PortablePaths,
+    root_write_error: Option<String>,
+    logger: Option<RunLogger>,
     settings: ViewerSettings,
-    client_dir_input: String,
     detected_client: Option<Result<DetectedClient, String>>,
     modules: Registry,
     status_line: String,
@@ -37,59 +39,170 @@ pub struct ExplorerApp {
 
 impl ExplorerApp {
     pub fn new() -> Self {
-        let settings_root = ViewerSettings::default_root_dir();
-        let (mut settings, status_line) = match ViewerSettings::load_from_dir(&settings_root) {
+        let paths = PortablePaths::from_executable();
+        Self::with_portable_paths(paths, true)
+    }
+
+    /// Construct app state for headless `--smoke-launch` without creating files
+    /// in the build output directory or opening any native dialog.
+    pub fn new_headless_smoke() -> Self {
+        let paths = PortablePaths::from_executable();
+        Self::with_portable_paths(paths, false)
+    }
+
+    fn with_portable_paths(paths: PortablePaths, allow_disk_init: bool) -> Self {
+        let mut root_write_error = None;
+        let mut logger = None;
+        let mut import_note: Option<String> = None;
+
+        if allow_disk_init {
+            match paths.check_writable() {
+                Ok(()) => {
+                    match RunLogger::open(&paths.logs_dir) {
+                        Ok(mut run_log) => {
+                            run_log.info(&format!(
+                                "Portable root: {} (settings: {}, logs: {}, cache: {})",
+                                paths.root.display(),
+                                paths.settings_dir.display(),
+                                paths.logs_dir.display(),
+                                paths.cache_dir.display()
+                            ));
+                            logger = Some(run_log);
+                        }
+                        Err(err) => {
+                            root_write_error = Some(err);
+                        }
+                    }
+                    let legacy = ViewerSettings::legacy_settings_path();
+                    if let Ok(Some(old_path)) =
+                        ViewerSettings::import_legacy_once(&paths, legacy.as_deref())
+                    {
+                        let msg =
+                            format!("Imported legacy settings once from {}", old_path.display());
+                        if let Some(log) = logger.as_mut() {
+                            log.info(&msg);
+                        }
+                        import_note = Some(msg);
+                    }
+                }
+                Err(err) => {
+                    root_write_error = Some(err);
+                }
+            }
+        }
+
+        let (mut settings, mut status_line) = match ViewerSettings::load_from_paths(&paths) {
             Ok(loaded) => (
                 loaded,
-                format!(
-                    "Settings loaded from {}",
-                    ViewerSettings::settings_path_in(&settings_root).display()
-                ),
+                format!("Settings path: {}", paths.settings_file.display()),
             ),
             Err(error) => (
                 ViewerSettings::default(),
                 format!("Using default settings ({error})"),
             ),
         };
+        if let Some(note) = import_note {
+            status_line = note;
+        }
+        if let Some(err) = &root_write_error {
+            status_line = err.clone();
+        }
         settings.apply_env_overrides();
-        let client_dir_input = settings
-            .client_dir
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
         let detected_client = settings.client_dir.as_deref().map(client_detect::detect);
         let modules = Registry::discover(Registry::default_root());
         Self {
             page: Page::Launcher,
-            settings_root,
+            paths,
+            root_write_error,
+            logger,
             settings,
-            client_dir_input,
             detected_client,
             modules,
             status_line,
         }
     }
 
-    fn save_settings(&mut self) {
-        let trimmed = self.client_dir_input.trim();
-        self.settings.client_dir = if trimmed.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(trimmed))
-        };
-        self.detected_client = self
-            .settings
-            .client_dir
-            .as_deref()
-            .map(client_detect::detect);
-        match self.settings.save_to_dir(&self.settings_root) {
-            Ok(path) => {
-                self.status_line = format!("Saved settings to {}", path.display());
+    fn switch_portable_root(&mut self, new_root: PathBuf) {
+        let new_paths = PortablePaths::from_root(new_root);
+        match new_paths.check_writable() {
+            Ok(()) => {
+                self.paths = new_paths;
+                self.root_write_error = None;
+                self.logger = RunLogger::open(&self.paths.logs_dir).ok();
+                if let Some(log) = self.logger.as_mut() {
+                    log.info(&format!(
+                        "Switched portable data root to {}",
+                        self.paths.root.display()
+                    ));
+                }
+                self.save_settings();
             }
-            Err(error) => {
-                self.status_line = format!("Failed to save settings: {error}");
+            Err(err) => {
+                self.root_write_error = Some(err.clone());
+                self.status_line = err;
             }
         }
+    }
+
+    fn apply_selected_client_dir(&mut self, folder: PathBuf) {
+        self.settings.client_dir = Some(folder.clone());
+        let result = client_detect::detect(&folder);
+        if let Some(log) = self.logger.as_mut() {
+            match &result {
+                Ok(client) => log.info(&format!(
+                    "Selected client folder {}: {} ({} archives, {} zones)",
+                    client.root.display(),
+                    client.recognition.summary(),
+                    client.pck_archives.len(),
+                    client.zones.len()
+                )),
+                Err(err) => log.warn(&format!(
+                    "Client folder validation failed for {}: {err}",
+                    folder.display()
+                )),
+            }
+        }
+        self.detected_client = Some(result);
+        self.save_settings();
+    }
+
+    fn save_settings(&mut self) {
+        match self.settings.save_to_paths(&self.paths) {
+            Ok(path) => {
+                let msg = format!("Saved settings to {}", path.display());
+                if let Some(log) = self.logger.as_mut() {
+                    log.info(&msg);
+                }
+                self.status_line = msg;
+            }
+            Err(error) => {
+                let msg = format!("Failed to save settings: {error}");
+                if let Some(log) = self.logger.as_mut() {
+                    log.error(&msg);
+                }
+                self.root_write_error = Some(msg.clone());
+                self.status_line = msg;
+            }
+        }
+    }
+
+    fn draw_unwritable_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(err) = self.root_write_error.clone() else {
+            return;
+        };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Portable folder is not writable");
+            ui.label(&err);
+            if ui.button("Choose Writable Folder…").clicked() {
+                if let Some(picked) = rfd::FileDialog::new()
+                    .set_title("Select a writable folder for settings, logs, and cache")
+                    .pick_folder()
+                {
+                    self.switch_portable_root(picked);
+                }
+            }
+        });
+        ui.add_space(8.0);
     }
 
     fn draw_launcher(&mut self, ui: &mut egui::Ui) {
@@ -97,18 +210,38 @@ impl ExplorerApp {
         ui.label("Free-flight viewer for a user-owned Forsaken World client.");
         ui.add_space(10.0);
 
+        self.draw_unwritable_banner(ui);
+
         ui.label("Client folder (never modified by this viewer):");
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.client_dir_input);
-            if ui.button("Validate & Save Path").clicked() {
-                self.save_settings();
+            let mut display_path = self
+                .settings
+                .client_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(No client folder selected)".to_string());
+            ui.add_enabled(
+                false,
+                egui::TextEdit::singleline(&mut display_path).desired_width(480.0),
+            );
+            if ui.button("Browse…").clicked() {
+                let mut dialog =
+                    rfd::FileDialog::new().set_title("Select Forsaken World client folder");
+                if let Some(last) = &self.settings.client_dir {
+                    if last.is_dir() {
+                        dialog = dialog.set_directory(last);
+                    }
+                }
+                if let Some(picked) = dialog.pick_folder() {
+                    self.apply_selected_client_dir(picked);
+                }
             }
         });
         ui.add_space(8.0);
 
         match &self.detected_client {
             None => {
-                ui.label("No client folder selected yet. Enter the Forsaken World client root (containing update/ and resources/).");
+                ui.label("Click Browse… to select your Forsaken World client root (containing update/ and resources/).");
             }
             Some(Ok(client)) => {
                 ui.group(|ui| {
@@ -138,11 +271,22 @@ impl ExplorerApp {
             }
         }
 
-        ui.add_space(8.0);
-        ui.label(format!(
-            "Cache & settings root: {}",
-            self.settings_root.display()
-        ));
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(format!("Portable root: {}", self.paths.root.display()));
+        ui.label(format!("Settings: {}", self.paths.settings_file.display()));
+        ui.label(format!("Cache: {}", self.paths.cache_dir.display()));
+        ui.horizontal(|ui| {
+            ui.label(format!("Logs: {}", self.paths.logs_dir.display()));
+            if ui.button("Open logs folder").clicked() {
+                if let Err(err) = logging::open_folder_in_file_manager(&self.paths.logs_dir) {
+                    if let Some(log) = self.logger.as_mut() {
+                        log.warn(&err);
+                    }
+                    self.status_line = err;
+                }
+            }
+        });
     }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui, tab: SettingsTab) {
@@ -164,7 +308,7 @@ impl ExplorerApp {
         let mut changed = false;
         match tab {
             SettingsTab::Graphics => {
-                ui.label("Graphics settings (persisted to viewer-settings.txt).");
+                ui.label("Graphics settings (persisted under <root>/settings/).");
                 ui.add_space(6.0);
                 let response = ui.add(
                     egui::Slider::new(
@@ -276,8 +420,7 @@ impl ExplorerApp {
         );
         ui.add_space(8.0);
         ui.label(
-            "Current stage: Phase 1 (client detection and .pck/.pkx archive layer). \
-             No 3D rendering or visual parity is claimed yet.",
+            "Portable layout: settings, logs, and cache live beside forsaken-world-explorer.exe.",
         );
     }
 
@@ -328,13 +471,14 @@ impl eframe::App for ExplorerApp {
     }
 }
 
-/// CPU-only headless UI smoke test: initializes `ExplorerApp`, probes the `wgpu`
-/// instance cleanly, and executes an `egui` frame pass across every page and Settings tab.
+/// CPU-only headless UI smoke test: initializes `ExplorerApp` non-interactively
+/// (never opens any native folder dialog), probes `wgpu::Instance`, and renders
+/// every UI page and Settings tab.
 pub fn run_smoke_launch() -> Result<(), String> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let _adapters = instance.enumerate_adapters(wgpu::Backends::all());
 
-    let mut app = ExplorerApp::new();
+    let mut app = ExplorerApp::new_headless_smoke();
     let ctx = egui::Context::default();
     let pages = [
         Page::Launcher,
@@ -385,6 +529,24 @@ fn try_create_fallback_wgpu_setup() -> Option<eframe::egui_wgpu::WgpuSetupExisti
     })
 }
 
+fn try_create_fallback_wgpu_setup_if_no_hardware() -> Option<eframe::egui_wgpu::WgpuSetupExisting> {
+    let probe = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let has_hw = probe
+        .enumerate_adapters(wgpu::Backends::PRIMARY)
+        .iter()
+        .any(|a| {
+            matches!(
+                a.get_info().device_type,
+                wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
+            )
+        });
+    if has_hw {
+        None
+    } else {
+        try_create_fallback_wgpu_setup()
+    }
+}
+
 pub fn run_window() -> Result<(), String> {
     let wgpu_setup = if let Some(existing) = try_create_fallback_wgpu_setup_if_no_hardware() {
         eframe::egui_wgpu::WgpuSetup::Existing(existing)
@@ -429,24 +591,6 @@ pub fn run_window() -> Result<(), String> {
         Box::new(|_cc| Ok(Box::new(ExplorerApp::new()))),
     )
     .map_err(|error| format!("failed to launch viewer window: {error}"))
-}
-
-fn try_create_fallback_wgpu_setup_if_no_hardware() -> Option<eframe::egui_wgpu::WgpuSetupExisting> {
-    let probe = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let has_hw = probe
-        .enumerate_adapters(wgpu::Backends::PRIMARY)
-        .iter()
-        .any(|a| {
-            matches!(
-                a.get_info().device_type,
-                wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
-            )
-        });
-    if has_hw {
-        None
-    } else {
-        try_create_fallback_wgpu_setup()
-    }
 }
 
 #[cfg(test)]
