@@ -1,0 +1,101 @@
+name: PR checks and Windows build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-check:
+    name: Linux checks and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run cargo tests
+        run: cargo test --locked
+      - name: Run dependency-free CPU core checks
+        run: sh tools/check-core.sh
+      - name: Run --self-test on Linux build
+        run: cargo run --locked --bin forsaken-world-explorer -- --self-test
+
+  dependency-audit:
+    name: Dependency security audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  windows-build:
+    name: Windows build, self-test, and package
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Run viewer unit tests
+        run: cargo test --locked --bin forsaken-world-explorer
+      - name: Check all binary targets
+        run: cargo check --locked --bins
+      - name: Build Windows release executable
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin forsaken-world-explorer
+      - name: Stage portable ZIP and SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          ./tools/package-windows.ps1 `
+            -Executable target/x86_64-pc-windows-msvc/release/forsaken-world-explorer.exe `
+            -Modules Modules `
+            -OutputDirectory release `
+            -ArchivePath release/Forsaken-World-Explorer-Windows-x64.zip
+      - name: Smoke run --self-test on packaged Windows executable
+        shell: pwsh
+        run: |
+          & "./release/Forsaken World Explorer/forsaken-world-explorer.exe" --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged executable --self-test failed with exit code $LASTEXITCODE"
+          }
+      - name: Verify SHA256SUMS.txt matches packaged files
+        shell: pwsh
+        run: |
+          $root = Resolve-Path "./release/Forsaken World Explorer"
+          $lines = Get-Content (Join-Path $root 'SHA256SUMS.txt') | Where-Object { $_.Trim().Length -gt 0 }
+          foreach ($line in $lines) {
+            $parts = $line -split '\s+', 2
+            $expected = $parts[0].ToLowerInvariant()
+            $rel = $parts[1]
+            $actual = (Get-FileHash -LiteralPath (Join-Path $root $rel) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) {
+              throw "Checksum mismatch for ${rel}: expected $expected, got $actual"
+            }
+          }
+          Write-Host "Verified $($lines.Count) file checksums in SHA256SUMS.txt"
+      - name: Upload Windows portable package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Forsaken-World-Explorer-Windows-x64
+          path: |
+            release/Forsaken-World-Explorer-Windows-x64.zip
+            release/SHA256SUMS.txt
+          if-no-files-found: error

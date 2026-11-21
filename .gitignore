@@ -1,0 +1,46 @@
+/target/
+/release/
+*.log
+
+# Proprietary Forsaken World client data, archives, assets, and binaries.
+# Never commit client files or derived caches to this repository.
+*.pck
+*.pkx
+*.t2bk
+*.t2mk
+*.t2lm
+*.t2lm1
+*.t2hc
+*.trn2
+*.ecwld
+*.ecbsd
+*.cld
+*.oc
+*.bmd
+*.ecm
+*.smd
+*.ski
+*.gfx
+*.data
+*.data[0-9]*
+*.dat
+*.dds
+*.spt
+*.ogg
+*.mp3
+*.wav
+*.dll
+*.exe
+*.bak
+
+# Local caches, Drive staging, and environment files
+/cache/
+/.cache/
+/google_drive/
+google_drive/
+.env
+.env.*
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
