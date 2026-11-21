@@ -18,6 +18,7 @@ use forsaken_world_explorer::{
     camera::{scaled_render_target, CameraInput, FreeCamera},
     client_detect::{self, DetectedClient},
     dxt,
+    input::{CaptureAction, InputStateMachine, MenuPage},
     logging::{self, RunLogger},
     modules::Registry,
     pck::PckArchive,
@@ -45,6 +46,7 @@ use forsaken_world_explorer::{
         TreeTypeDef, DEFAULT_HELPER_TIMEOUT_SECS, SPEEDTREE_CACHE_SUBDIR,
     },
     world_objects::{self, OrnamentPlacement},
+    zone_dump::{bmd_lookup_candidates, texture_lookup_candidates},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,6 +77,7 @@ struct TerrainCallback {
     scenery: Arc<SceneryDrawSnapshot>,
     vegetation: Arc<VegetationDrawSnapshot>,
     water: Arc<WaterRenderSnapshot>,
+    draw_sky_gradient: bool,
 }
 
 impl egui_wgpu::CallbackTrait for TerrainCallback {
@@ -102,6 +105,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             &self.scenery,
             &self.vegetation,
             &self.water,
+            self.draw_sky_gradient,
         )]
     }
 
@@ -118,6 +122,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
 }
 
 struct ActiveSceneryState {
+    client_root: Option<PathBuf>,
     zone: String,
     placements: Vec<OrnamentPlacement>,
     box_areas: Vec<BoxAreaAtmosphere>,
@@ -190,6 +195,7 @@ impl ActiveSceneryState {
         let model_cache = SceneryModelCache::open(cache_root)?;
         let tex_cache = TextureCache::new(tex_budget_bytes);
         Ok(Self {
+            client_root: Some(client_root.to_path_buf()),
             zone: zone.to_string(),
             placements,
             box_areas,
@@ -241,6 +247,7 @@ impl ActiveSceneryState {
             color_rgba: [0.06, 0.54, 0.84, 0.85],
         }];
         Ok(Self {
+            client_root: None,
             zone: "synthetic-preview".to_string(),
             placements,
             box_areas: vec![BoxAreaAtmosphere::default()],
@@ -322,6 +329,7 @@ impl ActiveSceneryState {
         let dedup = scenery::dedup_instances_by_model(&visible);
 
         let zone = self.zone.clone();
+        let client_root_opt = self.client_root.clone();
         let synth = self.synthetic_bmd_bytes.clone();
         let bmd_archives = &mut self.bmd_archives;
         let (_decoded_now, errs, drawn_instances, _total_trans) = scenery::step_streaming_frame(
@@ -332,12 +340,7 @@ impl ActiveSceneryState {
                 if let Some(raw) = &synth {
                     return Ok(raw.clone());
                 }
-                let candidates = [
-                    model_key.to_string(),
-                    format!("litmodels/{zone}/{model_key}"),
-                    format!("litmodels/{model_key}"),
-                    format!("building/{model_key}"),
-                ];
+                let candidates = bmd_lookup_candidates(&zone, model_key);
                 for arch in bmd_archives.iter_mut() {
                     for cand in &candidates {
                         if let Ok(bytes) = arch.read_entry(cand) {
@@ -345,7 +348,18 @@ impl ActiveSceneryState {
                         }
                     }
                 }
-                Err(format!("model not found in archives: {model_key}"))
+                if let Some(root) = &client_root_opt {
+                    let loose = root
+                        .join("litmodels")
+                        .join(&zone)
+                        .join(model_key.replace('\\', "/"));
+                    if let Ok(bytes) = fs::read(&loose) {
+                        return Ok(bytes);
+                    }
+                }
+                Err(format!(
+                    "model not found in litmodels.pck/building.pck: {model_key}"
+                ))
             },
         );
         if let Some(log) = logger.as_mut() {
@@ -372,11 +386,7 @@ impl ActiveSceneryState {
                     |tex_path| {
                         tex_cache
                             .get_or_insert_pinned(tex_path, || {
-                                let candidates = [
-                                    tex_path.to_string(),
-                                    format!("textures/{tex_path}"),
-                                    format!("litmodels/{tex_path}"),
-                                ];
+                                let candidates = texture_lookup_candidates(tex_path);
                                 for arch in tex_archives.iter_mut() {
                                     for cand in &candidates {
                                         if let Ok(bytes) = arch.read_entry(cand) {
@@ -390,11 +400,7 @@ impl ActiveSceneryState {
                                         }
                                     }
                                 }
-                                Ok(DecodedTexture {
-                                    width: 1,
-                                    height: 1,
-                                    rgba: vec![235, 220, 200, 255],
-                                })
+                                Err(format!("missing texture in archives: {tex_path}"))
                             })
                             .ok()
                     },
@@ -796,9 +802,10 @@ pub struct ExplorerApp {
     camera: FreeCamera,
     selected_zone: String,
     streaming_radius: i32,
-    show_map_placeholder: bool,
-    show_world_menu: bool,
+    input_sm: InputStateMachine,
+    world_settings_tab: SettingsTab,
     show_diagnostics: bool,
+    show_developer_tools: bool,
     started_at: Instant,
     terrain_session: Option<TerrainSession>,
     scenery_state: Option<ActiveSceneryState>,
@@ -909,10 +916,11 @@ impl ExplorerApp {
             status_line,
             camera: FreeCamera::default(),
             selected_zone,
-            streaming_radius: 2,
-            show_map_placeholder: false,
-            show_world_menu: false,
+            streaming_radius: 4,
+            input_sm: InputStateMachine::new_world_ready(),
+            world_settings_tab: SettingsTab::Graphics,
             show_diagnostics: true,
+            show_developer_tools: false,
             started_at: Instant::now(),
             terrain_session: None,
             scenery_state: None,
@@ -1023,13 +1031,44 @@ impl ExplorerApp {
         let hot_bytes = (self.settings.terrain_ram_mib as usize) * 1024 * 1024;
         let tex_budget_bytes = (self.settings.tex_budget_mib as usize) * 1024 * 1024;
         let zone = self.selected_zone.clone();
+        if let Some(log) = self.logger.as_mut() {
+            log.info(&format!(
+                "=== Load World: zone '{zone}' from {} ===",
+                client.root.display()
+            ));
+        }
+        // Stage 1: Terrain blocks, real layer textures/masks, and lightmaps
         match TerrainSession::open_zone(&client.root, &zone, &self.paths.cache_dir, hot_bytes) {
             Ok(mut session) => {
-                self.camera = FreeCamera::default();
+                for note in &session.load_notes {
+                    if let Some(log) = self.logger.as_mut() {
+                        log.info(&format!("[Stage 1 Terrain] {note}"));
+                    }
+                }
+                let origin_h = session.sample_height(0.0, 0.0).unwrap_or(140.0);
+                self.camera = FreeCamera {
+                    position: glam::Vec3::new(0.0, origin_h + 30.0, 0.0),
+                    yaw: 0.0,
+                    pitch: -0.25,
+                    ..Default::default()
+                };
                 let _ = session.update_for_camera(self.camera.position, self.streaming_radius);
+                if let Some(log) = self.logger.as_mut() {
+                    log.info(&format!(
+                        "[Stage 1 Terrain] OK: {}x{} blocks, streamed={}, height(0,0)={origin_h:.2}m, spawn=({:.1}, {:.1}, {:.1})",
+                        session.block_rows,
+                        session.block_cols,
+                        session.mesh.streamed_blocks,
+                        self.camera.position.x,
+                        self.camera.position.y,
+                        self.camera.position.z
+                    ));
+                }
                 self.mesh_arc = Arc::new(session.mesh.clone());
                 self.day_lm_arc = Arc::new(session.day_lightmap.clone());
                 self.night_lm_arc = Arc::new(session.night_lightmap.clone());
+
+                // Stage 2: World placements & static .bmd buildings
                 let scenery_note = match ActiveSceneryState::open_zone(
                     &client.root,
                     &zone,
@@ -1039,28 +1078,61 @@ impl ExplorerApp {
                     Ok(st) => {
                         let count = st.placements.len();
                         let boxes = st.box_areas.len();
+                        let bmd_pcks = st.bmd_archives.len();
+                        if let Some(log) = self.logger.as_mut() {
+                            log.info(&format!(
+                                "[Stage 2 Scenery] OK: {count} placements, {bmd_pcks} building archive(s) opened"
+                            ));
+                            log.info(&format!(
+                                "[Stage 4 Atmosphere/Water] box_areas={boxes}, water_planes={} | Sky: missing (Issue #15) | Effects: missing",
+                                st.water_planes.len()
+                            ));
+                        }
                         self.scenery_state = Some(st);
                         format!("{count} placements, {boxes} atmosphere box(es)")
                     }
                     Err(err) => {
+                        if let Some(log) = self.logger.as_mut() {
+                            log.warn(&format!("[Stage 2 Scenery] FAILED: {err}"));
+                        }
                         self.scenery_state = None;
                         format!("scenery unavailable ({err})")
                     }
                 };
-                self.veg_state = ActiveVegetationState::open_zone(
+
+                // Stage 3: Trees & Grass
+                match ActiveVegetationState::open_zone(
                     &client.root,
                     &zone,
                     &self.paths,
                     &mut self.logger,
-                )
-                .ok();
+                ) {
+                    Ok(veg) => {
+                        if let Some(log) = self.logger.as_mut() {
+                            log.info(&format!(
+                                "[Stage 3 Vegetation] OK: {} tree placements, {} grass placements",
+                                veg.tree_placements.len(),
+                                veg.grass_placements.len()
+                            ));
+                        }
+                        self.veg_state = Some(veg);
+                    }
+                    Err(err) => {
+                        if let Some(log) = self.logger.as_mut() {
+                            log.warn(&format!("[Stage 3 Vegetation] FAILED: {err}"));
+                        }
+                        self.veg_state = None;
+                    }
+                }
+
                 let vp = self.camera.view_proj(16.0 / 9.0);
                 self.step_scenery(vp, 1080, 680);
                 self.displayed_diag = self.latest_diag.clone();
                 self.displayed_veg_diag = self.latest_veg_diag.clone();
                 self.last_diag_refresh = Instant::now();
+                self.input_sm = InputStateMachine::new_world_ready();
                 let msg = format!(
-                    "Loaded zone '{}' ({}x{} blocks, {})",
+                    "Loaded zone '{}' ({}x{} blocks, height(0,0)={origin_h:.1}m, {})",
                     session.zone_name, session.block_rows, session.block_cols, scenery_note
                 );
                 if let Some(log) = self.logger.as_mut() {
@@ -1218,7 +1290,25 @@ impl ExplorerApp {
                     ui.label(format!("Readable map zones: {}", client.zones.len()));
                 });
                 ui.add_space(6.0);
-                if ui.button("Enter World View").clicked() {
+                let zones = client.zones.clone();
+                let mut clicked_load = false;
+                ui.horizontal(|ui| {
+                    ui.label("Zone:");
+                    egui::ComboBox::from_id_salt("launcher_zone_selector")
+                        .selected_text(&self.selected_zone)
+                        .show_ui(ui, |ui| {
+                            for z in &zones {
+                                ui.selectable_value(&mut self.selected_zone, z.clone(), z);
+                            }
+                        });
+                    if ui
+                        .add_sized([160.0, 32.0], egui::Button::new("Load World"))
+                        .clicked()
+                    {
+                        clicked_load = true;
+                    }
+                });
+                if clicked_load {
                     self.load_selected_zone();
                     self.page = Page::WorldView;
                 }
@@ -1244,77 +1334,88 @@ impl ExplorerApp {
                 }
             }
         });
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut self.show_developer_tools,
+            "Developer tools (off by default — synthetic test scene is not a game world)",
+        );
+        if self.show_developer_tools {
+            ui.horizontal(|ui| {
+                if ui.button("Open Synthetic Pipeline Test Scene").clicked() {
+                    self.load_synthetic_preview();
+                    self.input_sm = InputStateMachine::new_world_ready();
+                    self.page = Page::WorldView;
+                }
+                ui.small("Pipeline check only; not Forsaken World data.");
+            });
+        }
+    }
+
+    fn apply_capture_action(ctx: &egui::Context, action: CaptureAction) {
+        match action {
+            CaptureAction::Capture => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+            }
+            CaptureAction::Release => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+            }
+            CaptureAction::None => {}
+        }
     }
 
     fn draw_world_view(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        ctx.input(|i| {
-            if i.key_pressed(egui::Key::M) {
-                self.show_map_placeholder = !self.show_map_placeholder;
-            }
-            if i.key_pressed(egui::Key::Escape) {
-                self.show_world_menu = !self.show_world_menu;
-            }
-        });
+        // Track window focus changes so focus loss always releases mouse capture
+        let focused = ctx.input(|i| i.focused);
+        if focused != self.input_sm.window_focused {
+            let act = self.input_sm.on_focus_changed(focused);
+            Self::apply_capture_action(ctx, act);
+        }
 
-        let mut settings_changed = false;
-        ui.horizontal(|ui| {
-            let zones: Vec<String> = self
-                .detected_client
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .map(|c| c.zones.clone())
-                .unwrap_or_default();
-
-            if !zones.is_empty() {
-                egui::ComboBox::from_id_salt("zone_selector")
-                    .selected_text(&self.selected_zone)
-                    .show_ui(ui, |ui| {
-                        for z in &zones {
-                            ui.selectable_value(&mut self.selected_zone, z.clone(), z);
-                        }
-                    });
-                if ui.button("Load Zone").clicked() {
-                    self.load_selected_zone();
-                }
-            }
-            if ui.button("Preview Synthetic Scene").clicked() {
-                self.load_synthetic_preview();
-            }
-            ui.checkbox(&mut self.show_diagnostics, "Diagnostics");
-            ui.separator();
-            let hours = self.settings.time_of_day_hours();
-            let hh = (hours.floor() as u32) % 24;
-            let mm = ((hours.fract() * 60.0).floor() as u32) % 60;
-            ui.label(format!("Time: {hh:02}:{mm:02}"));
-            if !self.settings.follow_real_clock {
-                settings_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.settings.time_of_day_minutes, 0..=1439)
-                            .show_value(false),
-                    )
-                    .changed();
-            }
-            settings_changed |= ui
-                .checkbox(&mut self.settings.follow_real_clock, "Real clock")
-                .changed();
+        // Escape and M keys (matching PW Explorer MenuPage state machine)
+        let (esc_pressed, m_pressed) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::M),
+            )
         });
-        if settings_changed {
-            self.save_settings();
+        if esc_pressed {
+            let act = self.input_sm.on_escape();
+            Self::apply_capture_action(ctx, act);
+        }
+        if m_pressed {
+            let act = self.input_sm.on_toggle_world_map();
+            Self::apply_capture_action(ctx, act);
         }
 
         let avail = ui.available_size();
-        let (rect, response) =
-            ui.allocate_exact_size(avail.max(egui::vec2(64.0, 64.0)), egui::Sense::drag());
+        let (rect, response) = ui.allocate_exact_size(
+            avail.max(egui::vec2(64.0, 64.0)),
+            egui::Sense::click_and_drag(),
+        );
 
-        if !self.show_world_menu {
+        // Left-click in 3D viewport captures and locks the mouse for looking
+        if response.clicked_by(egui::PointerButton::Primary) {
+            let act = self.input_sm.on_left_click_in_viewport();
+            Self::apply_capture_action(ctx, act);
+        }
+
+        // Apply camera movement & raw mouse look ONLY while mouse is captured
+        if self.input_sm.allows_camera_input() {
             let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
-            let drag_delta = if response.dragged_by(egui::PointerButton::Secondary)
-                || response.dragged_by(egui::PointerButton::Primary)
-            {
-                response.drag_delta()
-            } else {
-                egui::Vec2::ZERO
-            };
+            let raw_mouse = ctx.input(|i| {
+                let mut sum = egui::Vec2::ZERO;
+                for ev in &i.events {
+                    if let egui::Event::MouseMoved(delta) = ev {
+                        sum += *delta;
+                    }
+                }
+                if sum == egui::Vec2::ZERO {
+                    sum = i.pointer.delta();
+                }
+                sum
+            });
             let cam_input = ctx.input(|i| CameraInput {
                 forward: i.key_down(egui::Key::W),
                 backward: i.key_down(egui::Key::S),
@@ -1327,8 +1428,8 @@ impl ExplorerApp {
                 look_right: i.key_down(egui::Key::ArrowRight),
                 look_up: i.key_down(egui::Key::ArrowUp),
                 look_down: i.key_down(egui::Key::ArrowDown),
-                mouse_dx: drag_delta.x,
-                mouse_dy: drag_delta.y,
+                mouse_dx: raw_mouse.x,
+                mouse_dy: raw_mouse.y,
             });
             let moving = cam_input.forward
                 || cam_input.backward
@@ -1340,9 +1441,12 @@ impl ExplorerApp {
                 || cam_input.look_right
                 || cam_input.look_up
                 || cam_input.look_down
-                || drag_delta.length_sq() > 0.0;
-            if moving {
-                self.camera.step(&cam_input, dt);
+                || raw_mouse.length_sq() > 0.0;
+            if moving
+                && self
+                    .input_sm
+                    .apply_camera_input(&mut self.camera, &cam_input, dt)
+            {
                 if let Some(session) = self.terrain_session.as_mut() {
                     if let Ok(true) =
                         session.update_for_camera(self.camera.position, self.streaming_radius)
@@ -1350,8 +1454,8 @@ impl ExplorerApp {
                         self.mesh_arc = Arc::new(session.mesh.clone());
                     }
                 }
-                ctx.request_repaint();
             }
+            ctx.request_repaint();
         }
 
         let ppp = ctx.pixels_per_point();
@@ -1374,6 +1478,10 @@ impl ExplorerApp {
             .scenery_state
             .as_ref()
             .and_then(|s| s.water_planes.first().map(|w| w.height_y));
+        let is_synthetic = self
+            .terrain_session
+            .as_ref()
+            .is_some_and(|s| s.is_synthetic);
 
         let hours = self.settings.time_of_day_hours();
         let elapsed_sec = self.started_at.elapsed().as_secs_f32();
@@ -1401,20 +1509,32 @@ impl ExplorerApp {
                 scenery: Arc::clone(&self.scenery_arc),
                 vegetation: Arc::clone(&self.veg_arc),
                 water: Arc::clone(&self.water_arc),
+                draw_sky_gradient: is_synthetic,
             },
         );
         ui.painter().add(cb);
 
+        // Subtle controls / capture banner (top-left)
         egui::Area::new(egui::Id::new("world_controls_hud"))
             .fixed_pos(rect.left_top() + egui::vec2(10.0, 10.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.small("WASD move | Space/E up | Q/Ctrl down | Shift fast | Arrows/Drag look | M map | Esc menu");
+                    if self.input_sm.mouse_captured {
+                        ui.small("Mouse captured | WASD fly | Space/E up | Q/Ctrl down | Shift fast | Arrows look | M map | ESC menu");
+                    } else {
+                        ui.strong("Left-click in the 3D view to capture mouse and look around | ESC menu | M World Map");
+                    }
+                    let zone_label = self
+                        .terrain_session
+                        .as_ref()
+                        .map(|s| s.zone_name.as_str())
+                        .unwrap_or("(no zone loaded)");
                     ui.small(format!(
-                        "3D target: {scaled_w}x{scaled_h} ({}% of {vp_w}x{vp_h}) | Terrain blocks: {} ({} KiB)",
-                        self.settings.resolution_scale_pct,
-                        self.mesh_arc.streamed_blocks,
-                        self.mesh_arc.hot_ram_bytes / 1024
+                        "Zone: {zone_label} | Pos: ({:.1}, {:.1}, {:.1}) | 3D: {scaled_w}x{scaled_h} ({}%)",
+                        self.camera.position.x,
+                        self.camera.position.y,
+                        self.camera.position.z,
+                        self.settings.resolution_scale_pct
                     ));
                     if let Some(notice) = self.veg_state.as_ref().and_then(|v| v.missing_notice.as_deref()) {
                         ui.small(format!("SpeedTree notice: {notice}"));
@@ -1422,116 +1542,239 @@ impl ExplorerApp {
                 });
             });
 
-        if self.show_diagnostics {
-            let d = &self.displayed_diag;
-            let dn = atmosphere::day_night_factor(hours);
-            let lighting_label = if d.approximate_lighting_meshes > 0 {
-                format!(
-                    "client day/night (dn={dn:.2}) + {} approx fallback mesh(es)",
-                    d.approximate_lighting_meshes
-                )
-            } else {
-                format!("client day/night (dn={dn:.2}; sky gradient approximate)")
-            };
-            egui::Area::new(egui::Id::new("world_diagnostics_panel"))
-                .fixed_pos(rect.right_top() + egui::vec2(-315.0, 10.0))
+        // Minimap overlay (top-right, matching PW Explorer Interface -> Show minimap)
+        if self.settings.show_minimap {
+            egui::Area::new(egui::Id::new("world_minimap_overlay"))
+                .fixed_pos(rect.right_top() + egui::vec2(-210.0, 10.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.strong("World Diagnostics (1 Hz)");
-                        ui.small(format!("Lighting: {lighting_label}"));
+                        ui.strong("Minimap");
                         ui.small(format!(
-                            "Placements in range: {} / {}",
-                            d.placements_in_range, d.placements_total
+                            "X {:.0}  Y {:.0}  Z {:.0}",
+                            self.camera.position.x, self.camera.position.y, self.camera.position.z
                         ));
-                        ui.small(format!(
-                            "Unique models loaded: {} (in range: {})",
-                            d.models_loaded, d.unique_models_in_range
-                        ));
-                        ui.small(format!(
-                            "Opaque/alpha-test instances: {}",
-                            d.instances_drawn
-                        ));
-                        ui.small(format!(
-                            "Transparent submeshes: drawn={}, skipped={}",
-                            d.transparent_submeshes_drawn, d.transparent_submeshes_skipped
-                        ));
-                        ui.small(format!("Failed to decode: {}", d.decode_failures));
-                        ui.small(format!(
-                            "Water planes visible: {} | World render passes/frame: {}",
-                            d.water_planes_visible, d.world_render_passes
-                        ));
-                        ui.small(format!(
-                            "Textures cached: {} ({:.2} / {:.2} MiB){}",
-                            d.textures_cached,
-                            d.texture_cache_bytes as f64 / (1024.0 * 1024.0),
-                            d.texture_budget_bytes as f64 / (1024.0 * 1024.0),
-                            if d.texture_budget_exceeded {
-                                " [PINNED > BUDGET]"
-                            } else {
-                                ""
-                            }
-                        ));
-                        let vd = &self.displayed_veg_diag;
-                        ui.small(format!(
-                            "Trees: {} in range / {} total ({} LOD meshes loaded)",
-                            vd.trees_in_range, vd.trees_total, vd.trees_loaded
-                        ));
-                        ui.small(format!(
-                            "SpeedTree helper: {}",
-                            if vd.helper_status.is_empty() { "idle" } else { &vd.helper_status }
-                        ));
-                        ui.small(format!(
-                            "Grass: {} drawn / {} in range ({} total) | speedtree-v1 cache: {:.1} KiB",
-                            vd.grass_drawn,
-                            vd.grass_in_range,
-                            vd.grass_total,
-                            vd.speedtree_cache_bytes as f64 / 1024.0
-                        ));
-                        if !d.gpu_timing_note.is_empty() {
-                            ui.small(format!("GPU timing: {}", d.gpu_timing_note));
-                        }
+                        ui.small("Minimap tiles: missing (not decoded yet)");
                     });
                 });
         }
 
-        if self.show_map_placeholder {
-            egui::Window::new("World Map (Placeholder)")
-                .collapsible(false)
-                .resizable(false)
+        // 1 Hz Diagnostics overlay (bottom-right)
+        if self.show_diagnostics {
+            let d = &self.displayed_diag;
+            let vd = &self.displayed_veg_diag;
+            egui::Area::new(egui::Id::new("world_diagnostics_panel"))
+                .fixed_pos(rect.right_bottom() + egui::vec2(-320.0, -185.0))
                 .show(ctx, |ui| {
-                    ui.label("Original client map tiles and teleport search arrive in Phase 7.");
-                    ui.label(format!(
-                        "Current camera: X={:.1}, Y={:.1}, Z={:.1}",
-                        self.camera.position.x, self.camera.position.y, self.camera.position.z
-                    ));
-                    if ui.button("Close (M)").clicked() {
-                        self.show_map_placeholder = false;
-                    }
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.strong("Diagnostics (1 Hz)");
+                        ui.small(format!(
+                            "Terrain blocks: {} ({} KiB hot RAM)",
+                            self.mesh_arc.streamed_blocks,
+                            self.mesh_arc.hot_ram_bytes / 1024
+                        ));
+                        ui.small(format!(
+                            "Placements: {} in range / {} total | .bmd loaded: {} (failed: {})",
+                            d.placements_in_range,
+                            d.placements_total,
+                            d.models_loaded,
+                            d.decode_failures
+                        ));
+                        ui.small(format!(
+                            "Instances drawn: {} | Transparent: drawn={}, skipped={}",
+                            d.instances_drawn,
+                            d.transparent_submeshes_drawn,
+                            d.transparent_submeshes_skipped
+                        ));
+                        ui.small(format!(
+                            "Textures: {} ({:.1} / {:.1} MiB) | Water visible: {}",
+                            d.textures_cached,
+                            d.texture_cache_bytes as f64 / (1024.0 * 1024.0),
+                            d.texture_budget_bytes as f64 / (1024.0 * 1024.0),
+                            d.water_planes_visible
+                        ));
+                        ui.small(format!(
+                            "Trees: {}/{} ({} meshes, {:.1} KiB) | Grass: {}/{} ({} total) | Helper: {}",
+                            vd.trees_in_range,
+                            vd.trees_total,
+                            vd.trees_loaded,
+                            vd.speedtree_cache_bytes as f64 / 1024.0,
+                            vd.grass_drawn,
+                            vd.grass_in_range,
+                            vd.grass_total,
+                            if vd.helper_status.is_empty() {
+                                "idle"
+                            } else {
+                                &vd.helper_status
+                            }
+                        ));
+                        ui.small(
+                            "Sky: missing (Issue #15) | Effects: missing | Audio: not started",
+                        );
+                    });
                 });
         }
 
-        if self.show_world_menu {
-            egui::Window::new("Explorer Menu (Esc)")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    if ui.button("Resume Free Flight").clicked() {
-                        self.show_world_menu = false;
-                    }
-                    if ui.button("Graphics Settings").clicked() {
-                        self.show_world_menu = false;
-                        self.page = Page::Settings(SettingsTab::Graphics);
-                    }
-                    if ui.button("World & Scenery Settings").clicked() {
-                        self.show_world_menu = false;
-                        self.page = Page::Settings(SettingsTab::World);
-                    }
-                    if ui.button("Back to Launcher").clicked() {
-                        self.show_world_menu = false;
-                        self.page = Page::Launcher;
-                    }
-                });
+        // PW Explorer ESC Menu & subpages
+        match self.input_sm.menu_page {
+            MenuPage::Closed => {}
+            MenuPage::Main => {
+                egui::Window::new("FORSAKEN WORLD EXPLORER  |  ESC MENU")
+                    .default_pos(egui::pos2(16.0, 80.0))
+                    .default_size(egui::vec2(340.0, 340.0))
+                    .collapsible(false)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(egui::RichText::new("WORLD EXPLORER").size(20.0).strong());
+                            ui.add_space(10.0);
+                            let w = ui.available_width().min(290.0);
+                            if ui
+                                .add_sized([w, 36.0], egui::Button::new("RESUME EXPLORING"))
+                                .clicked()
+                            {
+                                let act = self.input_sm.on_set_menu_page(MenuPage::Closed);
+                                Self::apply_capture_action(ctx, act);
+                            }
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [w, 40.0],
+                                    egui::Button::new(egui::RichText::new("SETTINGS").strong()),
+                                )
+                                .clicked()
+                            {
+                                let act = self.input_sm.on_set_menu_page(MenuPage::Settings);
+                                Self::apply_capture_action(ctx, act);
+                            }
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized([w, 34.0], egui::Button::new("MODULES"))
+                                .clicked()
+                            {
+                                let act = self.input_sm.on_set_menu_page(MenuPage::Modules);
+                                Self::apply_capture_action(ctx, act);
+                            }
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized([w, 34.0], egui::Button::new("TELEPORT LIST"))
+                                .clicked()
+                            {
+                                let act = self.input_sm.on_set_menu_page(MenuPage::Teleports);
+                                Self::apply_capture_action(ctx, act);
+                            }
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized([w, 34.0], egui::Button::new("WORLD MAP  [M]"))
+                                .clicked()
+                            {
+                                let act = self.input_sm.on_set_menu_page(MenuPage::WorldMap);
+                                Self::apply_capture_action(ctx, act);
+                            }
+                            ui.add_space(6.0);
+                            ui.checkbox(&mut self.show_diagnostics, "Show Diagnostics overlay");
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized([w, 30.0], egui::Button::new("Back to Launcher"))
+                                .clicked()
+                            {
+                                let act = self.input_sm.on_set_menu_page(MenuPage::Closed);
+                                Self::apply_capture_action(ctx, act);
+                                self.page = Page::Launcher;
+                            }
+                            if ui
+                                .add_sized([w, 30.0], egui::Button::new("Exit Explorer"))
+                                .clicked()
+                            {
+                                self.save_settings();
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                    });
+            }
+            MenuPage::Settings => {
+                egui::Window::new("SETTINGS  |  ESC to go back")
+                    .default_pos(egui::pos2(16.0, 80.0))
+                    .default_size(egui::vec2(480.0, 440.0))
+                    .collapsible(false)
+                    .resizable(true)
+                    .vscroll(true)
+                    .show(ctx, |ui| {
+                        let tab = self.world_settings_tab;
+                        self.draw_settings(ui, tab);
+                        ui.separator();
+                        if ui.button("Back to menu").clicked() {
+                            self.input_sm.on_set_menu_page(MenuPage::Main);
+                        }
+                    });
+            }
+            MenuPage::Modules => {
+                egui::Window::new("MODULES  |  ESC to go back")
+                    .default_pos(egui::pos2(16.0, 80.0))
+                    .default_size(egui::vec2(460.0, 360.0))
+                    .collapsible(false)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        self.draw_modules(ui);
+                        ui.separator();
+                        if ui.button("Back to menu").clicked() {
+                            self.input_sm.on_set_menu_page(MenuPage::Main);
+                        }
+                    });
+            }
+            MenuPage::Teleports => {
+                egui::Window::new("TELEPORT LIST  |  ESC to go back")
+                    .default_pos(egui::pos2(16.0, 80.0))
+                    .default_size(egui::vec2(460.0, 360.0))
+                    .collapsible(false)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        ui.heading("Explore destinations");
+                        let zones: Vec<String> = self
+                            .detected_client
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .map(|c| c.zones.clone())
+                            .unwrap_or_default();
+                        if !zones.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label("Zone:");
+                                egui::ComboBox::from_id_salt("tp_zone_selector")
+                                    .selected_text(&self.selected_zone)
+                                    .show_ui(ui, |ui| {
+                                        for z in &zones {
+                                            ui.selectable_value(&mut self.selected_zone, z.clone(), z);
+                                        }
+                                    });
+                                if ui.button("Load World").clicked() {
+                                    self.load_selected_zone();
+                                }
+                            });
+                        }
+                        ui.separator();
+                        ui.label("Teleport destinations: missing (client teleport table not decoded yet).");
+                        ui.separator();
+                        if ui.button("Back to menu").clicked() {
+                            self.input_sm.on_set_menu_page(MenuPage::Main);
+                        }
+                    });
+            }
+            MenuPage::WorldMap => {
+                egui::Window::new("WORLD MAP  |  M or ESC to close")
+                    .default_pos(egui::pos2(80.0, 80.0))
+                    .default_size(egui::vec2(420.0, 240.0))
+                    .collapsible(false)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        ui.label("World map tiles: missing (client surfaces/maps tiles not decoded yet).");
+                        ui.label(format!(
+                            "Current camera: X={:.1}, Y={:.1}, Z={:.1}",
+                            self.camera.position.x, self.camera.position.y, self.camera.position.z
+                        ));
+                        if ui.button("Close (M)").clicked() {
+                            self.input_sm.on_set_menu_page(MenuPage::Closed);
+                        }
+                    });
+            }
         }
     }
 
@@ -1545,7 +1788,10 @@ impl ExplorerApp {
                 (SettingsTab::Interface, "Interface"),
             ] {
                 if ui.selectable_label(tab == candidate, label).clicked() {
-                    self.page = Page::Settings(candidate);
+                    self.world_settings_tab = candidate;
+                    if matches!(self.page, Page::Settings(_)) {
+                        self.page = Page::Settings(candidate);
+                    }
                 }
             }
         });

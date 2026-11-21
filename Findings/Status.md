@@ -1,28 +1,38 @@
-# Subsystem Status
+# Forsaken World Explorer — Honest Status Table
 
-Status values: `not-started`, `implemented`, `implemented-partial`, `verified-cpu`, `not-verified-without-gpu`, `verified-by-user`.
-Only the user can mark a subsystem `verified-by-user` after running it locally on a real Forsaken World client and GPU.
+> **Notice (2026-11-21 reset):** Earlier status tables marked rendering, scenery, sky, water, grass, and trees as `verified-cpu` or `implemented` based on synthetic fixtures and Mesa `lavapipe` smoke tests. When tested on real client data, the Phase 5 artifact showed flat green terrain on a fake blue sky with no buildings, no trees, no effects, and broken mouse look. All overstated claims have been withdrawn below.
+>
+> **Allowed status values:**
+> - `working on real data` — confirmed visually by the user in the Windows artifact on real client files (currently **none**).
+> - `decoder verified on real data` — CPU decoder was executed on real Forsaken World client files and produced verified dump output.
+> - `pipeline runs on synthetic fixture` — shader/GPU pipeline compiled and ran on a synthetic fixture (proves pipeline execution only, NOT that the game world renders).
+> - `not working` — withdrawn from earlier claims; awaiting user confirmation on real client data after root-cause fixes.
+> - `missing` — client format or asset not yet decoded; viewer draws nothing for this part and reports it as missing.
+> - `not started` — work has not begun.
+>
+> **Important:** The approximate sky gradient and the synthetic preview scene are **not** game worlds. They have been removed from the default path (the synthetic pipeline test scene is hidden behind a collapsible Developer checkbox, off by default).
 
-| Phase | Subsystem | Status | Evidence | Open Gates | User Verification Notes |
-| --- | --- | --- | --- | --- | --- |
-| 0 | Repository skeleton, Cargo package & GPL-2.0-or-later license | `verified-cpu` | `Cargo.toml`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, CI Linux & Windows builds | None (CI gate passed) | Pending |
-| 0 | Portable root (`<root>/settings/`, `<root>/logs/`, `<root>/cache/`) & legacy import | `verified-cpu` | `src/settings.rs` & `src/logging.rs` unit tests, `tools/check-core.sh`, `--self-test` | Local Windows confirmation of Program Files unwritable prompt | Pending |
-| 0 | Desktop window, native folder picker (`rfd`), menu & Settings tabs | `not-verified-without-gpu` | `src/ui.rs` headless `--smoke-launch` & Windows CI startup launch check | Native Windows folder picker & live GUI rendering | Pending |
-| 0 | Module package discovery (`Modules/*/module.ini`) | `verified-cpu` | `src/modules.rs` unit tests, `tools/check-core.sh`, `--self-test` | None (CI gate passed) | Pending |
-| 0 | Drive client inventory | `verified-cpu` | [Findings/client-inventory.md](client-inventory.md) | `update/pem.exe` SHA-256 `pending` ([#3](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/3)) | Pending |
-| 1 | Client folder detection & `.pck`/`.pkx` archive layer + `pck-survey` | `verified-cpu` | [Findings/archive-format.md](archive-format.md), `src/pck.rs`, `src/client_detect.rs` | Real `models.pck`/`models.pkx` (>2 GiB) local run pending | Pending |
-| 2 | CPU world decoders (`.trn2`, `.t2bk`, `.t2lm`/`.t2lm1`, `.t2mk`, `.ecwld`, `.ecbsd`, DDS) & `cache/terrain-v1` | `verified-cpu` | [Findings/world-formats.md](world-formats.md), `src/terrain_block.rs`, `src/terrain_store.rs`, `src/dxt.rs`, `terrain-memory-check` | Zones `s1`–`s40` local survey pending | Pending |
-| 3 | Free-flight camera math, resolution-scale sizing (`10%–200%`), & `naga` WGSL validation | `verified-cpu` | `src/camera.rs`, `src/bin/shader-validate.rs`, [Findings/gpu-stack.md](gpu-stack.md) | None (CPU/naga CI gate passed) | Pending |
-| 3 | GPU terrain rendering & World View | `not-verified-without-gpu` | `src/terrain_gpu.rs`, `src/ui.rs`, Mesa `lavapipe` smoke test (pipeline execution only, not visual parity) | Live GPU visual check on Windows | Pending |
-| 4 | Static `.bmd` decoder (all supported versions fixture-tested), `.ecwld`/`.ecbsd` transforms, streaming, dedup, 32 MiB pinned texture cache & `scenery-survey` | `verified-cpu` | `src/bmd.rs` (golden-hash + version matrix + fuzz), `src/scenery.rs`, `src/tex_cache.rs`, [Findings/scenery-formats.md](scenery-formats.md), [Findings/scenery-budget.md](scenery-budget.md) | Real `litmodels.pck`/`building.pck` corpus survey via `scenery-survey` | Pending |
-| 4 | Instanced static scenery GPU rendering (opaque + alpha-test) & 1 Hz Diagnostics | `not-verified-without-gpu` | `src/shaders/scenery.wgsl`, `src/terrain_gpu.rs`, Mesa `lavapipe` smoke test | Live GPU check on zone `s0`; whole-world memory unverified | Pending |
-| 5 | Atmosphere CPU logic (time-of-day, `dn_factor`, fog curves, `ECBSDFILEBOXAREA15`/`ECBSDFILEWATER`, water culling/scissor, transparent sort) + `sky-survey`/`water-survey` | `verified-cpu` | `src/atmosphere.rs`, `--self-test`, `src/bin/sky-survey.rs`, `src/bin/water-survey.rs`, [Findings/sky-fog-formats.md](sky-fog-formats.md), [Findings/water-formats.md](water-formats.md) | Run `sky-survey` & `water-survey` locally on watery zones (`s1`–`s40`) | Pending |
-| 5 | Transparent `.bmd` scenery (back-to-front blended, depth write off) | `not-verified-without-gpu` | `src/shaders/scenery.wgsl` (`naga`), `src/terrain_gpu.rs`, Mesa `lavapipe` translucent quad smoke check | Live GPU visual check in `s0` | Pending |
-| 5 | Sky gradient, day/night `t2lm`+`t2lm1` & `.bmd` vertex lighting blend, environmental fog | `implemented-partial` | `src/shaders/sky.wgsl`, `terrain.wgsl`, `scenery.wgsl` (`naga`), Mesa `lavapipe` sky smoke check | Sky gradient is `approximate` until `surfaces.pck` skyboxes are decoded ([#15](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/15)) | Pending |
-| 5 | Experimental water (animated normals, scissored reflection/refraction, shoreline blend, underwater fog/tint) | `implemented-partial` | `src/shaders/water.wgsl` (`naga`), `src/terrain_gpu.rs`, Mesa `lavapipe` water smoke check, [Findings/water-status.md](water-status.md) | Water is not complete; `maps/s0/` has `0` water areas; live GPU check pending | Pending |
-| 6 | SpeedTree 32-bit helper (`tools/fw-speedtree-helper.exe`), protocol, DLL SHA-256 trust check, timeout/crash isolation, `FWST` v1 cache, tree LOD & grass streaming/density + `speedtree-survey`/`grass-survey` | `verified-cpu` | `tools/speedtree/fw-speedtree-helper`, `src/vegetation.rs` unit tests (fake helper + timeout/crash), `--self-test`, Windows CI 32-bit build + `SHA256SUMS.txt`, [Findings/speedtree-formats.md](speedtree-formats.md), [Findings/speedtree-bridge.md](speedtree-bridge.md), [Findings/grass-formats.md](grass-formats.md) | Real `update/speedtreert.dll` baking & `speedtree-survey` local run on Windows | Pending |
-| 6 | Vegetation GPU rendering (instanced trees + alpha-tested leaves + grass + approximate sine wind) | `implemented-partial` | `src/shaders/vegetation.wgsl` (`naga`), `src/terrain_gpu.rs`, Mesa `lavapipe` synthetic tree + grass smoke check, [Findings/vegetation-status.md](vegetation-status.md) | Wind is `approximate` sine sway; live GPU visual check on `s0` grass & forested zones pending | Pending |
-| 7 | World effects, audio (`.ogg` / `sfx.pck`), maps & navigation | `not-started` | `music/*.ogg`, `resources/sfx.pck`, `resources/gfx.pck` observed ([#7](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/7)) | Next phase | — |
-| 8 | Optional Modules (Walker & Populator) | `not-started` | `Modules/{Walker,Populator}/module.ini` placeholders; `data/elements.data` & `data/task_npc.data` observed ([#8](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/8)) | Blocked on Phase 7 | — |
-| 9 | Hardening, user guide & tagged release | `not-started` | `.github/workflows/release.yml`, `tools/package-windows.ps1` | Blocked on Phases 7–8 and user approval | — |
-| Deferred | Hardware ray-traced renderer ("Lighter" equivalent) | `not-started` | Explicitly deferred past Phases 0–7 per project brief | Out of scope for Phases 0–7 | — |
+## Ten Required Visible Results (in verification order)
+
+| # | Visible Result | Status | Honest Evidence / Gap |
+| --- | --- | --- | --- |
+| 1 | Terrain from `maps/s0/` with real heights and textures | `not working` (awaiting user test); terrain/mask/lightmap `decoder verified on real data` | Real `s0.trn2`, `s0_1.t2bk` (256/256 blocks, `68.91..226.16 m`, `height(0,0)=139.30 m`), `s0_1.t2mk` (16 mask areas, 43 layers, `256×256` masks), and `s0_1.t2lm`/`t2lm1` (16×`512×512` DXT1) decoded on real files. Fixed Angelica centered coordinates (`[-512..+512]`, `Z = +512 - row*64 - gz*2`), removed green fallback, and fixed `textures.pck` prefix stripping. Needs user verification in Windows artifact. |
+| 2 | Buildings and rocks from `s0.ecbsd` placements at correct terrain positions | `not working` (awaiting user test); placements `decoder verified on real data` | Real `s0.ecwld`/`s0.ecbsd` decoded (`1,884` unique placements, `0.33 m` median delta from Angelica terrain height). Fixed `litmodels.pck` prefix lookup (`s0/1/litmodel_*.bmd` first) and removed fake tan texture fallback. Needs user verification in Windows artifact with real `litmodels.pck`/`textures.pck`. |
+| 3 | Trees from SpeedTree runtime DLL (32-bit helper) and grass from client placements | `not working` (awaiting user test); grass placements & DLL fingerprint `decoder verified on real data` | `s0` has `0` tree placements and `2` grass types (`5` unique placements); `update/speedtreert.dll` SHA-256 verified (`1a62ff4d...`). 32-bit helper builds in Windows CI but has not been run against live `.spt` files. |
+| 4 | Lightmaps and day/night blending with time-of-day slider | `not working` (awaiting user test); `s0_1.t2lm`/`t2lm1` `decoder verified on real data` | Both 16-area `512×512` DXT1 lightmap files decode cleanly and stitch into day/night terrain textures; visual result awaiting user verification. |
+| 5 | Water planes from client water data (reflection & refraction) | `pipeline runs on synthetic fixture` | `s0` has `0` water planes (`ECBSDFILEWATER`). Water pipeline executes on Mesa `lavapipe` synthetic fixture only; not tested on a real zone with water. |
+| 6 | Effects (`ECWLD` effects and fire/glows from `gfx.pck`) | `missing` | Client effect record and `gfx.pck` formats are not decoded yet. Viewer draws nothing and reports `Effects: missing`. |
+| 7 | Sky from client skybox textures (`surfaces.pck`) | `missing` ([Issue #15](https://github.com/kasperfriend/Forsaken-World-Explorer/issues/15)) | `surfaces.pck` skybox textures are not decoded yet. Approximate blue sky gradient has been removed from the default real-world path; viewer clears to dark background and reports `Sky: missing`. |
+| 8 | Minimap and world map from client map tiles | `missing` | `surfaces/maps` and minimap tile formats are not decoded yet. UI shows camera coordinates and reports map tiles as `missing`. |
+| 9 | Teleport list from client teleport data | `missing` | Client teleport destination table is not decoded yet. ESC → Teleport List provides zone switching and reports destinations as `missing`. |
+| 10 | Audio (zone music, ambience, effects) from `sfx.pck` & loose music | `not started` | Audio backend and `sfx.pck` playback not yet started. |
+
+## Core Infrastructure & Input
+
+| Component | Status | Notes |
+| --- | --- | --- |
+| Mouse capture / release & ESC menu input state machine (`src/input.rs`) | `pipeline runs on synthetic fixture` (CPU unit tests pass; awaiting Windows user test) | Left-click captures/hides cursor (`CursorGrab::Locked`), mouse look & WASD apply only while captured, Escape releases cursor and unwinds `Settings`/`Modules`/`Teleports` → `Main` → `Closed`, `M` toggles World Map, focus loss releases cursor. |
+| Real-zone diagnostic dump (`--dump-zone <zone>`) | `decoder verified on real data` | Verified on real `maps/s0/` files; prints stage-by-stage counts, height probes, texture paths, and placement deltas. |
+| End-to-end real-loader CI fixture test (`tests/real_loader_e2e.rs`) | `pipeline runs on synthetic fixture` | Exercises real `TerrainSession::open_zone` and `zone_dump::dump_zone` on a tiny real-format fixture (not synthetic preview). |
+| Mesa `lavapipe` offscreen render smoke (`terrain-render-smoke`) | `pipeline runs on synthetic fixture` | Proves WGSL shaders and `wgpu` pipelines compile and execute on CPU software Vulkan; does NOT prove the viewer works on game data. |
+| Portable root layout (`<root>/{settings,logs,cache}/`) & native folder picker | `pipeline runs on synthetic fixture` | Runs in Windows CI; awaiting user re-verification on real client. |

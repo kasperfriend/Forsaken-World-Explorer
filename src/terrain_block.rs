@@ -67,6 +67,7 @@ pub struct Trn2Header {
     pub mask_areas: u32,
     pub mask_size: u32,
     pub sub_terrain_count: u32,
+    pub texture_paths: Vec<String>,
 }
 
 impl Trn2Header {
@@ -85,9 +86,30 @@ impl Trn2Header {
         let num_blocks = u32le(data, 24)?;
         let block_rows = u32le(data, 28)?;
         let block_cols = u32le(data, 32)?;
+        let num_textures = u32le(data, 36)? as usize;
         let mask_areas = u32le(data, 40)?;
         let mask_size = u32le(data, 48)?;
         let sub_terrain_count = u32le(data, 52)?;
+        let mut texture_paths = Vec::new();
+        if data.len() >= 76 && num_textures <= 256 {
+            let tex_off = u32le(data, 72)? as usize;
+            if tex_off >= 76 && tex_off < data.len() {
+                let mut cur = tex_off;
+                for _ in 0..num_textures {
+                    if cur + 4 > data.len() {
+                        break;
+                    }
+                    let slen = u32le(data, cur)? as usize;
+                    cur += 4;
+                    if slen == 0 || slen > 512 || cur + slen > data.len() {
+                        break;
+                    }
+                    let (decoded, _, _) = encoding_rs::GB18030.decode(&data[cur..cur + slen]);
+                    texture_paths.push(decoded.into_owned());
+                    cur += slen;
+                }
+            }
+        }
         if block_grid == 0 || block_grid > 128 {
             return Err(format!("unsupported trn2 block_grid {block_grid}"));
         }
@@ -106,6 +128,7 @@ impl Trn2Header {
             mask_areas,
             mask_size,
             sub_terrain_count,
+            texture_paths,
         })
     }
 }
@@ -185,9 +208,9 @@ impl T2bkFile {
             return Err(format!("t2bk block {index} header truncated"));
         }
 
-        let row = i16le(data, off)?;
-        let col = i16le(data, off + 2)?;
-        let mask_area = i16le(data, off + 4)?;
+        let mask_area = i16le(data, off)?;
+        let row = i16le(data, off + 4)?;
+        let col = i16le(data, off + 6)?;
         let lod_scale = f32le(data, off + 8)?;
 
         let (sz_hei, sz_nor, sz_diff, sz_diff1) = if self.version >= 6 {
@@ -446,6 +469,102 @@ impl T2mkHeader {
 }
 
 /// Synthetic terrain fixture builders for deterministic CPU unit and golden-hash tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct T2mkLayerRef {
+    pub layer_index: u32,
+    pub data_offset: u32,
+    pub data_len: u32,
+}
+
+impl T2mkHeader {
+    /// Parse the layer list for one mask area (`0..num_areas`).
+    pub fn area_layers(&self, data: &[u8], area: usize) -> Result<Vec<T2mkLayerRef>, String> {
+        let &off_u32 = self
+            .offsets
+            .get(area)
+            .ok_or_else(|| format!("t2mk area {area} out of range"))?;
+        let off = off_u32 as usize;
+        if off + 4 > data.len() {
+            return Err(format!("t2mk area {area} header truncated"));
+        }
+        let count = u32le(data, off)? as usize;
+        if count > 64 {
+            return Err(format!(
+                "t2mk area {area} layer count {count} exceeds limit"
+            ));
+        }
+        let table_end = off + 4 + count * 12;
+        if table_end > data.len() {
+            return Err(format!("t2mk area {area} layer table truncated"));
+        }
+        let mut layers = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = off + 4 + i * 12;
+            layers.push(T2mkLayerRef {
+                layer_index: u32le(data, base)?,
+                data_offset: u32le(data, base + 4)?,
+                data_len: u32le(data, base + 8)?,
+            });
+        }
+        Ok(layers)
+    }
+
+    /// Decode an 8-bit alpha mask for one layer. Returns `(side_px, alpha_bytes)`.
+    /// Base layers (`data_len == 0`) return `(1, vec![255])`.
+    pub fn decode_layer_mask(
+        &self,
+        data: &[u8],
+        layer: &T2mkLayerRef,
+    ) -> Result<(u32, Vec<u8>), String> {
+        if layer.data_len == 0 {
+            return Ok((1, vec![255]));
+        }
+        let start = layer.data_offset as usize;
+        let end = start
+            .checked_add(layer.data_len as usize)
+            .ok_or_else(|| "t2mk layer offset overflow".to_string())?;
+        let slice = data
+            .get(start..end)
+            .ok_or_else(|| format!("t2mk layer payload {start}..{end} out of bounds"))?;
+        let raw = if self.compressed != 0 {
+            let mut decomp = Decompress::new(true);
+            let mut out = Vec::with_capacity(256 * 256);
+            let mut in_pos = 0usize;
+            let mut buf = [0u8; 8192];
+            loop {
+                let before_in = decomp.total_in();
+                let before_out = decomp.total_out();
+                let status = decomp
+                    .decompress(&slice[in_pos..], &mut buf, FlushDecompress::None)
+                    .map_err(|e| format!("t2mk zlib decode failed: {e}"))?;
+                in_pos += (decomp.total_in() - before_in) as usize;
+                let produced = (decomp.total_out() - before_out) as usize;
+                out.extend_from_slice(&buf[..produced]);
+                if out.len() > 1024 * 1024 {
+                    return Err("t2mk mask exceeds 1 MiB safety limit".into());
+                }
+                if status == Status::StreamEnd {
+                    break;
+                }
+                if in_pos >= slice.len() && produced == 0 {
+                    break;
+                }
+            }
+            out
+        } else {
+            slice.to_vec()
+        };
+        let side = (raw.len() as f64).sqrt().round() as u32;
+        if (side as usize) * (side as usize) != raw.len() || side == 0 {
+            return Err(format!(
+                "t2mk decoded mask length {} is not a square",
+                raw.len()
+            ));
+        }
+        Ok((side, raw))
+    }
+}
+
 pub mod synthetic {
     use super::*;
     use flate2::{write::ZlibEncoder, Compression};
@@ -488,11 +607,10 @@ pub mod synthetic {
 
             let row = (idx / 4) as i16;
             let col = (idx % 4) as i16;
+            blocks_bytes.extend_from_slice(&0i16.to_le_bytes());
+            blocks_bytes.extend_from_slice(&0i16.to_le_bytes());
             blocks_bytes.extend_from_slice(&row.to_le_bytes());
             blocks_bytes.extend_from_slice(&col.to_le_bytes());
-            blocks_bytes.extend_from_slice(&0i16.to_le_bytes());
-            blocks_bytes.push(0);
-            blocks_bytes.push(0);
             blocks_bytes.extend_from_slice(&0.25f32.to_le_bytes());
             blocks_bytes.extend_from_slice(&1u32.to_le_bytes());
             blocks_bytes.extend_from_slice(&(c_hei.len() as u32).to_le_bytes());
