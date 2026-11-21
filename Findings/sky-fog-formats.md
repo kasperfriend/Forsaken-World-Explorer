@@ -1,41 +1,29 @@
-# Sky, Lighting & Environmental Fog Formats (`EC_SunMoon`, `ECBSDFILEBOXAREA15`)
+# Sky, Lighting & Environmental Fog Formats (`EC_SunMoon`, `ECBSDFILEBOXAREA15`, `A3DSkySphere`)
 
-This document records the verified Forsaken World sky, time-of-day, lighting, and fog data formats, with evidence per field and explicit notes where defaults or approximations remain.
+This document records the verified Forsaken World sky, time-of-day, lighting, and fog data formats with source-file line citations.
 
-## 1. Time-of-Day & Day/Night Blend (`EC_SunMoon.h`)
+## 1. Client Sky Rendering Path (`EC_World.cpp` + `ECBSDFILEBOXAREA15`)
+
+- **Source citations (`ForsakenWorldv260ClientSource/SMElement/SMElementClient/EC_World.cpp`):**
+  - `EC_World.cpp:865–888` (`CECWorld::LoadSky`): instantiates `A3DSkySphere`, initializes it with 3 textures (`Cap`, `SurroundF`, `SurroundB`), sets `SetFlySpeedU(0.003f)` and `SetFlySpeedV(0.003f)`, and attaches it to `A3DEngine::SetSky`.
+  - `EC_World.cpp:1367–1374` (`CECWorld::Render`): renders `m_pA3DSky->Render()` **first**, behind terrain.
+- **BoxArea sky texture paths (`EC_WorldFile.h`, `ECBSDFILEBOXAREA15`, verified on real `maps/s0/s0.ecbsd`):**
+  - Offset `+272`: `fCapTileSpeed` (`f32`, `8.0` on `s0`), `+276`: `fCapRotSpeed` (`f32`, `0.0` on `s0`).
+  - Offset `+280`: **6 length-prefixed GBK sky texture paths** (3 Day: `Cap`, `SurroundF`, `SurroundB`; 3 Night: `Cap`, `SurroundF`, `SurroundB`):
+    - `export_id = 2` (`iDefArea = 1`, default zone sky at `s0.ecbsd` offset `215`):
+      - Day & Night Cap: `希腊天空\静谧花园顶.bmp`
+      - Day & Night SurroundF: `希腊天空\巨人峰夜天1.bmp`
+      - Day & Night SurroundB: `希腊天空\巨人峰夜天2.bmp`
+    - `export_id = 53` (`iDefArea = 0`, regional override at `s0.ecbsd` offset `5184`):
+      - Day & Night Cap: `登录界面天空\城堡白天顶.bmp`
+      - Day & Night SurroundF: `S0天空\S0侧1.bmp`
+      - Day & Night SurroundB: `S0天空\S0侧2.bmp`
+- **No synthetic sky fallback:** `src/shaders/sky.wgsl` renders ONLY when all 3 real client sky textures resolve and decode (`.dds` or `.bmp`) from `surfaces.pck`/`textures.pck`. If any sky texture is missing, the sky pass is skipped (plain clear color) and the UI/dump reports `Sky: missing: <reason>`.
+
+## 2. Time-of-Day & Day/Night Blend (`EC_SunMoon.h`)
 
 **Evidence:** Directly verified from `ForsakenWorldv260ClientSource/SMElement/SMElementClient/EC_SunMoon.h`.
 
-- Time-of-day is stored as a normalized day fraction `m_vTimeOfTheDay` in `[0.0, 1.0)` (`0.0 = 00:00`, `1.0 = 24:00`, i.e. `hours / 24.0`), wrapping cleanly across midnight.
-- **Client transition constants:**
-  - `NIGHT_DAY_START = 3.0 / 24.0` (`03:00`) -> `NIGHT_DAY_END = 7.0 / 24.0` (`07:00`): `dn_factor` ramps from `1.0` (full night) to `0.0` (full day).
-  - `DAWN_TIME = 3.5 / 24.0` (`03:30`), `MID_NOON = 12.0 / 24.0` (`12:00` — viewer default time-of-day), `SUN_SET = 21.0 / 24.0` (`21:00`).
-  - `DAY_NIGHT_START = 18.0 / 24.0` (`18:00`) -> `DAY_NIGHT_END = 21.0 / 24.0` (`21:00`): `dn_factor` ramps from `0.0` (full day) to `1.0` (full night).
-  - `SUN_MAX_PITCH = 70°`, `MOON_MAX_PITCH = 60°`.
-- Both terrain day/night lightmaps (`t2lm` + `t2lm1`) and static `.bmd` per-vertex `day_diffuse` / `night_diffuse` colors blend using this exact `dn_factor` (`mix(day, night, dn_factor)`).
-
-## 2. Regional Sky, Lighting & Fog Box Areas (`ECBSDFILEBOXAREA15`)
-
-**Evidence:** Directly verified from `ForsakenWorldv260ClientSource/SMElement/SMCommon/EC_WorldFile.h` (`struct ECBSDFILEBOXAREA14` / `ECBSDFILEBOXAREA15`) and real `maps/s0/s0.ecwld` (v14) + `maps/s0/s0.ecbsd` (v15).
-
-In `.ecwld` (v9+), each block's `iNumBoxArea` entries are `ECWDFILEDATAREF { dwExportID, dwOffset }` records pointing into `<zone>.ecbsd`. At `dwOffset`, `<zone>.ecbsd` (v15) stores `ECBSDFILEBOXAREA15`:
-
-| Offset (bytes) | Field(s) | Type | Meaning |
-| --- | --- | --- | --- |
-| `0..8` | `iDefArea`, `dwAreaFlags` | `i32`, `u32` | Non-zero marks the default zone-wide atmosphere box |
-| `8..68` | `vPos`, `vExt`, `vAxisX`, `vAxisY`, `vAxisZ` | `5 × [f32; 3]` | Oriented bounding box center, half-extents, and basis |
-| `68..84` | `fFogStart`, `fFogEnd`, `fFogDensity`, `dwFogColor` | `3 × f32`, `u32` | Daylight environmental fog parameters (ARGB) |
-| `84..100` | `fUWFogStart`, `fUWFogEnd`, `fUWFogDensity`, `dwUWFogCol` | `3 × f32`, `u32` | Daylight underwater fog parameters (ARGB) |
-| `100..116` | `fFogStart_n`, `fFogEnd_n`, `fFogDensity_n`, `dwFogColor_n` | `3 × f32`, `u32` | Night environmental fog parameters (ARGB) |
-| `116..144` | `vLightDir`, `dwAmbient`, `dwDirLtCol`, `dwAmbient_n`, `dwDirLtCol_n` | `[f32; 3]`, `4 × u32` | Directional light vector & day/night ambient + sun colors |
-| `144..220` | `vSkySpeed`, `dwTrnLtScale`, `dwTransTime`, rain/snow, `fSunPower`, cloud colors, night UW fog | mixed | Sky cloud motion, sun power, night underwater fog (`fUWFogStart_n..dwUWFogCol_n`) |
-
-**Real-file verification on `maps/s0/`:** `s0.ecwld` + `s0.ecbsd` contains **2** unique box areas:
-- `dwExportID = 2` (`iDefArea = 1`, half-extents `512 × 512`, zone-wide default atmosphere)
-- `dwExportID = 53` (`iDefArea = 0`, regional atmosphere override inside `s0`)
-
-## 3. Documented Approximations
-
-- **Sky dome rendering:** Uses a procedural time-of-day zenith/horizon gradient + sun/moon disc driven by `EC_SunMoon` pitch and `ECBSDFILEBOXAREA15` day/night fog & cloud colors (`approximate` until full client skybox texture sets from `surfaces.pck` are decoded).
-- **Scenery without vertex light arrays (`v2` `.bmd`):** Falls back to directional + hemisphere lighting driven by `ECBSDFILEBOXAREA15` `vLightDir` / `dwAmbient` / `dwDirLtCol` and is labeled `approximate` in the UI.
-- **Scenery with `v3`–`v5` `.bmd` vertex light arrays:** Uses the real decoded `day_diffuse` / `night_diffuse` colors blended by `dn_factor` (labeled `client day/night` in Diagnostics).
+- `NIGHT_DAY_START = 3.0 / 24.0` (`03:00`) -> `NIGHT_DAY_END = 7.0 / 24.0` (`07:00`): `dn_factor` ramps `1.0 -> 0.0`.
+- `DAY_NIGHT_START = 18.0 / 24.0` (`18:00`) -> `DAY_NIGHT_END = 21.0 / 24.0` (`21:00`): `dn_factor` ramps `0.0 -> 1.0`.
+- `MID_NOON = 12.0 / 24.0`, `SUN_MAX_PITCH = 70°`, `MOON_MAX_PITCH = 60°`.

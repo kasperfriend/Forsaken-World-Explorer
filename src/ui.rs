@@ -22,7 +22,9 @@ use forsaken_world_explorer::{
     logging::{self, RunLogger},
     modules::Registry,
     pck::PckArchive,
-    scenery::{self, SceneryDiagnostics, SceneryModelCache},
+    scenery::{
+        self, FrameTimingWindow, SceneryDecodeWorker, SceneryDiagnostics, SceneryModelCache,
+    },
     settings::{
         GrassDensity, PortablePaths, ViewerSettings, WaterQuality, DEFAULT_FOG_DIST_MULT_PCT,
         DEFAULT_SCENERY_LOADS_PER_FRAME, DEFAULT_SCENERY_MAX_INSTANCES, DEFAULT_SCENERY_RADIUS_M,
@@ -36,9 +38,10 @@ use forsaken_world_explorer::{
         MIN_VEG_MAX_INSTANCES, MIN_VEG_RADIUS_M,
     },
     terrain_gpu::{
-        build_scenery_batches_for_model, build_tree_batches, CameraUniform, SceneryDrawSnapshot,
-        SceneryInstance, TerrainMeshSnapshot, TerrainSession, TerrainTextureSnapshot,
-        TerrainViewportRenderer, VegetationDrawBatch, VegetationDrawSnapshot, WaterRenderSnapshot,
+        build_scenery_batches_for_model, build_tree_batches, CameraUniform, GpuStageTimings,
+        SceneryDrawSnapshot, SceneryInstance, SkyTextureSnapshot, TerrainMeshSnapshot,
+        TerrainSession, TerrainSplatSnapshot, TerrainTextureSnapshot, TerrainViewportRenderer,
+        VegetationDrawBatch, VegetationDrawSnapshot, WaterRenderSnapshot,
     },
     tex_cache::{DecodedTexture, TextureCache},
     vegetation::{
@@ -46,10 +49,7 @@ use forsaken_world_explorer::{
         TreeTypeDef, DEFAULT_HELPER_TIMEOUT_SECS, SPEEDTREE_CACHE_SUBDIR,
     },
     world_objects::{self, OrnamentPlacement},
-    zone_dump::{
-        bmd_lookup_candidates_for_archive, open_all_resource_pcks,
-        texture_lookup_candidates_for_archive, FailureGroup,
-    },
+    zone_dump::{open_all_resource_pcks, texture_lookup_candidates_for_archive, FailureGroup},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,7 +77,10 @@ struct TerrainCallback {
     mesh: Arc<TerrainMeshSnapshot>,
     day_lightmap: Arc<TerrainTextureSnapshot>,
     night_lightmap: Arc<TerrainTextureSnapshot>,
+    splat: Arc<TerrainSplatSnapshot>,
+    sky: Arc<SkyTextureSnapshot>,
     scenery: Arc<SceneryDrawSnapshot>,
+    gpu_timings_out: Arc<std::sync::Mutex<GpuStageTimings>>,
     vegetation: Arc<VegetationDrawSnapshot>,
     water: Arc<WaterRenderSnapshot>,
     draw_sky_gradient: bool,
@@ -97,7 +100,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         let Some(renderer) = callback_resources.get_mut::<TerrainViewportRenderer>() else {
             return Vec::new();
         };
-        vec![renderer.prepare_frame(
+        let cmd = renderer.prepare_frame(
             device,
             queue,
             self.viewport_w,
@@ -107,13 +110,19 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             &self.mesh,
             &self.day_lightmap,
             &self.night_lightmap,
+            &self.splat,
+            &self.sky,
             &self.scenery,
             &self.vegetation,
             &self.water,
             self.draw_sky_gradient,
             self.terrain_has_real_textures,
             self.terrain_wireframe_debug,
-        )]
+        );
+        if let Ok(mut guard) = self.gpu_timings_out.lock() {
+            *guard = renderer.last_timings;
+        }
+        vec![cmd]
     }
 
     fn paint(
@@ -129,8 +138,8 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
 }
 
 struct ActiveSceneryState {
-    client_root: Option<PathBuf>,
-    zone: String,
+    _client_root: Option<PathBuf>,
+    _zone: String,
     placements: Vec<OrnamentPlacement>,
     box_areas: Vec<BoxAreaAtmosphere>,
     water_planes: Vec<WaterPlane>,
@@ -141,6 +150,9 @@ struct ActiveSceneryState {
     failure_groups: BTreeMap<String, FailureGroup>,
     bmd_tex_failed: usize,
     synthetic_bmd_bytes: Option<Vec<u8>>,
+    worker: Option<SceneryDecodeWorker>,
+    last_batch_sig: u64,
+    cached_snapshot: SceneryDrawSnapshot,
     revision: u64,
 }
 
@@ -185,8 +197,8 @@ impl ActiveSceneryState {
         let model_cache = SceneryModelCache::open(cache_root)?;
         let tex_cache = TextureCache::new(tex_budget_bytes);
         Ok(Self {
-            client_root: Some(client_root.to_path_buf()),
-            zone: zone.to_string(),
+            _client_root: Some(client_root.to_path_buf()),
+            _zone: zone.to_string(),
             placements,
             box_areas,
             water_planes: Vec::new(),
@@ -197,6 +209,13 @@ impl ActiveSceneryState {
             failure_groups: BTreeMap::new(),
             bmd_tex_failed: 0,
             synthetic_bmd_bytes: None,
+            worker: Some(SceneryDecodeWorker::spawn(
+                client_root.to_path_buf(),
+                zone.to_string(),
+                32,
+            )),
+            last_batch_sig: 0,
+            cached_snapshot: SceneryDrawSnapshot::default(),
             revision: 0,
         })
     }
@@ -239,8 +258,8 @@ impl ActiveSceneryState {
             color_rgba: [0.06, 0.54, 0.84, 0.85],
         }];
         Ok(Self {
-            client_root: None,
-            zone: "synthetic-preview".to_string(),
+            _client_root: None,
+            _zone: "synthetic-preview".to_string(),
             placements,
             box_areas: vec![BoxAreaAtmosphere::default()],
             water_planes,
@@ -251,6 +270,9 @@ impl ActiveSceneryState {
             failure_groups: BTreeMap::new(),
             bmd_tex_failed: 0,
             synthetic_bmd_bytes: Some(raw_bmd),
+            worker: None,
+            last_batch_sig: 0,
+            cached_snapshot: SceneryDrawSnapshot::default(),
             revision: 0,
         })
     }
@@ -291,6 +313,9 @@ impl ActiveSceneryState {
                 placements_loaded: 0,
                 placements_failed: 0,
                 placements_pending: 0,
+                not_drawn_collide_only: 0,
+                not_drawn_transparent_disabled: 0,
+                not_drawn_empty_mesh: 0,
                 unique_models_in_range: 0,
                 models_loaded: self.model_cache.loaded_count(),
                 instances_drawn: 0,
@@ -326,46 +351,47 @@ impl ActiveSceneryState {
         );
         let dedup = scenery::dedup_instances_by_model(&visible);
 
-        let zone = self.zone.clone();
-        let client_root_opt = self.client_root.clone();
-        let synth = self.synthetic_bmd_bytes.clone();
-        let resource_archives = &mut self.resource_archives;
-        let has_open_errors = !self.archive_open_errors.is_empty();
-        let (_decoded_now, errs, drawn_instances, _total_trans) = scenery::step_streaming_frame(
-            &mut self.model_cache,
-            &dedup,
-            settings.scenery_loads_per_frame as usize,
-            |model_key| {
-                if let Some(raw) = &synth {
-                    return Ok(raw.clone());
+        let mut errs = Vec::new();
+        if let Some(worker) = self.worker.as_mut() {
+            // Enqueue uncached in-range models to background worker (bounded queue, non-blocking)
+            for batch in &dedup {
+                if self.model_cache.get(&batch.model_key).is_none()
+                    && !self.model_cache.is_failed(&batch.model_key)
+                {
+                    worker.enqueue(&batch.model_key);
                 }
-                for (_, mount, arch) in resource_archives.iter_mut() {
-                    for cand in bmd_lookup_candidates_for_archive(&zone, model_key, Some(mount)) {
-                        if let Ok(bytes) = arch.read_entry(&cand) {
-                            return Ok(bytes);
+            }
+            // Drain ready decoded models & textures (capped by scenery_loads_per_frame)
+            let ready = worker.poll_ready(settings.scenery_loads_per_frame as usize);
+            for job in ready {
+                match job.result {
+                    Ok((model, textures)) => {
+                        for (tpath, dt) in textures {
+                            let _ = self.tex_cache.get_or_insert_pinned(&tpath, || Ok(dt));
                         }
+                        self.model_cache.insert_parsed(&job.model_key, model);
+                    }
+                    Err(e) => {
+                        self.model_cache.insert_failed(&job.model_key, e.clone());
+                        errs.push(e);
                     }
                 }
-                if let Some(root) = &client_root_opt {
-                    let loose = root
-                        .join("litmodels")
-                        .join(&zone)
-                        .join(model_key.replace('\\', "/"));
-                    if let Ok(bytes) = fs::read(&loose) {
-                        return Ok(bytes);
+            }
+        } else {
+            let synth = self.synthetic_bmd_bytes.clone();
+            let (_decoded_now, sync_errs, _drawn, _trans) = scenery::step_streaming_frame(
+                &mut self.model_cache,
+                &dedup,
+                settings.scenery_loads_per_frame as usize,
+                |model_key| {
+                    if let Some(raw) = &synth {
+                        return Ok(raw.clone());
                     }
-                }
-                if resource_archives.is_empty() {
-                    if has_open_errors {
-                        Err(format!("archive_open_error: {model_key}"))
-                    } else {
-                        Err(format!("archive_not_found: {model_key}"))
-                    }
-                } else {
                     Err(format!("entry_not_found: {model_key}"))
-                }
-            },
-        );
+                },
+            );
+            errs.extend(sync_errs);
+        }
         for e in &errs {
             let (reason, sample) = if e.contains("archive_open_error") {
                 ("archive_open_error", e.as_str())
@@ -387,74 +413,100 @@ impl ActiveSceneryState {
             }
         }
 
-        self.tex_cache.begin_visible_batch();
-        let mut opaque_batches = Vec::new();
-        let mut transparent_batches = Vec::new();
+        // Compute deterministic signature of visible loaded batches so we NEVER rebuild GPU
+        // buffers or re-upload textures when the visible set hasn't changed.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        settings.transparent_scenery_enabled.hash(&mut hasher);
+        for batch in &dedup {
+            batch.model_key.hash(&mut hasher);
+            batch.transforms.len().hash(&mut hasher);
+            self.model_cache
+                .get(&batch.model_key)
+                .is_some()
+                .hash(&mut hasher);
+        }
+        let sig = hasher.finish();
         let mut approx_lighting_meshes = 0usize;
         let mut transparent_skipped = 0usize;
 
-        for (b_idx, batch) in dedup.iter().enumerate() {
-            if let Some(model) = self.model_cache.get(&batch.model_key) {
-                let resource_archives = &mut self.resource_archives;
-                let tex_cache = &mut self.tex_cache;
-                let bmd_tex_failed = &mut self.bmd_tex_failed;
-                let (op, tr, approx, skipped) = build_scenery_batches_for_model(
-                    &model,
-                    &batch.transforms,
-                    settings.transparent_scenery_enabled,
-                    (b_idx as u64) << 32,
-                    |tex_path| {
-                        let res = tex_cache.get_or_insert_pinned(tex_path, || {
-                            for (_, mount, arch) in resource_archives.iter_mut() {
-                                if !matches!(
-                                    mount.as_str(),
-                                    "textures" | "litmodels" | "building" | "models" | "surfaces"
-                                ) {
-                                    continue;
-                                }
-                                for cand in
-                                    texture_lookup_candidates_for_archive(tex_path, Some(mount))
-                                {
-                                    if let Ok(bytes) = arch.read_entry(&cand) {
-                                        let surf = dxt::parse_dds(&bytes)?;
-                                        let rgba = dxt::decode_rgba8(&surf);
-                                        return Ok(DecodedTexture {
-                                            width: surf.width,
-                                            height: surf.height,
-                                            rgba,
-                                        });
+        if sig != self.last_batch_sig {
+            self.tex_cache.begin_visible_batch();
+            let mut opaque_batches = Vec::new();
+            let mut transparent_batches = Vec::new();
+            for (b_idx, batch) in dedup.iter().enumerate() {
+                if let Some(model) = self.model_cache.get(&batch.model_key) {
+                    let resource_archives = &mut self.resource_archives;
+                    let tex_cache = &mut self.tex_cache;
+                    let bmd_tex_failed = &mut self.bmd_tex_failed;
+                    let (op, tr, approx, skipped) = build_scenery_batches_for_model(
+                        &model,
+                        &batch.transforms,
+                        settings.transparent_scenery_enabled,
+                        (b_idx as u64) << 32,
+                        |tex_path| {
+                            let res = tex_cache.get_or_insert_pinned(tex_path, || {
+                                for (_, mount, arch) in resource_archives.iter_mut() {
+                                    if !matches!(
+                                        mount.as_str(),
+                                        "textures"
+                                            | "litmodels"
+                                            | "building"
+                                            | "models"
+                                            | "surfaces"
+                                    ) {
+                                        continue;
+                                    }
+                                    for cand in
+                                        texture_lookup_candidates_for_archive(tex_path, Some(mount))
+                                    {
+                                        if let Ok(bytes) = arch.read_entry(&cand) {
+                                            let surf = dxt::parse_dds(&bytes)?;
+                                            let rgba = dxt::decode_rgba8(&surf);
+                                            return Ok(DecodedTexture {
+                                                width: surf.width,
+                                                height: surf.height,
+                                                rgba,
+                                            });
+                                        }
                                     }
                                 }
+                                Err(format!("missing texture {tex_path}"))
+                            });
+                            if res.is_err() {
+                                *bmd_tex_failed += 1;
                             }
-                            Err(format!("missing texture in archives: {tex_path}"))
-                        });
-                        if res.is_err() {
-                            *bmd_tex_failed += 1;
-                        }
-                        res.ok()
-                    },
-                );
-                opaque_batches.extend(op);
-                transparent_batches.extend(tr);
-                approx_lighting_meshes += approx;
-                transparent_skipped += skipped;
+                            res.ok()
+                        },
+                    );
+                    opaque_batches.extend(op);
+                    transparent_batches.extend(tr);
+                    approx_lighting_meshes += approx;
+                    transparent_skipped += skipped;
+                }
             }
+            atmosphere::sort_transparent_back_to_front(&mut transparent_batches, camera_pos, |b| {
+                (b.sort_center, b.sort_id)
+            });
+            self.revision = self.revision.wrapping_add(1);
+            self.cached_snapshot = SceneryDrawSnapshot {
+                opaque_batches,
+                transparent_batches,
+                revision: self.revision,
+            };
+            self.last_batch_sig = sig;
         }
-
-        // Sort transparent submeshes strictly back-to-front per instance and per submesh
-        atmosphere::sort_transparent_back_to_front(&mut transparent_batches, camera_pos, |b| {
-            (b.sort_center, b.sort_id)
-        });
-
-        if let Some(warn_msg) = self.tex_cache.enforce_budget_after_batch() {
-            if let Some(log) = logger.as_mut() {
-                log.warn(&warn_msg);
-            }
-        }
-
+        let opaque_batches = self.cached_snapshot.opaque_batches.clone();
+        let transparent_batches = self.cached_snapshot.transparent_batches.clone();
         let tstats = self.tex_cache.stats();
         let (not_in_range, in_range_cnt, p_loaded, p_failed, p_pending) =
             scenery::compute_placement_counters(self.placements.len(), &visible, &self.model_cache);
+        let (drawn_instances, nd_collide, nd_trans_dis, nd_empty) =
+            scenery::compute_drawn_breakdown(
+                &visible,
+                &self.model_cache,
+                settings.transparent_scenery_enabled,
+            );
         let diag = SceneryDiagnostics {
             placements_total: self.placements.len(),
             placements_not_in_range: not_in_range,
@@ -462,6 +514,9 @@ impl ActiveSceneryState {
             placements_loaded: p_loaded,
             placements_failed: p_failed,
             placements_pending: p_pending,
+            not_drawn_collide_only: nd_collide,
+            not_drawn_transparent_disabled: nd_trans_dis,
+            not_drawn_empty_mesh: nd_empty,
             unique_models_in_range: dedup.len(),
             models_loaded: self.model_cache.loaded_count(),
             instances_drawn: drawn_instances,
@@ -478,7 +533,6 @@ impl ActiveSceneryState {
             gpu_timing_note: "Timestamp queries checked on device init".into(),
         };
 
-        self.revision = self.revision.wrapping_add(1);
         (
             SceneryDrawSnapshot {
                 opaque_batches,
@@ -850,6 +904,11 @@ pub struct ExplorerApp {
     mesh_arc: Arc<TerrainMeshSnapshot>,
     day_lm_arc: Arc<TerrainTextureSnapshot>,
     night_lm_arc: Arc<TerrainTextureSnapshot>,
+    splat_arc: Arc<TerrainSplatSnapshot>,
+    sky_arc: Arc<SkyTextureSnapshot>,
+    gpu_timings_shared: Arc<std::sync::Mutex<GpuStageTimings>>,
+    timing_window: FrameTimingWindow,
+    displayed_timings: FrameTimingWindow,
     scenery_arc: Arc<SceneryDrawSnapshot>,
     veg_arc: Arc<VegetationDrawSnapshot>,
     water_arc: Arc<WaterRenderSnapshot>,
@@ -972,6 +1031,11 @@ impl ExplorerApp {
             mesh_arc: Arc::new(TerrainMeshSnapshot::default()),
             day_lm_arc: Arc::new(TerrainTextureSnapshot::default()),
             night_lm_arc: Arc::new(TerrainTextureSnapshot::default()),
+            splat_arc: Arc::new(TerrainSplatSnapshot::default()),
+            sky_arc: Arc::new(SkyTextureSnapshot::default()),
+            gpu_timings_shared: Arc::new(std::sync::Mutex::new(GpuStageTimings::default())),
+            timing_window: FrameTimingWindow::default(),
+            displayed_timings: FrameTimingWindow::default(),
             scenery_arc: Arc::new(SceneryDrawSnapshot::default()),
             veg_arc: Arc::new(VegetationDrawSnapshot::default()),
             water_arc: Arc::new(WaterRenderSnapshot::default()),
@@ -1065,6 +1129,7 @@ impl ExplorerApp {
         if self.last_diag_refresh.elapsed() >= Duration::from_secs(1) {
             self.displayed_diag = self.latest_diag.clone();
             self.displayed_veg_diag = self.latest_veg_diag.clone();
+            self.displayed_timings = std::mem::take(&mut self.timing_window);
             self.last_diag_refresh = Instant::now();
         }
     }
@@ -1123,6 +1188,8 @@ impl ExplorerApp {
                 self.mesh_arc = Arc::new(session.mesh.clone());
                 self.day_lm_arc = Arc::new(session.day_lightmap.clone());
                 self.night_lm_arc = Arc::new(session.night_lightmap.clone());
+                self.splat_arc = Arc::new(session.splat.clone());
+                self.sky_arc = Arc::new(session.sky.clone());
 
                 // Stage 2: World placements & static .bmd buildings
                 let scenery_note = match ActiveSceneryState::open_zone(
@@ -1259,6 +1326,8 @@ impl ExplorerApp {
                 self.mesh_arc = Arc::new(session.mesh.clone());
                 self.day_lm_arc = Arc::new(session.day_lightmap.clone());
                 self.night_lm_arc = Arc::new(session.night_lightmap.clone());
+                self.splat_arc = Arc::new(session.splat.clone());
+                self.sky_arc = Arc::new(session.sky.clone());
                 if let Ok(st) =
                     ActiveSceneryState::open_synthetic(&self.paths.cache_dir, tex_budget_bytes)
                 {
@@ -1564,8 +1633,24 @@ impl ExplorerApp {
         let aspect = (vp_w as f32) / (vp_h as f32);
         let vp = self.camera.view_proj(aspect);
 
+        let t_frame_start = Instant::now();
+        let t_stream0 = Instant::now();
         if self.scenery_state.is_some() {
             self.step_scenery(vp, scaled_w, scaled_h);
+        }
+        let stream_ms = t_stream0.elapsed().as_secs_f32() * 1000.0;
+        self.timing_window.streaming.record(stream_ms);
+        if let Ok(gt) = self.gpu_timings_shared.lock() {
+            self.timing_window
+                .texture_upload
+                .record(gt.texture_upload_ms);
+            self.timing_window.mesh_upload.record(gt.mesh_upload_ms);
+            self.timing_window.terrain_draw.record(gt.terrain_draw_ms);
+            self.timing_window.scenery_draw.record(gt.scenery_draw_ms);
+            self.timing_window
+                .vegetation_draw
+                .record(gt.vegetation_draw_ms);
+            self.timing_window.water_post.record(gt.water_post_ms);
         }
 
         let active_box = self
@@ -1584,7 +1669,7 @@ impl ExplorerApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
             "Forsaken World Explorer — {active_zone_title}"
         )));
-        let is_synthetic = self
+        let _is_synthetic = self
             .terrain_session
             .as_ref()
             .is_some_and(|s| s.is_synthetic);
@@ -1612,10 +1697,13 @@ impl ExplorerApp {
                 mesh: Arc::clone(&self.mesh_arc),
                 day_lightmap: Arc::clone(&self.day_lm_arc),
                 night_lightmap: Arc::clone(&self.night_lm_arc),
+                splat: Arc::clone(&self.splat_arc),
+                sky: Arc::clone(&self.sky_arc),
                 scenery: Arc::clone(&self.scenery_arc),
+                gpu_timings_out: Arc::clone(&self.gpu_timings_shared),
                 vegetation: Arc::clone(&self.veg_arc),
                 water: Arc::clone(&self.water_arc),
-                draw_sky_gradient: is_synthetic,
+                draw_sky_gradient: self.sky_arc.has_real_textures(),
                 terrain_has_real_textures: self
                     .terrain_session
                     .as_ref()
@@ -1751,13 +1839,24 @@ impl ExplorerApp {
                             "Placements (counted once): total={} = not_in_range({}) + in_range({})",
                             d.placements_total, d.placements_not_in_range, d.placements_in_range
                         ));
+                        let gap = d.placements_loaded.saturating_sub(d.instances_drawn);
+                        let gap_note = if gap > 0 {
+                            format!(
+                                " (not drawn={gap}: collide_only={}, trans_off={}, empty={})",
+                                d.not_drawn_collide_only,
+                                d.not_drawn_transparent_disabled,
+                                d.not_drawn_empty_mesh
+                            )
+                        } else {
+                            String::new()
+                        };
                         ui.small(format!(
-                            "  in_range: loaded({}) + failed({}) + pending({}) | drawn={}{}",
-                            d.placements_loaded,
-                            d.placements_failed,
-                            d.placements_pending,
-                            d.instances_drawn,
-                            bmd_reason
+                            "  in_range: loaded({}) + failed({}) + pending({})",
+                            d.placements_loaded, d.placements_failed, d.placements_pending
+                        ));
+                        ui.small(format!(
+                            "  drawn={} <= loaded({}){gap_note}{bmd_reason}",
+                            d.instances_drawn, d.placements_loaded
                         ));
                         if let Some(st) = &self.scenery_state {
                             if !st.archive_open_errors.is_empty() {
@@ -1777,9 +1876,28 @@ impl ExplorerApp {
                                 }
                             }
                         }
-                        ui.small(
-                            "Sky: missing (Issue #15) | Effects: missing | Audio: not started",
-                        );
+                        let sky_status = if self.sky_arc.status_note.is_empty() {
+                            "missing: no zone loaded"
+                        } else {
+                            self.sky_arc.status_note.as_str()
+                        };
+                        ui.small(format!("Sky: {sky_status}"));
+                        let tm = &self.displayed_timings;
+                        let ui_ms = t_frame_start.elapsed().as_secs_f32() * 1000.0;
+                        self.timing_window.ui.record(ui_ms);
+                        self.timing_window.total_frame.record(ui_ms);
+                        ui.small(format!(
+                            "Frame ms (avg/max): total={:.2}/{:.2} | stream={:.2}/{:.2} | tex_up={:.2}/{:.2} | mesh_up={:.2}/{:.2}",
+                            tm.total_frame.avg_ms(),
+                            tm.total_frame.max_ms,
+                            tm.streaming.avg_ms(),
+                            tm.streaming.max_ms,
+                            tm.texture_upload.avg_ms(),
+                            tm.texture_upload.max_ms,
+                            tm.mesh_upload.avg_ms(),
+                            tm.mesh_upload.max_ms,
+                        ));
+                        ui.small("Effects: missing | Audio: not started");
                     });
                 });
         }

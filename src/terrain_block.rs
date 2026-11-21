@@ -425,13 +425,29 @@ impl T2lmHeader {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Per-layer descriptor stored in `<zone>_1.t2mk` between the mask-area offset table
+/// (`20 + num_areas*4`) and `offsets[0]` (28 bytes per layer; verified on real `s0_1.t2mk`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct T2mkLayerDesc {
+    pub tex_index: u32,
+    pub spec_map_index: i32,
+    pub mask_size: u32,
+    pub proj_axis: u32,
+    /// Texture repeats per world meter along U (e.g. `0.1` = 1 tile per 10 m).
+    pub scale_u: f32,
+    /// Texture repeats per world meter along V.
+    pub scale_v: f32,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct T2mkHeader {
     pub version: u32,
     pub num_areas: u32,
     pub num_layers_field: u32,
     pub compressed: u32,
     pub offsets: Vec<u32>,
+    pub layer_descs: Vec<T2mkLayerDesc>,
 }
 
 impl T2mkHeader {
@@ -463,12 +479,32 @@ impl T2mkHeader {
             }
             offsets.push(off);
         }
+        let mut layer_descs = Vec::new();
+        let first_area_off = offsets.first().copied().unwrap_or(table_end as u32) as usize;
+        if first_area_off >= table_end + (num_layers_field as usize) * 28 && num_layers_field <= 256
+        {
+            for i in 0..(num_layers_field as usize) {
+                let b = table_end + i * 28;
+                let su = f32le(data, b + 16).unwrap_or(0.1);
+                let sv = f32le(data, b + 20).unwrap_or(0.1);
+                layer_descs.push(T2mkLayerDesc {
+                    tex_index: u32le(data, b)?,
+                    spec_map_index: u32le(data, b + 4)? as i32,
+                    mask_size: u32le(data, b + 8)?,
+                    proj_axis: u32le(data, b + 12)?,
+                    scale_u: if su.is_finite() && su > 0.0 { su } else { 0.1 },
+                    scale_v: if sv.is_finite() && sv > 0.0 { sv } else { 0.1 },
+                    weight: u32le(data, b + 24)?,
+                });
+            }
+        }
         Ok(Self {
             version,
             num_areas,
             num_layers_field,
             compressed,
             offsets,
+            layer_descs,
         })
     }
 }

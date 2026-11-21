@@ -264,6 +264,68 @@ pub mod synthetic {
     }
 }
 
+/// Decode either a DDS texture (`DDS `) or an uncompressed 24/32-bit BMP (`BM`) to RGBA8.
+/// Returns `(width, height, rgba8, format_label)`.
+pub fn decode_image_rgba8(data: &[u8]) -> Result<(u32, u32, Vec<u8>, String), String> {
+    if data.len() >= 4 && &data[0..4] == DDS_MAGIC {
+        let surf = parse_dds(data)?;
+        let rgba = decode_rgba8(&surf);
+        return Ok((
+            surf.width,
+            surf.height,
+            rgba,
+            format!("DDS {:?}", surf.format),
+        ));
+    }
+    if data.len() >= 54 && &data[0..2] == b"BM" {
+        let pixel_off = u32le(data, 10)? as usize;
+        let dib_size = u32le(data, 14)?;
+        if dib_size < 40 {
+            return Err(format!("unsupported BMP DIB header size {dib_size}"));
+        }
+        let width_i = i32::from_le_bytes(data[18..22].try_into().unwrap());
+        let height_i = i32::from_le_bytes(data[22..26].try_into().unwrap());
+        let bpp = u16::from_le_bytes([data[28], data[29]]);
+        let compression = u32le(data, 30)?;
+        if compression != 0 || !(bpp == 24 || bpp == 32) {
+            return Err(format!(
+                "unsupported BMP format bpp={bpp} compression={compression}"
+            ));
+        }
+        if width_i <= 0 || height_i == 0 || width_i > 8192 || height_i.abs() > 8192 {
+            return Err(format!("invalid BMP dimensions {width_i}x{height_i}"));
+        }
+        let w = width_i as usize;
+        let h = height_i.unsigned_abs() as usize;
+        let top_down = height_i < 0;
+        let bytes_per_px = (bpp / 8) as usize;
+        let row_stride = (w * bytes_per_px).div_ceil(4) * 4;
+        if pixel_off + row_stride * h > data.len() {
+            return Err("truncated BMP pixel payload".into());
+        }
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let src_y = if top_down { y } else { h - 1 - y };
+            let src_row =
+                &data[pixel_off + src_y * row_stride..pixel_off + (src_y + 1) * row_stride];
+            for x in 0..w {
+                let s = x * bytes_per_px;
+                let d = (y * w + x) * 4;
+                rgba[d] = src_row[s + 2];
+                rgba[d + 1] = src_row[s + 1];
+                rgba[d + 2] = src_row[s];
+                rgba[d + 3] = if bytes_per_px == 4 {
+                    src_row[s + 3]
+                } else {
+                    255
+                };
+            }
+        }
+        return Ok((w as u32, h as u32, rgba, format!("BMP {bpp}bpp")));
+    }
+    Err("unrecognized image header (expected DDS or uncompressed 24/32-bit BMP)".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

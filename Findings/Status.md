@@ -1,35 +1,33 @@
 # Forsaken World Explorer — Status Table
 
 > **Allowed status strings (strict):**
-> - `decoder verified on real data (file + offset evidence)`
-> - `not working: <reason>`
+> - `decoder verified on real data (file + offset)`
+> - `working (user confirmed)`
+> - `not working`
 > - `missing: <reason>`
-> - `fixed in this round, pending user check`
-> - `awaiting user confirmation`
 >
-> A feature is only marked working when the user confirms it on screen in the Windows artifact on real client files. Never report verified based on synthetic fixtures alone.
+> A feature is only marked `working (user confirmed)` after the user confirms it on screen in the Windows artifact on real client files. No fallback colors, synthetic sky, or approximations exist in the default path.
 
 ## Visible Results
 
 | # | Visible Result | Status | Notes |
 | --- | --- | --- | --- |
-| 1a | Terrain layer textures (`textures.pck`, DDS DXT3) | `decoder verified on real data (dump-s0.txt)` | 5/5 `s0` layer textures (`512×512` DXT3, `5,242,880 B`) decode cleanly. |
-| 1b | Terrain rendering (s0) | `not working: black output (Task 1)` | Root cause found & patched: `upload_rgba_view` used `Rgba8UnormSrgb` into linear `Rgba8Unorm` `scene_color` (crushing mid-tones via `pow(x, 2.2)`) and `terrain.wgsl` applied a second synthetic `shade` multiplier. Added `--export-terrain-pngs` + channel stats; awaiting user visual check. |
-| 2 | Buildings and rocks (`.bmd` `0x10000006`) | `not working: v0x10000006 layout unknown (Task 2)` | `sample_litmodel_1000.bmd` (45,318/45,318 B, 12 submeshes, 28 collision hulls) traced and implemented (`mesh_flags_v6: u8` after AABB, bit meaning `unknown`). Awaiting user test on real client + 2 additional `.bmd` samples (`litmodel_1001.bmd` and one `building.pck` model). |
-| 3 | Trees (SpeedTree DLL) & grass | `awaiting user confirmation` | Out of scope for this round; `s0` has 0 tree placements and 5 grass placements. |
-| 4 | Lightmaps & day/night blending | `decoder verified on real data (dump-s0.txt)` | `s0_1.t2lm` and `s0_1.t2lm1` (`16×512×512` DXT1, `zero_frac=0.0000`) verified; unscaled `diffuse × lightmap` used until client modulate scale is confirmed. |
-| 5 | Water planes | `awaiting user confirmation` | Out of scope for this round; `s0` has 0 water records. |
-| 6 | Effects (`ECWLD` / `gfx.pck`) | `missing: ECWLD effect and gfx.pck formats not decoded yet` | Draws nothing. |
-| 7 | Sky (`surfaces.pck` skyboxes) | `missing: surfaces.pck skyboxes not decoded yet (Issue #15)` | Draws dark clear background. |
+| 1a | Buildings (`s0`, 1,884 placements, `A3DLitMesh 0x10000006`) | `working (user confirmed)` | Confirmed on `s0` by user (`1,884/1,884` resolved, `2,993` submeshes, `64/64` sampled textures). |
+| 1b | Trees (SpeedTree DLL) | `working (user confirmed)` | Confirmed on `s0` by user. |
+| 2 | Sky (`A3DSkySphere` from `ECBSDFILEBOXAREA15` + `surfaces.pck`/`textures.pck`) | `not working` | `EC_World.cpp:865-888` & `s0.ecbsd +280` sky paths decoded and wired into `sky.wgsl` (BMP/DDS). Draws nothing (`Sky: missing: <reason>`) if sky textures are absent. Awaiting user confirmation + `--list-entries surfaces.pck --filter sky`. |
+| 3 | Ground detail (terrain textures & splatting) | `not working` | Replaced blurry 512×512 whole-zone diffuse bake with real multi-layer GPU shader splatting (`512×512` mipmapped `texture_2d_array`, `t2mk` `scale_u = [0.1, 0.1, 0.0556, 0.0833, 0.0667]`, trilinear + 16× aniso). Awaiting user visual confirmation. |
+| 4 | Terrain layer textures (`textures.pck`, DDS DXT3) | `decoder verified on real data (dump-s0.txt + s0_1.t2mk bytes 84..224)` | 5/5 `s0` layer DDS (`512×512` DXT3) + 28-byte `t2mk` layer scales verified. |
+| 5 | Lightmaps (`s0_1.t2lm` / `s0_1.t2lm1`) | `decoder verified on real data (dump-s0.txt)` | Raw `t2lm`/`t2lm1` (`16×512×512` DXT1) multiplied unscaled with GPU splat diffuse. |
+| 6 | Water planes | `not working` | Out of scope for this round. |
+| 7 | Effects (`ECWLD` / `gfx.pck`) | `missing: ECWLD effect and gfx.pck formats not decoded yet` | Draws nothing. |
 | 8 | Minimap & world map tiles | `missing: surfaces/maps and minimap tile formats not decoded yet` | Shows camera coordinates only. |
 | 9 | Teleport list | `missing: client teleport destination table not decoded yet` | Zone switcher only. |
 | 10 | Audio (`sfx.pck` & loose music) | `missing: audio backend not started` | Out of scope for this round. |
 
-## Core Infrastructure & Diagnostics
+## Performance, Counters & Tooling
 
 | Component | Status | Notes |
 | --- | --- | --- |
-| Placement & Diagnostics counters (`src/scenery.rs`, `src/ui.rs`) | `fixed in this round, pending user check` | Enforces `total = not_in_range + in_range` and `in_range = loaded + failed + pending` (each placement counted once), verified by CI unit test. |
-| Mouse capture / release & ESC menu (`src/input.rs`) | `awaiting user confirmation` | Kept unchanged. |
-| Zone selection (`s0` default) & active zone title | `awaiting user confirmation` | Confirmed by user on `s0`. |
-| Diagnostic & Export CLI (`--dump-zone`, `--export-terrain-pngs`, `--bmd-trace`, `--extract-entry`, `--hexdump`, `--export-terrain-block`, `--export-texture-png`) | `fixed in this round, pending user check` | All outputs `< 1 MB`. |
+| Movement smoothness / lag fix (`src/terrain_gpu.rs`, `src/scenery.rs`, `src/ui.rs`) | `not working` | Fixed 60×/sec GPU texture & buffer re-upload storm (`gpu_tex_cache` + unchanged-batch revision skip), moved `.bmd`/DDS decoding to bounded `SceneryDecodeWorker` thread, added per-stage avg/max frame timing to 1 Hz Diagnostics & `--bench-flight`. Awaiting user feel check on `s0` & `s40`. |
+| Placement & drawn counters (`src/scenery.rs`, `src/ui.rs`) | `not working` | Enforces `total = not_in_range + in_range`, `in_range = loaded + failed + pending`, and `drawn <= loaded` with explicit reasons (`collide_only`, `trans_off`, `empty`), verified by CI unit tests. Awaiting user check on `s40`. |
+| Mouse capture / release & ESC menu (`src/input.rs`) | `working (user confirmed)` | Kept unchanged. |

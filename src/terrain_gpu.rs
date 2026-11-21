@@ -7,12 +7,13 @@
 //! - Resolution scaling (`10%–200%`) with native `egui` UI overlay (`blit.wgsl`)
 
 use std::{
+    collections::HashMap,
     env, fs,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 static NEXT_TERRAIN_TEX_REV: AtomicU64 = AtomicU64::new(1);
@@ -108,6 +109,7 @@ pub struct WaterUniform {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
+    pub inv_view_proj: [[f32; 4]; 4],
     /// xyz = normalized sun dir, w = dn_factor (0=day, 1=night)
     pub sun_dir: [f32; 4],
     /// rgb = active fog color, a = elapsed time seconds
@@ -170,6 +172,7 @@ impl CameraUniform {
         let (zenith, horizon, sun_col) = atmosphere::sky_colors_for_time(hours, Some(area));
         Self {
             view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             sun_dir: [sun.x, sun.y, sun.z, dn],
             fog_color: [fog_rgb[0], fog_rgb[1], fog_rgb[2], elapsed_sec],
             fog_params: [
@@ -188,6 +191,116 @@ impl CameraUniform {
             sun_color: [sun_col[0], sun_col[1], sun_col[2], 1.0],
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct TerrainLayerUniform {
+    pub scales_0: [f32; 4],
+    pub scales_1: [f32; 4],
+    pub params: [f32; 4],
+}
+
+/// Real per-layer terrain textures (`512x512` DDS), `t2mk` `scale_u` tiling values, and
+/// packed 8-bit mask textures (`mask_0`: L1..L4, `mask_1`: L5..L7) sampled directly in `terrain.wgsl`.
+#[derive(Clone, Debug)]
+pub struct TerrainSplatSnapshot {
+    pub layers: Vec<DecodedTexture>,
+    pub scales: [f32; 8],
+    pub mask_0: TerrainTextureSnapshot,
+    pub mask_1: TerrainTextureSnapshot,
+    pub use_layer_splat: bool,
+    pub revision: u64,
+}
+
+impl Default for TerrainSplatSnapshot {
+    fn default() -> Self {
+        let zero_mask = TerrainTextureSnapshot {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 0],
+            revision: 0,
+        };
+        Self {
+            layers: vec![DecodedTexture {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+            }],
+            scales: [0.1; 8],
+            mask_0: zero_mask.clone(),
+            mask_1: zero_mask,
+            use_layer_splat: false,
+            revision: 0,
+        }
+    }
+}
+
+/// Decoded client `A3DSkySphere` textures (`Cap`, `SurroundF`, `SurroundB`).
+/// When `has_real_textures()` is false, no sky is drawn (clear color only).
+#[derive(Clone, Debug, Default)]
+pub struct SkyTextureSnapshot {
+    pub cap: Option<DecodedTexture>,
+    pub surr_f: Option<DecodedTexture>,
+    pub surr_b: Option<DecodedTexture>,
+    pub revision: u64,
+    pub status_note: String,
+    pub entries_loaded: Vec<String>,
+}
+
+impl SkyTextureSnapshot {
+    pub fn has_real_textures(&self) -> bool {
+        self.cap.is_some() && self.surr_f.is_some() && self.surr_b.is_some()
+    }
+}
+
+/// Per-stage CPU timings measured inside `TerrainViewportRenderer::prepare_frame` (milliseconds).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuStageTimings {
+    pub texture_upload_ms: f32,
+    pub mesh_upload_ms: f32,
+    pub terrain_draw_ms: f32,
+    pub scenery_draw_ms: f32,
+    pub vegetation_draw_ms: f32,
+    pub water_post_ms: f32,
+    pub gpu_textures_cached: usize,
+    pub gpu_textures_uploaded_this_frame: usize,
+}
+
+/// Generate a full 2x2 box-filter RGBA8 mipmap chain down to 1x1 (no invented detail).
+pub fn generate_rgba8_mipmaps(w: u32, h: u32, rgba: &[u8]) -> Vec<(u32, u32, Vec<u8>)> {
+    let mut mips = vec![(w.max(1), h.max(1), rgba.to_vec())];
+    let mut cw = w.max(1);
+    let mut ch = h.max(1);
+    while cw > 1 || ch > 1 {
+        let nw = (cw / 2).max(1);
+        let nh = (ch / 2).max(1);
+        let prev = &mips.last().unwrap().2;
+        let mut next = vec![0u8; (nw as usize) * (nh as usize) * 4];
+        for y in 0..(nh as usize) {
+            for x in 0..(nw as usize) {
+                let sx0 = (x * 2).min(cw as usize - 1);
+                let sx1 = (x * 2 + 1).min(cw as usize - 1);
+                let sy0 = (y * 2).min(ch as usize - 1);
+                let sy1 = (y * 2 + 1).min(ch as usize - 1);
+                let mut acc = [0u32; 4];
+                for &(px, py) in &[(sx0, sy0), (sx1, sy0), (sx0, sy1), (sx1, sy1)] {
+                    let o = (py * (cw as usize) + px) * 4;
+                    for c in 0..4 {
+                        acc[c] += prev[o + c] as u32;
+                    }
+                }
+                let d = (y * (nw as usize) + x) * 4;
+                for c in 0..4 {
+                    next[d + c] = (acc[c] / 4) as u8;
+                }
+            }
+        }
+        mips.push((nw, nh, next));
+        cw = nw;
+        ch = nh;
+    }
+    mips
 }
 
 /// One deduplicated static submesh batch (one vertex/index buffer shared across N instances).
@@ -663,6 +776,96 @@ fn create_terrain_lm_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_sky_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sky-tex-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
@@ -758,6 +961,7 @@ fn create_water_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 fn create_sky_pipeline(
     device: &wgpu::Device,
     cam_bgl: &wgpu::BindGroupLayout,
+    sky_bgl: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sky-shader"),
@@ -765,7 +969,7 @@ fn create_sky_pipeline(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("sky-pipeline-layout"),
-        bind_group_layouts: &[cam_bgl],
+        bind_group_layouts: &[cam_bgl, sky_bgl],
         push_constant_ranges: &[],
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1320,6 +1524,22 @@ pub fn render_offscreen_smoke(
         revision: 1,
     };
 
+    let blue_sky = DecodedTexture {
+        width: 2,
+        height: 2,
+        rgba: vec![
+            40, 110, 220, 255, 40, 110, 220, 255, 40, 110, 220, 255, 40, 110, 220, 255,
+        ],
+    };
+    let sky_snap = SkyTextureSnapshot {
+        cap: Some(blue_sky.clone()),
+        surr_f: Some(blue_sky.clone()),
+        surr_b: Some(blue_sky),
+        revision: 1,
+        status_note: "synthetic sky smoke fixture".into(),
+        entries_loaded: Vec::new(),
+    };
+    let splat_snap = TerrainSplatSnapshot::default();
     let world_cmd = renderer.prepare_frame(
         device,
         queue,
@@ -1330,6 +1550,8 @@ pub fn render_offscreen_smoke(
         &mesh_snap,
         &day_lm,
         &night_lm,
+        &splat_snap,
+        &sky_snap,
         &scenery_snap,
         &veg_snap,
         &water_snap,
@@ -1570,6 +1792,8 @@ pub struct TerrainSession {
     pub mesh: TerrainMeshSnapshot,
     pub day_lightmap: TerrainTextureSnapshot,
     pub night_lightmap: TerrainTextureSnapshot,
+    pub splat: TerrainSplatSnapshot,
+    pub sky: SkyTextureSnapshot,
 }
 
 /// Stitch all mask-area lightmaps from `<zone>_1.t2lm` (or `t2lm1`) into one global
@@ -1583,6 +1807,7 @@ fn build_real_zone_terrain_textures(
 ) -> (
     TerrainTextureSnapshot,
     TerrainTextureSnapshot,
+    TerrainSplatSnapshot,
     usize,
     usize,
     usize,
@@ -1643,7 +1868,6 @@ fn build_real_zone_terrain_textures(
         "Terrain layer textures: loaded={loaded_cnt}, failed={failed_cnt}, bytes={decoded_bytes}"
     ));
 
-    // No grey fallback: if 0 real layer textures resolved, do NOT synthesize a fallback diffuse.
     if loaded_cnt == 0 {
         let empty = TerrainTextureSnapshot {
             width: 1,
@@ -1654,6 +1878,7 @@ fn build_real_zone_terrain_textures(
         return (
             empty.clone(),
             empty,
+            TerrainSplatSnapshot::default(),
             loaded_cnt,
             failed_cnt,
             decoded_bytes,
@@ -1661,82 +1886,127 @@ fn build_real_zone_terrain_textures(
         );
     }
 
-    let mut diffuse = vec![0u8; (full_side as usize) * (full_side as usize) * 4];
+    // Pack real t2mk 8-bit masks into mask_0 (L1..L4 -> RGBA) and mask_1 (L5..L7 -> RGB)
+    // and read real per-layer scale_u values from t2mk layer_descs.
+    let full_px = (full_side as usize) * (full_side as usize);
+    let mut mask0_rgba = vec![0u8; full_px * 4];
+    let mut mask1_rgba = vec![0u8; full_px * 4];
+    let mut scales = [0.1f32; 8];
+
     let t2mk_path = zone_dir.join(format!("{zone}_1.t2mk"));
     if let Ok(mk_bytes) = fs::read(&t2mk_path) {
         if let Ok(mk) = T2mkHeader::parse(&mk_bytes) {
+            for (i, desc) in mk.layer_descs.iter().take(8).enumerate() {
+                scales[i] = desc.scale_u;
+            }
             for ma in 0..num_ma.min(mk.num_areas as usize) {
                 let ma_r = ma / ma_grid;
                 let ma_c = ma % ma_grid;
                 let Ok(layers) = mk.area_layers(&mk_bytes, ma) else {
                     continue;
                 };
-                let mut tile_rgb = vec![[0.0f32; 3]; tile_px * tile_px];
-                let mut tile_has_base = false;
                 for (li, lyr) in layers.iter().enumerate() {
-                    // Missing layer texture is skipped (never painted with a fallback color)
-                    let Some(Some(tex)) = layer_textures.get(lyr.layer_index as usize) else {
+                    let lidx = lyr.layer_index as usize;
+                    if lidx == 0 || lidx >= 8 {
                         continue;
-                    };
+                    }
                     let Ok((m_side, m_bytes)) = mk.decode_layer_mask(&mk_bytes, lyr) else {
                         continue;
                     };
-                    let tw = tex.width.max(1) as usize;
-                    let th = tex.height.max(1) as usize;
                     for ty in 0..tile_px {
                         for tx in 0..tile_px {
-                            let sx = ((tx * tw * 8) / tile_px) % tw;
-                            let sy = ((ty * th * 8) / tile_px) % th;
-                            let tidx = (sy * tw + sx) * 4;
-                            let tr = tex.rgba[tidx] as f32;
-                            let tg = tex.rgba[tidx + 1] as f32;
-                            let tb = tex.rgba[tidx + 2] as f32;
-
-                            let alpha = if !tile_has_base || li == 0 || m_side <= 1 {
-                                1.0f32
+                            let mv = if li == 0 || m_side <= 1 {
+                                255u8
                             } else {
                                 let mx = (tx * (m_side as usize)) / tile_px;
                                 let my = (ty * (m_side as usize)) / tile_px;
                                 m_bytes
                                     .get(my * (m_side as usize) + mx)
                                     .copied()
-                                    .unwrap_or(0) as f32
-                                    / 255.0
+                                    .unwrap_or(0)
                             };
-                            let dst = &mut tile_rgb[ty * tile_px + tx];
-                            if !tile_has_base {
-                                *dst = [tr, tg, tb];
-                            } else {
-                                dst[0] = dst[0] * (1.0 - alpha) + tr * alpha;
-                                dst[1] = dst[1] * (1.0 - alpha) + tg * alpha;
-                                dst[2] = dst[2] * (1.0 - alpha) + tb * alpha;
+                            let gx = ma_c * tile_px + tx;
+                            let gy = ma_r * tile_px + ty;
+                            let o = (gy * (full_side as usize) + gx) * 4;
+                            if (1..=4).contains(&lidx) {
+                                mask0_rgba[o + (lidx - 1)] = mv;
+                            } else if (5..=7).contains(&lidx) {
+                                mask1_rgba[o + (lidx - 5)] = mv;
                             }
                         }
-                    }
-                    tile_has_base = true;
-                }
-                for ty in 0..tile_px {
-                    for tx in 0..tile_px {
-                        let gx = ma_c * tile_px + tx;
-                        let gy = ma_r * tile_px + ty;
-                        let o = (gy * (full_side as usize) + gx) * 4;
-                        let rgb = tile_rgb[ty * tile_px + tx];
-                        diffuse[o] = rgb[0].clamp(0.0, 255.0) as u8;
-                        diffuse[o + 1] = rgb[1].clamp(0.0, 255.0) as u8;
-                        diffuse[o + 2] = rgb[2].clamp(0.0, 255.0) as u8;
-                        diffuse[o + 3] = 255;
                     }
                 }
             }
             notes.push(format!(
-                "Composited {full_side}x{full_side} real terrain diffuse from {zone}_1.t2mk ({} mask areas)",
-                mk.num_areas
+                "Loaded real GPU layer splat masks from {zone}_1.t2mk ({} mask areas, scales={:?})",
+                mk.num_areas,
+                &scales[..trn2.texture_paths.len().min(8)]
             ));
         }
     }
 
+    // Collect up to 8 real layer textures (resize/pad to common size matching layer 0 if needed)
+    let target_dim = layer_textures
+        .iter()
+        .flatten()
+        .next()
+        .map(|t| (t.width, t.height))
+        .unwrap_or((512, 512));
+    let mut splat_layers = Vec::new();
+    for lt in layer_textures.iter().take(8) {
+        if let Some(t) = lt {
+            if (t.width, t.height) == target_dim {
+                splat_layers.push(t.clone());
+            } else {
+                // Nearest-resize to match texture_2d_array dimensions
+                let mut resized = vec![0u8; (target_dim.0 as usize) * (target_dim.1 as usize) * 4];
+                for y in 0..(target_dim.1 as usize) {
+                    let sy = (y * (t.height as usize)) / (target_dim.1 as usize);
+                    for x in 0..(target_dim.0 as usize) {
+                        let sx = (x * (t.width as usize)) / (target_dim.0 as usize);
+                        let s = (sy * (t.width as usize) + sx) * 4;
+                        let d = (y * (target_dim.0 as usize) + x) * 4;
+                        resized[d..d + 4].copy_from_slice(&t.rgba[s..s + 4]);
+                    }
+                }
+                splat_layers.push(DecodedTexture {
+                    width: target_dim.0,
+                    height: target_dim.1,
+                    rgba: resized,
+                });
+            }
+        } else {
+            splat_layers.push(DecodedTexture {
+                width: target_dim.0,
+                height: target_dim.1,
+                rgba: vec![0u8; (target_dim.0 as usize) * (target_dim.1 as usize) * 4],
+            });
+        }
+    }
+
+    let splat = TerrainSplatSnapshot {
+        layers: splat_layers,
+        scales,
+        mask_0: TerrainTextureSnapshot {
+            width: full_side,
+            height: full_side,
+            rgba: mask0_rgba,
+            revision: next_terrain_tex_revision(),
+        },
+        mask_1: TerrainTextureSnapshot {
+            width: full_side,
+            height: full_side,
+            rgba: mask1_rgba,
+            revision: next_terrain_tex_revision(),
+        },
+        use_layer_splat: true,
+        revision: next_terrain_tex_revision(),
+    };
+
+    // Stitch raw day (t2lm) and night (t2lm1) lightmaps WITHOUT pre-multiplying diffuse
+    // (terrain.wgsl now multiplies high-res tiled layer splat diffuse * lightmap in shader).
     let stitch_lm = |suffix: &str, notes: &mut Vec<String>| -> TerrainTextureSnapshot {
-        let mut rgba = diffuse.clone();
+        let mut rgba = vec![255u8; full_px * 4];
         let lm_path = zone_dir.join(format!("{zone}_1.{suffix}"));
         if let Ok(lm_bytes) = fs::read(&lm_path) {
             if let Ok(lm) = T2lmHeader::parse(&lm_bytes) {
@@ -1761,15 +2031,16 @@ fn build_real_zone_terrain_textures(
                             let gx = ma_c * tile_px + tx;
                             let gy = ma_r * tile_px + ty;
                             let o = (gy * (full_side as usize) + gx) * 4;
-                            rgba[o] = ((rgba[o] as u16 * dec[sidx] as u16) / 255) as u8;
-                            rgba[o + 1] = ((rgba[o + 1] as u16 * dec[sidx + 1] as u16) / 255) as u8;
-                            rgba[o + 2] = ((rgba[o + 2] as u16 * dec[sidx + 2] as u16) / 255) as u8;
+                            rgba[o] = dec[sidx];
+                            rgba[o + 1] = dec[sidx + 1];
+                            rgba[o + 2] = dec[sidx + 2];
+                            rgba[o + 3] = 255;
                         }
                     }
                     ok_areas += 1;
                 }
                 notes.push(format!(
-                    "Stitched {ok_areas}/{} lightmap areas from {zone}_1.{suffix}",
+                    "Stitched {ok_areas}/{} raw lightmap areas from {zone}_1.{suffix}",
                     lm.num_areas
                 ));
             }
@@ -1786,7 +2057,113 @@ fn build_real_zone_terrain_textures(
 
     let day = stitch_lm("t2lm", &mut notes);
     let night = stitch_lm("t2lm1", &mut notes);
-    (day, night, loaded_cnt, failed_cnt, decoded_bytes, notes)
+    (
+        day,
+        night,
+        splat,
+        loaded_cnt,
+        failed_cnt,
+        decoded_bytes,
+        notes,
+    )
+}
+
+/// Resolve and decode real `A3DSkySphere` textures (`Cap`, `SurroundF`, `SurroundB`)
+/// referenced by the default `ECBSDFILEBOXAREA15` in `<zone>.ecbsd` from `surfaces.pck`/`textures.pck`.
+/// Never synthesizes fallback sky colors if files are missing.
+pub fn load_real_zone_sky_textures(
+    client_root: &std::path::Path,
+    box_area: Option<&BoxAreaAtmosphere>,
+) -> SkyTextureSnapshot {
+    let Some(area) = box_area else {
+        return SkyTextureSnapshot {
+            status_note: "missing: no ECBSDFILEBOXAREA15 record in zone".into(),
+            ..Default::default()
+        };
+    };
+    let names = &area.day_sky_textures;
+    if names.iter().all(|s| s.is_empty()) {
+        return SkyTextureSnapshot {
+            status_note: "missing: ECBSDFILEBOXAREA15 has empty sky texture names".into(),
+            ..Default::default()
+        };
+    }
+    let (mut archives, _) = open_all_resource_pcks(client_root);
+    let mut decoded: [Option<DecodedTexture>; 3] = [None, None, None];
+    let mut entries_loaded = Vec::new();
+    let mut missing = Vec::new();
+
+    for (slot, raw) in names.iter().enumerate() {
+        if raw.is_empty() {
+            missing.push(format!("slot[{slot}] empty"));
+            continue;
+        }
+        let norm = raw.replace('\\', "/").trim_start_matches('/').to_string();
+        let alt_dds = if norm.to_ascii_lowercase().ends_with(".bmp") {
+            format!("{}.dds", &norm[..norm.len() - 4])
+        } else {
+            norm.clone()
+        };
+        let mut cands = Vec::new();
+        for base in [&norm, &alt_dds] {
+            for pref in ["", "sky/", "textures/sky/", "surfaces/sky/", "textures/"] {
+                let c = format!("{pref}{base}");
+                if !cands.contains(&c) {
+                    cands.push(c);
+                }
+            }
+        }
+        let mut found = None;
+        for (aname, mount, arch) in archives.iter_mut() {
+            if !matches!(mount.as_str(), "surfaces" | "textures" | "litmodels") {
+                continue;
+            }
+            for cand in &cands {
+                if let Ok(bytes) = arch.read_entry(cand) {
+                    if let Ok((w, h, rgba, fmt)) = dxt::decode_image_rgba8(&bytes) {
+                        entries_loaded.push(format!("{aname}:{cand} ({w}x{h} {fmt})"));
+                        found = Some(DecodedTexture {
+                            width: w,
+                            height: h,
+                            rgba,
+                        });
+                        break;
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        if found.is_none() {
+            missing.push(raw.clone());
+        }
+        decoded[slot] = found;
+    }
+
+    let [cap, surr_f, surr_b] = decoded;
+    if cap.is_some() && surr_f.is_some() && surr_b.is_some() {
+        SkyTextureSnapshot {
+            cap,
+            surr_f,
+            surr_b,
+            revision: next_terrain_tex_revision(),
+            status_note: format!("loaded A3DSkySphere ({})", entries_loaded.join(", ")),
+            entries_loaded,
+        }
+    } else {
+        SkyTextureSnapshot {
+            cap: None,
+            surr_f: None,
+            surr_b: None,
+            revision: next_terrain_tex_revision(),
+            status_note: format!(
+                "missing: sky texture(s) not found in surfaces.pck/textures.pck ({})",
+                missing.join(", ")
+            ),
+            entries_loaded,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1829,11 +2206,31 @@ impl TerrainSession {
         let (
             day_lightmap,
             night_lightmap,
+            splat,
             terrain_layers_loaded,
             terrain_layers_failed,
             terrain_tex_bytes,
-            load_notes,
+            mut load_notes,
         ) = build_real_zone_terrain_textures(client_root, &zone_dir, zone, &trn2);
+
+        let box_area = fs::read(zone_dir.join(format!("{zone}.ecwld")))
+            .ok()
+            .and_then(|wb| {
+                fs::read(zone_dir.join(format!("{zone}.ecbsd")))
+                    .ok()
+                    .and_then(|bb| {
+                        atmosphere::parse_ecwld_ecbsd_atmosphere_and_water(&wb, &bb).ok()
+                    })
+            })
+            .and_then(|(_, _, boxes, _)| {
+                boxes
+                    .iter()
+                    .find(|b| b.is_default)
+                    .or_else(|| boxes.first())
+                    .cloned()
+            });
+        let sky = load_real_zone_sky_textures(client_root, box_area.as_ref());
+        load_notes.push(format!("Sky: {}", sky.status_note));
 
         Ok(Self {
             zone_name: zone.to_string(),
@@ -1853,6 +2250,8 @@ impl TerrainSession {
             mesh: TerrainMeshSnapshot::default(),
             day_lightmap,
             night_lightmap,
+            splat,
+            sky,
         })
     }
 
@@ -1903,6 +2302,8 @@ impl TerrainSession {
             mesh: TerrainMeshSnapshot::default(),
             day_lightmap,
             night_lightmap,
+            splat: TerrainSplatSnapshot::default(),
+            sky: SkyTextureSnapshot::default(),
         })
     }
 
@@ -2047,15 +2448,21 @@ pub struct TerrainViewportRenderer {
     blit_pipeline: wgpu::RenderPipeline,
     tex_bgl: wgpu::BindGroupLayout,
     terrain_lm_bgl: wgpu::BindGroupLayout,
+    sky_bgl: wgpu::BindGroupLayout,
     scenery_mat_bgl: wgpu::BindGroupLayout,
     water_bgl: wgpu::BindGroupLayout,
     cam_buf: wgpu::Buffer,
     cam_bg: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    layer_sampler: wgpu::Sampler,
     white_view: wgpu::TextureView,
     water_normal_view: wgpu::TextureView,
     lm_bg: wgpu::BindGroup,
-    lm_revision: (u64, u64),
+    lm_revision: (u64, u64, u64),
+    sky_bg: wgpu::BindGroup,
+    sky_revision: u64,
+    gpu_tex_cache: HashMap<usize, wgpu::TextureView>,
+    pub last_timings: GpuStageTimings,
     scene_color: wgpu::Texture,
     scene_view: wgpu::TextureView,
     scene_depth: wgpu::Texture,
@@ -2134,10 +2541,11 @@ impl TerrainViewportRenderer {
             ],
         });
         let terrain_lm_bgl = create_terrain_lm_bgl(device);
+        let sky_bgl = create_sky_bgl(device);
         let scenery_mat_bgl = create_scenery_mat_bgl(device);
         let water_bgl = create_water_bgl(device);
 
-        let sky_pipeline = create_sky_pipeline(device, &cam_bgl);
+        let sky_pipeline = create_sky_pipeline(device, &cam_bgl, &sky_bgl);
         let scenery_opaque_pipeline =
             create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl, false);
         let scenery_transparent_pipeline =
@@ -2151,6 +2559,17 @@ impl TerrainViewportRenderer {
             address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let layer_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("terrain-layer-trilinear-aniso-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            anisotropy_clamp: 16,
             ..Default::default()
         });
 
@@ -2332,14 +2751,20 @@ impl TerrainViewportRenderer {
         });
 
         let default_lm = TerrainTextureSnapshot::default();
+        let default_splat = TerrainSplatSnapshot::default();
         let lm_bg = Self::upload_dual_lightmap_bg(
             device,
             queue,
             &terrain_lm_bgl,
             &sampler,
+            &layer_sampler,
             &default_lm,
             &default_lm,
+            &default_splat,
         );
+        let default_sky = SkyTextureSnapshot::default();
+        let sky_bg =
+            Self::upload_sky_bg(device, queue, &sky_bgl, &sampler, &white_view, &default_sky);
         let (scene_color, scene_view, scene_depth, depth_view, blit_bg) =
             Self::create_scaled_targets(device, &tex_bgl, &sampler, 64, 64);
         let (refl_color, refl_view, refl_depth, refl_depth_view) =
@@ -2358,15 +2783,21 @@ impl TerrainViewportRenderer {
             blit_pipeline,
             tex_bgl,
             terrain_lm_bgl,
+            sky_bgl,
             scenery_mat_bgl,
             water_bgl,
             cam_buf,
             cam_bg,
             sampler,
+            layer_sampler,
             white_view,
             water_normal_view,
             lm_bg,
-            lm_revision: (0, 0),
+            lm_revision: (0, 0, 0),
+            sky_bg,
+            sky_revision: 0,
+            gpu_tex_cache: HashMap::new(),
+            last_timings: GpuStageTimings::default(),
             scene_color,
             scene_view,
             scene_depth,
@@ -2445,17 +2876,166 @@ impl TerrainViewportRenderer {
         gpu_tex.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
+    fn upload_rgba_view_mipmapped(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+    ) -> wgpu::TextureView {
+        let mips = generate_rgba8_mipmaps(w, h, rgba);
+        let mip_count = mips.len() as u32;
+        let gpu_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("live-rgba-mip-tex"),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, (mw, mh, data)) in mips.iter().enumerate() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &gpu_tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(mw * 4),
+                    rows_per_image: Some(*mh),
+                },
+                wgpu::Extent3d {
+                    width: *mw,
+                    height: *mh,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        gpu_tex.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    fn upload_layer_array_mipmapped(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers: &[DecodedTexture],
+    ) -> wgpu::TextureView {
+        let count = layers.len().clamp(1, 8) as u32;
+        let (w, h) = layers
+            .first()
+            .map(|t| (t.width.max(1), t.height.max(1)))
+            .unwrap_or((1, 1));
+        let mip_count = (w.max(h) as f32).log2().floor() as u32 + 1;
+        let gpu_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terrain-layer-array-mip"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: count.max(2), // D2Array requires >= 2 layers on some backends
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (layer_idx, tex) in layers.iter().take(8).enumerate() {
+            let mips = generate_rgba8_mipmaps(w, h, &tex.rgba);
+            for (level, (mw, mh, data)) in mips.iter().take(mip_count as usize).enumerate() {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu_tex,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: layer_idx as u32,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(mw * 4),
+                        rows_per_image: Some(*mh),
+                    },
+                    wgpu::Extent3d {
+                        width: *mw,
+                        height: *mh,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+        gpu_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn upload_dual_lightmap_bg(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         bgl: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
+        layer_sampler: &wgpu::Sampler,
         day: &TerrainTextureSnapshot,
         night: &TerrainTextureSnapshot,
+        splat: &TerrainSplatSnapshot,
     ) -> wgpu::BindGroup {
         let day_view = Self::upload_rgba_view(device, queue, day.width, day.height, &day.rgba);
         let night_view =
             Self::upload_rgba_view(device, queue, night.width, night.height, &night.rgba);
+        let layer_array_view = Self::upload_layer_array_mipmapped(device, queue, &splat.layers);
+        let mask0_view = Self::upload_rgba_view(
+            device,
+            queue,
+            splat.mask_0.width,
+            splat.mask_0.height,
+            &splat.mask_0.rgba,
+        );
+        let mask1_view = Self::upload_rgba_view(
+            device,
+            queue,
+            splat.mask_1.width,
+            splat.mask_1.height,
+            &splat.mask_1.rgba,
+        );
+        let layer_u = TerrainLayerUniform {
+            scales_0: [
+                splat.scales[0],
+                splat.scales[1],
+                splat.scales[2],
+                splat.scales[3],
+            ],
+            scales_1: [
+                splat.scales[4],
+                splat.scales[5],
+                splat.scales[6],
+                splat.scales[7],
+            ],
+            params: [
+                splat.layers.len().min(8) as f32,
+                if splat.use_layer_splat { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
+        };
+        let layer_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-layer-uniform"),
+            contents: bytemuck::bytes_of(&layer_u),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("live-dual-lm-bg"),
             layout: bgl,
@@ -2470,6 +3050,76 @@ impl TerrainViewportRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&layer_array_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(layer_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&mask0_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&mask1_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: layer_buf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn upload_sky_bg(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        fallback_view: &wgpu::TextureView,
+        sky: &SkyTextureSnapshot,
+    ) -> wgpu::BindGroup {
+        let cap_v = sky
+            .cap
+            .as_ref()
+            .map(|t| Self::upload_rgba_view(device, queue, t.width, t.height, &t.rgba));
+        let sf_v = sky
+            .surr_f
+            .as_ref()
+            .map(|t| Self::upload_rgba_view(device, queue, t.width, t.height, &t.rgba));
+        let sb_v = sky
+            .surr_b
+            .as_ref()
+            .map(|t| Self::upload_rgba_view(device, queue, t.width, t.height, &t.rgba));
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("live-sky-bg"),
+            layout: bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        cap_v.as_ref().unwrap_or(fallback_view),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        sf_v.as_ref().unwrap_or(fallback_view),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        sb_v.as_ref().unwrap_or(fallback_view),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
@@ -2553,11 +3203,12 @@ impl TerrainViewportRenderer {
     }
 
     fn upload_scenery_batches(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src: &[SceneryDrawBatch],
-    ) -> Vec<GpuSceneryBatch> {
+    ) -> (Vec<GpuSceneryBatch>, usize) {
+        let mut newly_uploaded = 0usize;
         let mut out = Vec::with_capacity(src.len());
         for b in src {
             if b.vertices.is_empty() || b.indices.is_empty() || b.instances.is_empty() {
@@ -2592,11 +3243,20 @@ impl TerrainViewportRenderer {
                 contents: bytemuck::bytes_of(&mat_u),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
-            let owned_view = b
-                .texture
-                .as_ref()
-                .map(|t| Self::upload_rgba_view(device, queue, t.width, t.height, &t.rgba));
-            let tex_view_ref = owned_view.as_ref().unwrap_or(&self.white_view);
+            let tex_view_ref = if let Some(t) = b.texture.as_ref() {
+                let ptr_key = Arc::as_ptr(t) as usize;
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.gpu_tex_cache.entry(ptr_key)
+                {
+                    let v =
+                        Self::upload_rgba_view_mipmapped(device, queue, t.width, t.height, &t.rgba);
+                    e.insert(v);
+                    newly_uploaded += 1;
+                }
+                self.gpu_tex_cache.get(&ptr_key).unwrap_or(&self.white_view)
+            } else {
+                &self.white_view
+            };
             let mat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("live-scenery-mat-bg"),
                 layout: &self.scenery_mat_bgl,
@@ -2624,7 +3284,7 @@ impl TerrainViewportRenderer {
                 instance_count: b.instances.len() as u32,
             });
         }
-        out
+        (out, newly_uploaded)
     }
 
     fn upload_vegetation_batches(
@@ -2709,6 +3369,7 @@ impl TerrainViewportRenderer {
         if draw_sky_gradient {
             rpass.set_pipeline(&self.sky_pipeline);
             rpass.set_bind_group(0, &self.cam_bg, &[]);
+            rpass.set_bind_group(1, &self.sky_bg, &[]);
             rpass.draw(0..3, 0..1);
         }
 
@@ -2790,6 +3451,8 @@ impl TerrainViewportRenderer {
         mesh: &TerrainMeshSnapshot,
         day_lightmap: &TerrainTextureSnapshot,
         night_lightmap: &TerrainTextureSnapshot,
+        splat: &TerrainSplatSnapshot,
+        sky: &SkyTextureSnapshot,
         scenery: &SceneryDrawSnapshot,
         vegetation: &VegetationDrawSnapshot,
         water: &WaterRenderSnapshot,
@@ -2842,18 +3505,43 @@ impl TerrainViewportRenderer {
 
         queue.write_buffer(&self.cam_buf, 0, bytemuck::bytes_of(uniform));
 
-        let lm_rev = (day_lightmap.revision, night_lightmap.revision);
+        let t_tex0 = Instant::now();
+        let mut uploaded_tex_count = 0usize;
+        let lm_rev = (
+            day_lightmap.revision,
+            night_lightmap.revision,
+            splat.revision,
+        );
         if self.lm_revision != lm_rev {
             self.lm_bg = Self::upload_dual_lightmap_bg(
                 device,
                 queue,
                 &self.terrain_lm_bgl,
                 &self.sampler,
+                &self.layer_sampler,
                 day_lightmap,
                 night_lightmap,
+                splat,
             );
             self.lm_revision = lm_rev;
+            uploaded_tex_count += splat.layers.len() + 4;
         }
+        if self.sky_revision != sky.revision {
+            self.sky_bg = Self::upload_sky_bg(
+                device,
+                queue,
+                &self.sky_bgl,
+                &self.sampler,
+                &self.white_view,
+                sky,
+            );
+            self.sky_revision = sky.revision;
+            if sky.has_real_textures() {
+                uploaded_tex_count += 3;
+            }
+        }
+        let mut tex_upload_ms = t_tex0.elapsed().as_secs_f32() * 1000.0;
+        let t_mesh0 = Instant::now();
 
         if self.mesh_revision != mesh.revision {
             if mesh.vertices.is_empty() || mesh.indices.is_empty() {
@@ -2896,10 +3584,11 @@ impl TerrainViewportRenderer {
         }
 
         if self.scenery_revision != scenery.revision {
-            self.opaque_batches =
-                self.upload_scenery_batches(device, queue, &scenery.opaque_batches);
-            self.transparent_batches =
-                self.upload_scenery_batches(device, queue, &scenery.transparent_batches);
+            let (op, n1) = self.upload_scenery_batches(device, queue, &scenery.opaque_batches);
+            let (tr, n2) = self.upload_scenery_batches(device, queue, &scenery.transparent_batches);
+            self.opaque_batches = op;
+            self.transparent_batches = tr;
+            uploaded_tex_count += n1 + n2;
             self.scenery_revision = scenery.revision;
         }
 
@@ -2907,6 +3596,20 @@ impl TerrainViewportRenderer {
             self.veg_batches = self.upload_vegetation_batches(device, queue, &vegetation.batches);
             self.veg_revision = vegetation.revision;
         }
+        let mesh_upload_ms = t_mesh0.elapsed().as_secs_f32() * 1000.0;
+        if uploaded_tex_count > 0 {
+            tex_upload_ms = tex_upload_ms.max(0.01);
+        }
+        self.last_timings = GpuStageTimings {
+            texture_upload_ms: tex_upload_ms,
+            mesh_upload_ms,
+            terrain_draw_ms: 0.0,
+            scenery_draw_ms: 0.0,
+            vegetation_draw_ms: 0.0,
+            water_post_ms: 0.0,
+            gpu_textures_cached: self.gpu_tex_cache.len(),
+            gpu_textures_uploaded_this_frame: uploaded_tex_count,
+        };
 
         let vp = Mat4::from_cols_array_2d(&uniform.view_proj);
         let vis_water = atmosphere::visible_water_planes(

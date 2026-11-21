@@ -26,6 +26,9 @@ pub struct SceneryDiagnostics {
     pub placements_loaded: usize,
     pub placements_failed: usize,
     pub placements_pending: usize,
+    pub not_drawn_collide_only: usize,
+    pub not_drawn_transparent_disabled: usize,
+    pub not_drawn_empty_mesh: usize,
     pub unique_models_in_range: usize,
     pub models_loaded: usize,
     pub instances_drawn: usize,
@@ -198,6 +201,10 @@ impl SceneryModelCache {
         self.loaded
             .insert(model_key.to_ascii_lowercase(), Arc::new(model));
     }
+
+    pub fn insert_failed(&mut self, model_key: &str, reason: String) {
+        self.failed.insert(model_key.to_ascii_lowercase(), reason);
+    }
 }
 
 /// Advance multi-frame scenery streaming by decoding at most `loads_per_frame` uncached
@@ -279,6 +286,229 @@ pub fn compute_placement_counters(
         }
     }
     (not_in_range, in_range_cnt, loaded, failed, pending)
+}
+
+/// Compute exact `drawn <= loaded` breakdown for in-range loaded placements so every
+/// difference between `loaded` and `drawn` has an explicit reason:
+/// `drawn + collide_only + transparent_disabled + empty_mesh == loaded`.
+pub fn compute_drawn_breakdown(
+    in_range: &[&OrnamentPlacement],
+    cache: &SceneryModelCache,
+    transparent_enabled: bool,
+) -> (usize, usize, usize, usize) {
+    let mut drawn = 0usize;
+    let mut collide_only = 0usize;
+    let mut transparent_disabled = 0usize;
+    let mut empty_mesh = 0usize;
+    for p in in_range {
+        let key = p.normalized_bmd_path().to_ascii_lowercase();
+        let Some(model) = cache.get(&key) else {
+            continue;
+        };
+        if model.collide_only {
+            collide_only += 1;
+        } else if model.submeshes.is_empty() {
+            empty_mesh += 1;
+        } else {
+            let has_opaque = model
+                .submeshes
+                .iter()
+                .any(|sub| sub.alpha_mode != AlphaMode::TransparentDeferred);
+            if has_opaque || transparent_enabled {
+                drawn += 1;
+            } else {
+                transparent_disabled += 1;
+            }
+        }
+    }
+    (drawn, collide_only, transparent_disabled, empty_mesh)
+}
+
+/// Rolling per-stage CPU timing accumulator (ms) reporting both average and max per 1 Hz window.
+#[derive(Debug, Clone, Default)]
+pub struct StageTimingStat {
+    pub sum_ms: f64,
+    pub max_ms: f32,
+    pub samples: u32,
+}
+
+impl StageTimingStat {
+    pub fn record(&mut self, ms: f32) {
+        self.sum_ms += ms as f64;
+        if ms > self.max_ms {
+            self.max_ms = ms;
+        }
+        self.samples += 1;
+    }
+
+    pub fn avg_ms(&self) -> f32 {
+        if self.samples == 0 {
+            0.0
+        } else {
+            (self.sum_ms / self.samples as f64) as f32
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FrameTimingWindow {
+    pub streaming: StageTimingStat,
+    pub texture_upload: StageTimingStat,
+    pub mesh_upload: StageTimingStat,
+    pub terrain_draw: StageTimingStat,
+    pub scenery_draw: StageTimingStat,
+    pub vegetation_draw: StageTimingStat,
+    pub water_post: StageTimingStat,
+    pub ui: StageTimingStat,
+    pub total_frame: StageTimingStat,
+}
+
+pub struct DecodedBmdJob {
+    pub model_key: String,
+    pub result: Result<(BmdModel, Vec<(String, crate::tex_cache::DecodedTexture)>), String>,
+}
+
+/// Bounded background worker thread for `.bmd` + DDS decoding off the render thread.
+pub struct SceneryDecodeWorker {
+    tx: std::sync::mpsc::SyncSender<String>,
+    rx: std::sync::mpsc::Receiver<DecodedBmdJob>,
+    in_flight: std::collections::HashSet<String>,
+}
+
+impl SceneryDecodeWorker {
+    pub fn spawn(client_root: PathBuf, zone: String, queue_bound: usize) -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::sync_channel::<String>(queue_bound.max(8));
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<DecodedBmdJob>();
+        std::thread::spawn(move || {
+            let (mut archives, open_errors) =
+                crate::zone_dump::open_all_resource_pcks(&client_root);
+            let has_open_errors = !open_errors.is_empty();
+            while let Ok(model_key) = req_rx.recv() {
+                let mut raw_opt: Option<Vec<u8>> = None;
+                for (_, mount, arch) in archives.iter_mut() {
+                    for cand in crate::zone_dump::bmd_lookup_candidates_for_archive(
+                        &zone,
+                        &model_key,
+                        Some(mount),
+                    ) {
+                        if let Ok(bytes) = arch.read_entry(&cand) {
+                            raw_opt = Some(bytes);
+                            break;
+                        }
+                    }
+                    if raw_opt.is_some() {
+                        break;
+                    }
+                }
+                if raw_opt.is_none() {
+                    let loose = client_root
+                        .join("litmodels")
+                        .join(&zone)
+                        .join(model_key.replace('\\', "/"));
+                    if let Ok(bytes) = fs::read(&loose) {
+                        raw_opt = Some(bytes);
+                    }
+                }
+                let result = match raw_opt {
+                    None => {
+                        if archives.is_empty() && has_open_errors {
+                            Err(format!("archive_open_error: {model_key}"))
+                        } else if archives.is_empty() {
+                            Err(format!("archive_not_found: {model_key}"))
+                        } else {
+                            Err(format!("entry_not_found: {model_key}"))
+                        }
+                    }
+                    Some(raw) => match BmdModel::parse(&raw) {
+                        Err(e) => Err(format!("{model_key}: {e}")),
+                        Ok(model) => {
+                            let mut textures = Vec::new();
+                            for sub in &model.submeshes {
+                                if sub.texture.is_empty() {
+                                    continue;
+                                }
+                                if textures
+                                    .iter()
+                                    .any(|(k, _): &(String, _)| k == &sub.texture)
+                                {
+                                    continue;
+                                }
+                                for (_, mount, arch) in archives.iter_mut() {
+                                    if !matches!(
+                                        mount.as_str(),
+                                        "textures"
+                                            | "litmodels"
+                                            | "building"
+                                            | "models"
+                                            | "surfaces"
+                                    ) {
+                                        continue;
+                                    }
+                                    let mut found_t = None;
+                                    for cand in
+                                        crate::zone_dump::texture_lookup_candidates_for_archive(
+                                            &sub.texture,
+                                            Some(mount),
+                                        )
+                                    {
+                                        if let Ok(tb) = arch.read_entry(&cand) {
+                                            if let Ok(surf) = crate::dxt::parse_dds(&tb) {
+                                                found_t = Some(crate::tex_cache::DecodedTexture {
+                                                    width: surf.width,
+                                                    height: surf.height,
+                                                    rgba: crate::dxt::decode_rgba8(&surf),
+                                                });
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if let Some(dt) = found_t {
+                                        textures.push((sub.texture.clone(), dt));
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok((model, textures))
+                        }
+                    },
+                };
+                if res_tx.send(DecodedBmdJob { model_key, result }).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            tx: req_tx,
+            rx: res_rx,
+            in_flight: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn enqueue(&mut self, model_key: &str) -> bool {
+        if self.in_flight.contains(model_key) {
+            return false;
+        }
+        if self.tx.try_send(model_key.to_string()).is_ok() {
+            self.in_flight.insert(model_key.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn poll_ready(&mut self, max_items: usize) -> Vec<DecodedBmdJob> {
+        let mut out = Vec::new();
+        for _ in 0..max_items.max(1) {
+            match self.rx.try_recv() {
+                Ok(job) => {
+                    self.in_flight.remove(&job.model_key);
+                    out.push(job);
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
 }
 
 pub fn format_bmd_error(model_key: &str, err: &BmdError) -> String {
@@ -410,6 +640,43 @@ mod tests {
         assert_eq!(pending, 1);
         assert_eq!(all.len(), not_in_range + in_range_cnt);
         assert_eq!(in_range_cnt, loaded + failed + pending);
+        let (drawn, col_only, trans_dis, empty_m) =
+            compute_drawn_breakdown(&in_range, &cache, true);
+        assert_eq!(drawn + col_only + trans_dis + empty_m, loaded);
+        assert!(drawn <= loaded);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drawn_breakdown_explains_collide_only_and_transparent_gap() {
+        let dir = std::env::temp_dir().join(format!("fw_drawn_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut cache = SceneryModelCache::open(&dir).unwrap();
+        let good = synthetic::build_bmd_v5_box("textures/wall.dds", 2.0, 6.0);
+        let mut col_model = BmdModel::parse(&good).unwrap();
+        col_model.collide_only = true;
+        cache.insert_parsed("wall.bmd", BmdModel::parse(&good).unwrap());
+        cache.insert_parsed("collider.bmd", col_model);
+
+        let mk = |id: u32, path: &str| OrnamentPlacement {
+            export_id: id,
+            asset_path: path.into(),
+            position: [0.0, 0.0, 0.0],
+            direction: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            reflect: false,
+            refract: false,
+            optimize: false,
+        };
+        let all = [mk(1, "wall.bmd"), mk(2, "collider.bmd")];
+        let refs: Vec<&OrnamentPlacement> = all.iter().collect();
+        let (drawn, col_only, trans_dis, empty_m) = compute_drawn_breakdown(&refs, &cache, true);
+        assert_eq!(drawn, 1);
+        assert_eq!(col_only, 1);
+        assert_eq!(trans_dis, 0);
+        assert_eq!(empty_m, 0);
+        assert_eq!(drawn + col_only + trans_dis + empty_m, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 }
