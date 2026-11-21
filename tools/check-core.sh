@@ -8,7 +8,7 @@ RUSTC=${RUSTC:-rustc}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
-for module in settings modules; do
+for module in settings logging modules; do
     "$RUSTC" --edition=2021 --test "src/$module.rs" -o "$work/$module"
     "$work/$module"
 done
