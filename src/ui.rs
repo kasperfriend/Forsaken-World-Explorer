@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use eframe::egui;
+use eframe::{egui, wgpu};
 use forsaken_world_explorer::{
     client_detect::{self, DetectedClient},
     modules::Registry,
@@ -328,9 +328,12 @@ impl eframe::App for ExplorerApp {
     }
 }
 
-/// CPU-only headless UI smoke test: initializes `ExplorerApp` and executes an `egui`
-/// frame pass across every page and Settings tab to prove startup UI code does not panic.
+/// CPU-only headless UI smoke test: initializes `ExplorerApp`, probes the `wgpu`
+/// instance cleanly, and executes an `egui` frame pass across every page and Settings tab.
 pub fn run_smoke_launch() -> Result<(), String> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let _adapters = instance.enumerate_adapters(wgpu::Backends::all());
+
     let mut app = ExplorerApp::new();
     let ctx = egui::Context::default();
     let pages = [
@@ -354,43 +357,70 @@ pub fn run_smoke_launch() -> Result<(), String> {
     Ok(())
 }
 
-pub fn run_window() -> Result<(), String> {
-    // Prefer hardware GPUs first, falling back to software adapters (such as
-    // Microsoft Basic Render Driver / WARP on headless Windows runners) so the
-    // app launches cleanly even without a discrete GPU.
-    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
-        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
-            eframe::egui_wgpu::WgpuSetupCreateNew {
-                native_adapter_selector: Some(Arc::new(|adapters, surface| {
-                    let rank = |device_type: eframe::wgpu::DeviceType| match device_type {
-                        eframe::wgpu::DeviceType::DiscreteGpu => 0,
-                        eframe::wgpu::DeviceType::IntegratedGpu => 1,
-                        eframe::wgpu::DeviceType::VirtualGpu => 2,
-                        eframe::wgpu::DeviceType::Cpu => 3,
-                        eframe::wgpu::DeviceType::Other => 4,
-                    };
-                    adapters
-                        .iter()
-                        .filter(|adapter| {
-                            surface
-                                .map(|s| adapter.is_surface_supported(s))
-                                .unwrap_or(true)
-                        })
-                        .min_by_key(|adapter| rank(adapter.get_info().device_type))
-                        .cloned()
-                        .ok_or_else(|| "no compatible wgpu adapter found".to_string())
-                })),
-                ..Default::default()
-            },
-        ),
+fn try_create_fallback_wgpu_setup() -> Option<eframe::egui_wgpu::WgpuSetupExisting> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
         ..Default::default()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        force_fallback_adapter: true,
+    }))?;
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("forsaken-world-explorer-fallback"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+        },
+        None,
+    ))
+    .ok()?;
+    Some(eframe::egui_wgpu::WgpuSetupExisting {
+        instance,
+        adapter,
+        device,
+        queue,
+    })
+}
+
+pub fn run_window() -> Result<(), String> {
+    let wgpu_setup = if let Some(existing) = try_create_fallback_wgpu_setup_if_no_hardware() {
+        eframe::egui_wgpu::WgpuSetup::Existing(existing)
+    } else {
+        eframe::egui_wgpu::WgpuSetup::CreateNew(eframe::egui_wgpu::WgpuSetupCreateNew {
+            native_adapter_selector: Some(Arc::new(|adapters, surface| {
+                let rank = |device_type: wgpu::DeviceType| match device_type {
+                    wgpu::DeviceType::DiscreteGpu => 0,
+                    wgpu::DeviceType::IntegratedGpu => 1,
+                    wgpu::DeviceType::VirtualGpu => 2,
+                    wgpu::DeviceType::Cpu => 3,
+                    wgpu::DeviceType::Other => 4,
+                };
+                adapters
+                    .iter()
+                    .filter(|adapter| {
+                        surface
+                            .map(|s| adapter.is_surface_supported(s))
+                            .unwrap_or(true)
+                    })
+                    .min_by_key(|adapter| rank(adapter.get_info().device_type))
+                    .cloned()
+                    .ok_or_else(|| "no compatible wgpu adapter found".to_string())
+            })),
+            ..Default::default()
+        })
     };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 620.0])
             .with_title("Forsaken World Explorer"),
-        wgpu_options,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup,
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
@@ -399,6 +429,24 @@ pub fn run_window() -> Result<(), String> {
         Box::new(|_cc| Ok(Box::new(ExplorerApp::new()))),
     )
     .map_err(|error| format!("failed to launch viewer window: {error}"))
+}
+
+fn try_create_fallback_wgpu_setup_if_no_hardware() -> Option<eframe::egui_wgpu::WgpuSetupExisting> {
+    let probe = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let has_hw = probe
+        .enumerate_adapters(wgpu::Backends::PRIMARY)
+        .iter()
+        .any(|a| {
+            matches!(
+                a.get_info().device_type,
+                wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
+            )
+        });
+    if has_hw {
+        None
+    } else {
+        try_create_fallback_wgpu_setup()
+    }
 }
 
 #[cfg(test)]
