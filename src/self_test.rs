@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{modules, pck, settings};
+use crate::{dxt, modules, pck, settings, terrain_block, terrain_store};
 
 #[derive(Debug)]
 pub struct CheckResult {
@@ -149,6 +149,46 @@ fn check_synthetic_pck_archive() -> Result<CheckResult, String> {
     res
 }
 
+fn check_synthetic_world_decoders() -> Result<CheckResult, String> {
+    let cache_dir = unique_temp_dir("fw-selftest-terrain")?;
+    let res = (|| -> Result<CheckResult, String> {
+        let bytes = terrain_block::synthetic::build_t2bk_v6(8, 2);
+        let t2bk = terrain_block::T2bkFile::parse_header(&bytes)?;
+        let block0 = t2bk.decode_block(&bytes, 0, 8)?;
+        if block0.heights.len() != 81 || block0.normals.len() != 81 {
+            return Err("unexpected synthetic terrain block dimensions".into());
+        }
+
+        let mut store =
+            terrain_store::TerrainStore::open(&cache_dir, terrain_store::DEFAULT_HOT_RAM_BYTES)?;
+        let key = terrain_store::TerrainStore::content_key(&bytes);
+        let page = store.get_or_insert_with(&key, || {
+            Ok(terrain_store::TerrainPage {
+                heights: block0.heights.clone(),
+                normals: block0.normals.clone(),
+            })
+        })?;
+        if page.heights != block0.heights {
+            return Err("terrain cache round-trip mismatch".into());
+        }
+
+        let dxt1 = [0x00, 0xf8, 0x1f, 0x00, 0xe4, 0xe4, 0xe4, 0xe4];
+        let dds = dxt::synthetic::build_dds(4, 4, b"DXT1", &dxt1);
+        let surface = dxt::parse_dds(&dds)?;
+        let rgba = dxt::decode_rgba8(&surface);
+        if rgba.len() != 64 {
+            return Err("unexpected decoded DDS pixel count".into());
+        }
+
+        Ok(CheckResult {
+            name: "synthetic-world-decoders",
+            detail: "verified v6 .t2bk decode, cache/terrain-v1, and DXT1 DDS decode".into(),
+        })
+    })();
+    let _ = fs::remove_dir_all(&cache_dir);
+    res
+}
+
 fn check_optional_client_env() -> CheckResult {
     match env::var_os(settings::ENV_CLIENT_DIR).filter(|v| !v.is_empty()) {
         Some(path) => {
@@ -188,6 +228,7 @@ pub fn run() -> Result<Vec<CheckResult>, String> {
         check_settings_round_trip()?,
         check_module_discovery()?,
         check_synthetic_pck_archive()?,
+        check_synthetic_world_decoders()?,
         check_optional_client_env(),
     ])
 }
@@ -199,6 +240,6 @@ mod tests {
     #[test]
     fn self_test_passes_on_cpu() {
         let results = run().expect("self-test should pass");
-        assert!(results.len() >= 4);
+        assert!(results.len() >= 5);
     }
 }
