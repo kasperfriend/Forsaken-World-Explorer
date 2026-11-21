@@ -29,6 +29,16 @@ pub const DEFAULT_RESOLUTION_SCALE_PCT: u16 = 100;
 pub const DEFAULT_TERRAIN_RAM_MIB: u32 = 2;
 pub const DEFAULT_TEX_BUDGET_MIB: u32 = 32;
 
+pub const MIN_SCENERY_RADIUS_M: u32 = 32;
+pub const MAX_SCENERY_RADIUS_M: u32 = 2048;
+pub const DEFAULT_SCENERY_RADIUS_M: u32 = 256;
+pub const MIN_SCENERY_MAX_INSTANCES: u32 = 64;
+pub const MAX_SCENERY_MAX_INSTANCES: u32 = 16_384;
+pub const DEFAULT_SCENERY_MAX_INSTANCES: u32 = 1024;
+pub const MIN_SCENERY_LOADS_PER_FRAME: u32 = 1;
+pub const MAX_SCENERY_LOADS_PER_FRAME: u32 = 64;
+pub const DEFAULT_SCENERY_LOADS_PER_FRAME: u32 = 4;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortablePaths {
     pub root: PathBuf,
@@ -98,6 +108,11 @@ pub struct ViewerSettings {
     pub resolution_scale_pct: u16,
     pub terrain_ram_mib: u32,
     pub tex_budget_mib: u32,
+    pub scenery_enabled: bool,
+    pub scenery_radius_m: u32,
+    pub scenery_max_instances: u32,
+    pub scenery_loads_per_frame: u32,
+    pub scenery_whole_world: bool,
     pub music_volume: u8,
     pub ambience_volume: u8,
     pub effects_volume: u8,
@@ -112,6 +127,11 @@ impl Default for ViewerSettings {
             resolution_scale_pct: DEFAULT_RESOLUTION_SCALE_PCT,
             terrain_ram_mib: DEFAULT_TERRAIN_RAM_MIB,
             tex_budget_mib: DEFAULT_TEX_BUDGET_MIB,
+            scenery_enabled: true,
+            scenery_radius_m: DEFAULT_SCENERY_RADIUS_M,
+            scenery_max_instances: DEFAULT_SCENERY_MAX_INSTANCES,
+            scenery_loads_per_frame: DEFAULT_SCENERY_LOADS_PER_FRAME,
+            scenery_whole_world: false,
             music_volume: 70,
             ambience_volume: 70,
             effects_volume: 80,
@@ -188,6 +208,26 @@ impl ViewerSettings {
         ));
         out.push_str(&format!("terrain_ram_mib={}\n", self.terrain_ram_mib));
         out.push_str(&format!("tex_budget_mib={}\n", self.tex_budget_mib));
+        out.push_str(&format!("scenery_enabled={}\n", self.scenery_enabled));
+        out.push_str(&format!(
+            "scenery_radius_m={}\n",
+            self.scenery_radius_m
+                .clamp(MIN_SCENERY_RADIUS_M, MAX_SCENERY_RADIUS_M)
+        ));
+        out.push_str(&format!(
+            "scenery_max_instances={}\n",
+            self.scenery_max_instances
+                .clamp(MIN_SCENERY_MAX_INSTANCES, MAX_SCENERY_MAX_INSTANCES)
+        ));
+        out.push_str(&format!(
+            "scenery_loads_per_frame={}\n",
+            self.scenery_loads_per_frame
+                .clamp(MIN_SCENERY_LOADS_PER_FRAME, MAX_SCENERY_LOADS_PER_FRAME)
+        ));
+        out.push_str(&format!(
+            "scenery_whole_world={}\n",
+            self.scenery_whole_world
+        ));
         out.push_str(&format!("music_volume={}\n", self.music_volume.min(100)));
         out.push_str(&format!(
             "ambience_volume={}\n",
@@ -233,6 +273,34 @@ impl ViewerSettings {
                 "tex_budget_mib" => {
                     if let Ok(parsed) = value.parse::<u32>() {
                         settings.tex_budget_mib = parsed.max(1);
+                    }
+                }
+                "scenery_enabled" => {
+                    if let Some(parsed) = parse_bool(value) {
+                        settings.scenery_enabled = parsed;
+                    }
+                }
+                "scenery_radius_m" => {
+                    if let Ok(parsed) = value.parse::<u32>() {
+                        settings.scenery_radius_m =
+                            parsed.clamp(MIN_SCENERY_RADIUS_M, MAX_SCENERY_RADIUS_M);
+                    }
+                }
+                "scenery_max_instances" => {
+                    if let Ok(parsed) = value.parse::<u32>() {
+                        settings.scenery_max_instances =
+                            parsed.clamp(MIN_SCENERY_MAX_INSTANCES, MAX_SCENERY_MAX_INSTANCES);
+                    }
+                }
+                "scenery_loads_per_frame" => {
+                    if let Ok(parsed) = value.parse::<u32>() {
+                        settings.scenery_loads_per_frame =
+                            parsed.clamp(MIN_SCENERY_LOADS_PER_FRAME, MAX_SCENERY_LOADS_PER_FRAME);
+                    }
+                }
+                "scenery_whole_world" => {
+                    if let Some(parsed) = parse_bool(value) {
+                        settings.scenery_whole_world = parsed;
                     }
                 }
                 "music_volume" => {
@@ -347,6 +415,11 @@ mod tests {
             resolution_scale_pct: 125,
             terrain_ram_mib: 8,
             tex_budget_mib: 64,
+            scenery_enabled: true,
+            scenery_radius_m: 384,
+            scenery_max_instances: 2048,
+            scenery_loads_per_frame: 6,
+            scenery_whole_world: true,
             music_volume: 45,
             ambience_volume: 55,
             effects_volume: 90,
@@ -398,8 +471,6 @@ mod tests {
     #[test]
     fn unwritable_root_is_detected_cleanly() {
         let root = temp_test_dir("unwritable");
-        // Place a regular file at `<root>/settings` so creating the `settings/` directory
-        // fails reliably across both Windows and Unix (even if running as root).
         fs::write(root.join(SETTINGS_SUBDIR), b"blocking-file").unwrap();
         let paths = PortablePaths::from_root(root.clone());
         let err = paths
@@ -417,6 +488,10 @@ not-a-kv-line
 resolution_scale_pct=999
 terrain_ram_mib=0
 tex_budget_mib=abc
+scenery_radius_m=99999
+scenery_max_instances=1
+scenery_loads_per_frame=0
+scenery_whole_world=true
 music_volume=250
 show_minimap=maybe
 show_zone_notices=false
@@ -426,6 +501,10 @@ unknown_key=123
         assert_eq!(parsed.resolution_scale_pct, MAX_RESOLUTION_SCALE_PCT);
         assert_eq!(parsed.terrain_ram_mib, 1);
         assert_eq!(parsed.tex_budget_mib, DEFAULT_TEX_BUDGET_MIB);
+        assert_eq!(parsed.scenery_radius_m, MAX_SCENERY_RADIUS_M);
+        assert_eq!(parsed.scenery_max_instances, MIN_SCENERY_MAX_INSTANCES);
+        assert_eq!(parsed.scenery_loads_per_frame, MIN_SCENERY_LOADS_PER_FRAME);
+        assert!(parsed.scenery_whole_world);
         assert_eq!(parsed.music_volume, 100);
         assert!(parsed.show_minimap);
         assert!(!parsed.show_zone_notices);

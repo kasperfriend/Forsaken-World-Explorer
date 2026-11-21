@@ -1,9 +1,11 @@
-//! Offscreen GPU terrain render smoke test (designed for Mesa `lavapipe` on Linux CI).
+//! Offscreen GPU terrain + static `.bmd` scenery render smoke test (designed for Mesa
+//! `lavapipe` on Linux CI).
 //!
 //! Creates a `wgpu` device, streams synthetic v6 terrain blocks through `TerrainStore`
-//! (`cache/terrain-v1`), renders one frame at a fixed camera with resolution scaling,
-//! reads back the final color buffer, and asserts that the frame is non-empty, not a
-//! single flat color, and has nonzero terrain coverage.
+//! (`cache/terrain-v1`), places one synthetic `.bmd` static mesh instance on the terrain,
+//! renders one depth-tested frame at a fixed camera with resolution scaling, reads back
+//! the final color buffer, and asserts nonzero terrain coverage, color variation, and
+//! visible static mesh pixels in the expected region.
 //!
 //! Note: Software rendering via `lavapipe` verifies pipeline compilation and execution
 //! only — it is **not** visual parity with a real GPU or client.
@@ -66,14 +68,14 @@ fn main() -> ExitCode {
         match terrain_gpu::render_offscreen_smoke(&device, &queue, width, height, scale_pct) {
             Ok(m) => m,
             Err(err) => {
-                eprintln!("error: offscreen terrain smoke render failed: {err}");
+                eprintln!("error: offscreen terrain/scenery smoke render failed: {err}");
                 return ExitCode::FAILURE;
             }
         };
 
     let coverage_pct = (metrics.non_clear_pixels as f64 / metrics.total_pixels as f64) * 100.0;
     println!(
-        "Rendered {}x{} (3D pass {}x{} @ {}% scale), {} streamed blocks, {}/{} non-clear pixels ({:.1}%), {} distinct colors",
+        "Rendered {}x{} (3D pass {}x{} @ {}% scale), {} streamed blocks, {}/{} non-clear pixels ({:.1}%), {} static-mesh pixels, {} distinct colors",
         metrics.width,
         metrics.height,
         metrics.scaled_width,
@@ -83,6 +85,7 @@ fn main() -> ExitCode {
         metrics.non_clear_pixels,
         metrics.total_pixels,
         coverage_pct,
+        metrics.scenery_pixels,
         metrics.distinct_colors
     );
 
@@ -97,6 +100,13 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    if metrics.scenery_pixels < 100 {
+        eprintln!(
+            "error: static .bmd mesh pixels not detected in expected region ({} pixels, expected >= 100)",
+            metrics.scenery_pixels
+        );
+        return ExitCode::FAILURE;
+    }
     if metrics.distinct_colors <= 16 {
         eprintln!(
             "error: rendered image looks flat ({} distinct colors, expected > 16)",
@@ -106,7 +116,7 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "[PASS] Offscreen terrain smoke test passed (verifies pipeline execution only; not visual parity)."
+        "[PASS] Offscreen terrain + static .bmd scenery smoke test passed (verifies pipeline execution only; not visual parity)."
     );
     ExitCode::SUCCESS
 }

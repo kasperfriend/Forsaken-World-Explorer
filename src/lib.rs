@@ -1,12 +1,15 @@
+pub mod bmd;
 pub mod camera;
 pub mod client_detect;
 pub mod dxt;
 pub mod logging;
 pub mod modules;
 pub mod pck;
+pub mod scenery;
 pub mod self_test;
 pub mod settings;
 pub mod terrain_block;
 pub mod terrain_gpu;
 pub mod terrain_store;
+pub mod tex_cache;
 pub mod world_objects;

@@ -1,8 +1,10 @@
-//! GPU terrain renderer using `wgpu`, streaming blocks through `TerrainStore` (`cache/terrain-v1`)
-//! and rendering 3D world geometry at the configured resolution scale (10%–200%).
+//! GPU terrain and instanced static `.bmd` scenery renderer using `wgpu`, streaming terrain
+//! blocks through `TerrainStore` (`cache/terrain-v1`) and rendering 3D world geometry at the
+//! configured resolution scale (10%–200%).
 
 use std::{
     env, fs,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,13 +13,17 @@ use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::{
+    bmd::{self, AlphaMode, BmdModel},
     camera::{scaled_render_target, streaming_blocks, FreeCamera},
     dxt,
     terrain_block::{self, T2bkFile},
     terrain_store::{TerrainPage, TerrainStore, DEFAULT_HOT_RAM_BYTES},
+    tex_cache::DecodedTexture,
+    world_objects::placement_transform_matrix,
 };
 
 pub const TERRAIN_WGSL: &str = include_str!("shaders/terrain.wgsl");
+pub const SCENERY_WGSL: &str = include_str!("shaders/scenery.wgsl");
 pub const BLIT_WGSL: &str = include_str!("shaders/blit.wgsl");
 
 #[repr(C)]
@@ -31,10 +37,123 @@ pub struct TerrainVertex {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct SceneryVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub color: [f32; 4],
+    pub uv: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct SceneryInstance {
+    pub model_cols: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct SceneryMaterialUniform {
+    pub diffuse_rgba: [f32; 4],
+    pub params: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct CameraUniform {
     pub view_proj: [[f32; 4]; 4],
     pub sun_dir: [f32; 4],
     pub fog_color: [f32; 4],
+}
+
+/// One deduplicated static submesh batch (one vertex/index buffer shared across N instances).
+#[derive(Clone, Debug)]
+pub struct SceneryDrawBatch {
+    pub vertices: Vec<SceneryVertex>,
+    pub indices: Vec<u16>,
+    pub instances: Vec<SceneryInstance>,
+    pub diffuse_rgba: [f32; 4],
+    pub alpha_cutoff: f32,
+    pub texture: Option<Arc<DecodedTexture>>,
+}
+
+/// Complete set of deduplicated static scenery draw batches for the current frame.
+#[derive(Clone, Debug, Default)]
+pub struct SceneryDrawSnapshot {
+    pub batches: Vec<SceneryDrawBatch>,
+    pub revision: u64,
+}
+
+fn unpack_argb_to_rgba_f32(argb: u32) -> [f32; 4] {
+    let a = ((argb >> 24) & 0xff) as f32 / 255.0;
+    let r = ((argb >> 16) & 0xff) as f32 / 255.0;
+    let g = ((argb >> 8) & 0xff) as f32 / 255.0;
+    let b = (argb & 0xff) as f32 / 255.0;
+    [r, g, b, a]
+}
+
+/// Convert a parsed `BmdModel` + its deduplicated world instance transforms into GPU draw batches,
+/// skipping `collide_only` models and `AlphaMode::TransparentDeferred` submeshes (Phase 5).
+pub fn build_scenery_batches_for_model<F>(
+    model: &BmdModel,
+    transforms: &[Mat4],
+    mut resolve_tex: F,
+) -> Vec<SceneryDrawBatch>
+where
+    F: FnMut(&str) -> Option<Arc<DecodedTexture>>,
+{
+    if model.collide_only || transforms.is_empty() {
+        return Vec::new();
+    }
+    let instances: Vec<SceneryInstance> = transforms
+        .iter()
+        .map(|m| SceneryInstance {
+            model_cols: m.to_cols_array_2d(),
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    for sm in &model.submeshes {
+        if sm.alpha_mode == AlphaMode::TransparentDeferred
+            || sm.vertices.is_empty()
+            || sm.indices.is_empty()
+        {
+            continue;
+        }
+        let alpha_cutoff = if sm.alpha_mode == AlphaMode::AlphaTested {
+            0.5
+        } else {
+            0.0
+        };
+        let diffuse_rgba = sm
+            .material
+            .as_ref()
+            .map(|m| m.diffuse)
+            .unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let vertices: Vec<SceneryVertex> = sm
+            .vertices
+            .iter()
+            .map(|v| SceneryVertex {
+                position: v.position,
+                normal: v.normal,
+                color: unpack_argb_to_rgba_f32(v.day_diffuse),
+                uv: v.uv,
+            })
+            .collect();
+        let texture = if sm.texture.is_empty() {
+            None
+        } else {
+            resolve_tex(&sm.texture)
+        };
+        out.push(SceneryDrawBatch {
+            vertices,
+            indices: sm.indices.clone(),
+            instances: instances.clone(),
+            diffuse_rgba,
+            alpha_cutoff,
+            texture,
+        });
+    }
+    out
 }
 
 /// Build an indexed triangle mesh for one terrain block from a streamed `TerrainPage`.
@@ -70,7 +189,6 @@ pub fn build_block_mesh(
                     cols[3] as f32 / 255.0,
                 ]
             } else {
-                // Elevation-tinted neutral ground color when vertex color section is absent
                 let t = ((h - 80.0) / 160.0).clamp(0.0, 1.0);
                 [0.32 + 0.35 * t, 0.48 + 0.25 * t, 0.26 + 0.20 * t, 1.0]
             };
@@ -110,12 +228,152 @@ pub struct OffscreenSmokeMetrics {
     pub streamed_blocks: usize,
     pub total_pixels: usize,
     pub non_clear_pixels: usize,
+    pub scenery_pixels: usize,
     pub distinct_colors: usize,
 }
 
-/// Render one offscreen terrain frame at a fixed camera using a `wgpu` device (such as
-/// Mesa `lavapipe` on Linux CI), streaming synthetic v6 terrain blocks through `TerrainStore`
-/// (`cache/terrain-v1`) and executing both the terrain pass and resolution-scale blit pass.
+fn create_scenery_mat_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("scenery-mat-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_scenery_pipeline(
+    device: &wgpu::Device,
+    cam_bgl: &wgpu::BindGroupLayout,
+    mat_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("scenery-shader"),
+        source: wgpu::ShaderSource::Wgsl(SCENERY_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("scenery-pipeline-layout"),
+        bind_group_layouts: &[cam_bgl, mat_bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("scenery-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SceneryVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 24,
+                            shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 40,
+                            shader_location: 3,
+                        },
+                    ],
+                },
+                wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SceneryInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 0,
+                            shader_location: 4,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 16,
+                            shader_location: 5,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 32,
+                            shader_location: 6,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 48,
+                            shader_location: 7,
+                        },
+                    ],
+                },
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// Render one offscreen terrain + static `.bmd` scenery frame at a fixed camera using a `wgpu`
+/// device (such as Mesa `lavapipe` on Linux CI), streaming synthetic v6 terrain blocks through
+/// `TerrainStore` (`cache/terrain-v1`), placing one synthetic `.bmd` building instance on the
+/// terrain, and executing both the 3D depth-tested pass and resolution-scale blit pass.
 ///
 /// Proves pipelines compile and execute on CPU; does **not** establish visual parity.
 pub fn render_offscreen_smoke(
@@ -127,7 +385,6 @@ pub fn render_offscreen_smoke(
 ) -> Result<OffscreenSmokeMetrics, String> {
     let (scaled_w, scaled_h) = scaled_render_target(width, height, scale_pct);
 
-    // Stream 4 synthetic v6 terrain blocks (2x2 grid) through TerrainStore (`cache/terrain-v1`).
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -168,7 +425,21 @@ pub fn render_offscreen_smoke(
     }
     let _ = fs::remove_dir_all(&cache_root);
 
-    // Decode a synthetic DXT1 lightmap via Phase 2 `dxt.rs` and upload as RGBA8 texture.
+    // Build one synthetic static .bmd building sitting on the terrain in the camera center.
+    let raw_bmd = bmd::synthetic::build_bmd_v5_box("textures/smoke_tower.dds", 14.0, 46.0);
+    let bmd_model = BmdModel::parse(&raw_bmd).map_err(|e| e.to_string())?;
+    let tower_mat = placement_transform_matrix(
+        [64.0, 95.0, 64.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 1.0, 1.0],
+    );
+    let mut scenery_batches = build_scenery_batches_for_model(&bmd_model, &[tower_mat], |_| None);
+    for b in &mut scenery_batches {
+        // Distinct crimson/terracotta tint so the readback check confirms the .bmd mesh rendered
+        b.diffuse_rgba = [0.95, 0.14, 0.10, 1.0];
+    }
+
     let dxt1_block = [0xef, 0xf7, 0x20, 0x84, 0xe4, 0x1b, 0xe4, 0x1b];
     let dds = dxt::synthetic::build_dds(4, 4, b"DXT1", &dxt1_block);
     let surf = dxt::parse_dds(&dds)?;
@@ -208,6 +479,42 @@ pub fn render_offscreen_smoke(
         },
     );
     let lm_view = lm_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let white_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("smoke-white-tex"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &white_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[255, 255, 255, 255],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let white_view = white_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("smoke-sampler"),
         mag_filter: wgpu::FilterMode::Linear,
@@ -215,7 +522,6 @@ pub fn render_offscreen_smoke(
         ..Default::default()
     });
 
-    // Uniforms
     let vp: Mat4 = camera.view_proj(width as f32 / height as f32);
     let uniform = CameraUniform {
         view_proj: vp.to_cols_array_2d(),
@@ -285,6 +591,9 @@ pub fn render_offscreen_smoke(
             },
         ],
     });
+
+    let scenery_mat_bgl = create_scenery_mat_bgl(device);
+    let scenery_pipeline = create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl);
 
     let terrain_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("terrain-shader"),
@@ -463,6 +772,61 @@ pub fn render_offscreen_smoke(
         usage: wgpu::BufferUsages::INDEX,
     });
 
+    // Upload the synthetic .bmd batch
+    let mut gpu_scenery = Vec::new();
+    for b in &scenery_batches {
+        let svb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("smoke-scenery-vbuf"),
+            contents: bytemuck::cast_slice(&b.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let sib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("smoke-scenery-ibuf"),
+            contents: bytemuck::cast_slice(&b.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("smoke-scenery-inst"),
+            contents: bytemuck::cast_slice(&b.instances),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let mat_u = SceneryMaterialUniform {
+            diffuse_rgba: b.diffuse_rgba,
+            params: [b.alpha_cutoff, 0.0, 0.0, 0.0],
+        };
+        let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("smoke-scenery-mat"),
+            contents: bytemuck::bytes_of(&mat_u),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let mat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("smoke-scenery-mat-bg"),
+            layout: &scenery_mat_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&white_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: mat_buf.as_entire_binding(),
+                },
+            ],
+        });
+        gpu_scenery.push((
+            svb,
+            sib,
+            inst_buf,
+            mat_bg,
+            b.indices.len() as u32,
+            b.instances.len() as u32,
+        ));
+    }
+
     let clear_r = 0.08;
     let clear_g = 0.14;
     let clear_b = 0.24;
@@ -472,7 +836,7 @@ pub fn render_offscreen_smoke(
     });
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("terrain-pass"),
+            label: Some("terrain-and-scenery-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &scene_view,
                 resolve_target: None,
@@ -502,6 +866,16 @@ pub fn render_offscreen_smoke(
         rpass.set_vertex_buffer(0, vbuf.slice(..));
         rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
         rpass.draw_indexed(0..all_indices.len() as u32, 0, 0..1);
+
+        rpass.set_pipeline(&scenery_pipeline);
+        rpass.set_bind_group(0, &cam_bg, &[]);
+        for (svb, sib, inst_buf, mat_bg, idx_cnt, inst_cnt) in &gpu_scenery {
+            rpass.set_bind_group(1, mat_bg, &[]);
+            rpass.set_vertex_buffer(0, svb.slice(..));
+            rpass.set_vertex_buffer(1, inst_buf.slice(..));
+            rpass.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint16);
+            rpass.draw_indexed(0..*idx_cnt, 0, 0..*inst_cnt);
+        }
     }
     {
         let mut bpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -572,15 +946,28 @@ pub fn render_offscreen_smoke(
         (clear_b * 255.0).round() as i32,
     ];
     let mut non_clear_pixels = 0usize;
+    let mut scenery_pixels = 0usize;
     let mut distinct = std::collections::HashSet::new();
+    let margin_x = (width / 8) as usize;
+    let margin_y = (height / 8) as usize;
     for y in 0..height as usize {
         let row = &data[y * padded_bpr as usize..y * padded_bpr as usize + unpadded_bpr as usize];
-        for px in row.as_chunks::<4>().0 {
+        for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
             let dr = (px[0] as i32 - clear_px[0]).abs();
             let dg = (px[1] as i32 - clear_px[1]).abs();
             let db = (px[2] as i32 - clear_px[2]).abs();
             if dr > 4 || dg > 4 || db > 4 {
                 non_clear_pixels += 1;
+            }
+            if x >= margin_x
+                && x < (width as usize - margin_x)
+                && y >= margin_y
+                && y < (height as usize - margin_y)
+                && px[0] > 90
+                && (px[0] as i32) > (px[1] as i32) + 35
+                && (px[0] as i32) > (px[2] as i32) + 35
+            {
+                scenery_pixels += 1;
             }
             distinct.insert([px[0], px[1], px[2]]);
         }
@@ -596,6 +983,7 @@ pub fn render_offscreen_smoke(
         streamed_blocks: visible.len(),
         total_pixels: (width as usize) * (height as usize),
         non_clear_pixels,
+        scenery_pixels,
         distinct_colors: distinct.len(),
     })
 }
@@ -631,7 +1019,6 @@ impl Default for TerrainTextureSnapshot {
 }
 
 /// Camera-centered streaming session backed by `TerrainStore` (`cache/terrain-v1`).
-/// Supports both real Forsaken World `maps/<zone>/` files and a synthetic preview zone.
 pub struct TerrainSession {
     pub zone_name: String,
     pub block_size: f32,
@@ -647,8 +1034,6 @@ pub struct TerrainSession {
 }
 
 impl TerrainSession {
-    /// Open a real client zone from `<client_root>/maps/<zone>/` using `cache_root`
-    /// (`<root>/cache/terrain-v1`) and the configured hot RAM budget in bytes.
     pub fn open_zone(
         client_root: &std::path::Path,
         zone: &str,
@@ -704,7 +1089,6 @@ impl TerrainSession {
         })
     }
 
-    /// Open a synthetic 4x4 terrain preview zone backed by `TerrainStore` (`cache/terrain-v1`).
     pub fn open_synthetic(
         cache_root: &std::path::Path,
         hot_ram_bytes: usize,
@@ -742,8 +1126,6 @@ impl TerrainSession {
         })
     }
 
-    /// Stream blocks centered on `camera_pos` through `TerrainStore` whenever the camera
-    /// moves into a new terrain block cell or the streaming radius changes.
     pub fn update_for_camera(
         &mut self,
         camera_pos: Vec3,
@@ -803,14 +1185,27 @@ impl TerrainSession {
     }
 }
 
-/// Live `wgpu` viewport renderer supporting 10%–200% resolution scaling with native UI overlay.
+struct GpuSceneryBatch {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    inst_buf: wgpu::Buffer,
+    mat_bg: wgpu::BindGroup,
+    index_count: u32,
+    instance_count: u32,
+}
+
+/// Live `wgpu` viewport renderer supporting terrain + instanced `.bmd` scenery at 10%–200%
+/// resolution scale with a native-resolution `egui` UI overlay.
 pub struct TerrainViewportRenderer {
     terrain_pipeline: wgpu::RenderPipeline,
+    scenery_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     tex_bgl: wgpu::BindGroupLayout,
+    scenery_mat_bgl: wgpu::BindGroupLayout,
     cam_buf: wgpu::Buffer,
     cam_bg: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    white_view: wgpu::TextureView,
     lm_bg: wgpu::BindGroup,
     lm_revision: u64,
     scene_color: wgpu::Texture,
@@ -823,6 +1218,8 @@ pub struct TerrainViewportRenderer {
     ibuf: Option<wgpu::Buffer>,
     index_count: u32,
     mesh_revision: u64,
+    scenery_batches: Vec<GpuSceneryBatch>,
+    scenery_revision: u64,
 }
 
 impl TerrainViewportRenderer {
@@ -884,12 +1281,50 @@ impl TerrainViewportRenderer {
                 },
             ],
         });
+        let scenery_mat_bgl = create_scenery_mat_bgl(device);
+        let scenery_pipeline = create_scenery_pipeline(device, &cam_bgl, &scenery_mat_bgl);
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("live-linear-sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+
+        let white_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("live-white-fallback"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &white_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let white_view = white_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let terrain_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("live-terrain-shader"),
@@ -1003,11 +1438,14 @@ impl TerrainViewportRenderer {
 
         Self {
             terrain_pipeline,
+            scenery_pipeline,
             blit_pipeline,
             tex_bgl,
+            scenery_mat_bgl,
             cam_buf,
             cam_bg,
             sampler,
+            white_view,
             lm_bg,
             lm_revision: 0,
             scene_color,
@@ -1020,20 +1458,22 @@ impl TerrainViewportRenderer {
             ibuf: None,
             index_count: 0,
             mesh_revision: 0,
+            scenery_batches: Vec::new(),
+            scenery_revision: 0,
         }
     }
 
-    fn upload_texture_bg(
+    fn upload_rgba_view(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        tex_bgl: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        tex: &TerrainTextureSnapshot,
-    ) -> wgpu::BindGroup {
-        let w = tex.width.max(1);
-        let h = tex.height.max(1);
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+    ) -> wgpu::TextureView {
+        let w = w.max(1);
+        let h = h.max(1);
         let gpu_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("live-lightmap"),
+            label: Some("live-rgba-tex"),
             size: wgpu::Extent3d {
                 width: w,
                 height: h,
@@ -1053,7 +1493,7 @@ impl TerrainViewportRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &tex.rgba,
+            rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(w * 4),
@@ -1065,7 +1505,17 @@ impl TerrainViewportRenderer {
                 depth_or_array_layers: 1,
             },
         );
-        let view = gpu_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        gpu_tex.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    fn upload_texture_bg(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex_bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        tex: &TerrainTextureSnapshot,
+    ) -> wgpu::BindGroup {
+        let view = Self::upload_rgba_view(device, queue, tex.width, tex.height, &tex.rgba);
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("live-lm-bg"),
             layout: tex_bgl,
@@ -1153,6 +1603,7 @@ impl TerrainViewportRenderer {
         uniform: &CameraUniform,
         mesh: &TerrainMeshSnapshot,
         lightmap: &TerrainTextureSnapshot,
+        scenery: &SceneryDrawSnapshot,
     ) -> wgpu::CommandBuffer {
         let desired = scaled_render_target(viewport_w, viewport_h, scale_pct);
         if self.scaled_size != desired {
@@ -1204,12 +1655,77 @@ impl TerrainViewportRenderer {
             self.mesh_revision = mesh.revision;
         }
 
+        if self.scenery_revision != scenery.revision {
+            self.scenery_batches.clear();
+            for b in &scenery.batches {
+                if b.vertices.is_empty() || b.indices.is_empty() || b.instances.is_empty() {
+                    continue;
+                }
+                let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("live-scenery-vbuf"),
+                    contents: bytemuck::cast_slice(&b.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("live-scenery-ibuf"),
+                    contents: bytemuck::cast_slice(&b.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("live-scenery-inst"),
+                    contents: bytemuck::cast_slice(&b.instances),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let mat_u = SceneryMaterialUniform {
+                    diffuse_rgba: b.diffuse_rgba,
+                    params: [b.alpha_cutoff, 0.0, 0.0, 0.0],
+                };
+                let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("live-scenery-mat"),
+                    contents: bytemuck::bytes_of(&mat_u),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                let owned_view = b
+                    .texture
+                    .as_ref()
+                    .map(|t| Self::upload_rgba_view(device, queue, t.width, t.height, &t.rgba));
+                let tex_view_ref = owned_view.as_ref().unwrap_or(&self.white_view);
+                let mat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("live-scenery-mat-bg"),
+                    layout: &self.scenery_mat_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(tex_view_ref),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: mat_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                self.scenery_batches.push(GpuSceneryBatch {
+                    vbuf,
+                    ibuf,
+                    inst_buf,
+                    mat_bg,
+                    index_count: b.indices.len() as u32,
+                    instance_count: b.instances.len() as u32,
+                });
+            }
+            self.scenery_revision = scenery.revision;
+        }
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("live-terrain-encoder"),
+            label: Some("live-world-encoder"),
         });
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("live-terrain-pass"),
+                label: Some("live-world-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.scene_view,
                     resolve_target: None,
@@ -1241,6 +1757,17 @@ impl TerrainViewportRenderer {
                     rpass.set_vertex_buffer(0, vbuf.slice(..));
                     rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     rpass.draw_indexed(0..self.index_count, 0, 0..1);
+                }
+            }
+            if !self.scenery_batches.is_empty() {
+                rpass.set_pipeline(&self.scenery_pipeline);
+                rpass.set_bind_group(0, &self.cam_bg, &[]);
+                for b in &self.scenery_batches {
+                    rpass.set_bind_group(1, &b.mat_bg, &[]);
+                    rpass.set_vertex_buffer(0, b.vbuf.slice(..));
+                    rpass.set_vertex_buffer(1, b.inst_buf.slice(..));
+                    rpass.set_index_buffer(b.ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                    rpass.draw_indexed(0..b.index_count, 0, 0..b.instance_count);
                 }
             }
         }
