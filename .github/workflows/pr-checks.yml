@@ -28,12 +28,14 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Run cargo tests
+      - name: Run all cargo tests (lib and bins)
         run: cargo test --locked
       - name: Run dependency-free CPU core checks
         run: sh tools/check-core.sh
-      - name: Run --self-test on Linux build
-        run: cargo run --locked --bin forsaken-world-explorer -- --self-test
+      - name: Run --self-test and --smoke-launch on Linux build
+        run: |
+          cargo run --locked --bin forsaken-world-explorer -- --self-test
+          cargo run --locked --bin forsaken-world-explorer -- --smoke-launch
 
   dependency-audit:
     name: Dependency security audit
@@ -46,7 +48,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   windows-build:
-    name: Windows build, self-test, and package
+    name: Windows build, startup check, and package
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -55,8 +57,10 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      - name: Run viewer unit tests
-        run: cargo test --locked --bin forsaken-world-explorer
+      - name: Run library and viewer unit tests
+        run: |
+          cargo test --locked --lib
+          cargo test --locked --bin forsaken-world-explorer
       - name: Check all binary targets
         run: cargo check --locked --bins
       - name: Build Windows release executable
@@ -69,12 +73,43 @@ jobs:
             -Modules Modules `
             -OutputDirectory release `
             -ArchivePath release/Forsaken-World-Explorer-Windows-x64.zip
-      - name: Smoke run --self-test on packaged Windows executable
+      - name: Verify packaged Windows executable startup (--self-test, --smoke-launch, --version)
         shell: pwsh
         run: |
-          & "./release/Forsaken World Explorer/forsaken-world-explorer.exe" --self-test
+          $exe = "./release/Forsaken World Explorer/forsaken-world-explorer.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged executable --version failed with exit code $LASTEXITCODE"
+          }
+          & $exe --self-test
           if ($LASTEXITCODE -ne 0) {
             throw "Packaged executable --self-test failed with exit code $LASTEXITCODE"
+          }
+          & $exe --smoke-launch
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged executable --smoke-launch failed with exit code $LASTEXITCODE"
+          }
+      - name: Verify packaged Windows executable launches without crashing or panicking
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "./release/Forsaken World Explorer/forsaken-world-explorer.exe").Path
+          $stdoutLog = Join-Path $env:TEMP "fw-launch-stdout.log"
+          $stderrLog = Join-Path $env:TEMP "fw-launch-stderr.log"
+          $proc = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+          Start-Sleep -Seconds 3
+          if ($proc.HasExited) {
+            $code = $proc.ExitCode
+            $err = if (Test-Path $stderrLog) { Get-Content $stderrLog -Raw } else { '' }
+            if ($code -eq 0) {
+              Write-Host "forsaken-world-explorer.exe exited cleanly with code 0"
+            } elseif ($code -eq 1 -and $err -match 'Failed to create wgpu adapter' -and $err -notmatch 'panicked at') {
+              Write-Host "forsaken-world-explorer.exe started cleanly and reported no GPU adapter on headless runner (no panic/crash)."
+            } else {
+              throw "forsaken-world-explorer.exe crashed or failed unexpectedly (exit code ${code}): $err"
+            }
+          } else {
+            Write-Host "forsaken-world-explorer.exe stayed running cleanly for 3s (PID $($proc.Id)); stopping."
+            Stop-Process -Id $proc.Id -Force
           }
       - name: Verify SHA256SUMS.txt matches packaged files
         shell: pwsh
