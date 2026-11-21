@@ -2,7 +2,7 @@
 
 An experimental, GPU-based, free-flight viewer for a user-owned **Forsaken World** client, recreated from the architecture and principles of [`kasperfriend/Perfect-World-Explorer`](https://github.com/kasperfriend/Perfect-World-Explorer). It reads world data from a client you already own; it is **not** a game client, editor, server, or gameplay implementation.
 
-> **Work in progress:** Client folder selection (native folder picker), portable root storage, verified `.pck`/`.pkx` archive reading, CPU terrain/lightmap/mask/placement/DDS decoders, and the RAM-first `cache/terrain-v1` (2 MiB default hot set) are implemented and CPU-verified. No 3D GPU rendering or visual parity is claimed yet; all CI checks run without a hardware GPU. See [Findings/README.md](Findings/README.md) and [Findings/Status.md](Findings/Status.md) for evidence, limits, and open gates.
+> **Work in progress:** Client folder selection (native folder picker), portable root storage, verified `.pck`/`.pkx` archive reading, CPU terrain/lightmap/mask/placement/DDS decoders, RAM-first `cache/terrain-v1` streaming (2 MiB default hot set), and Phase 3 `wgpu` terrain rendering with free-flight camera and `10%–200%` resolution scaling are implemented. **Visual parity is not verified without a hardware GPU:** offline `naga` validation and Mesa `lavapipe` software offscreen smoke tests prove shader validity and pipeline execution only, not visual parity on a real GPU or client. See [Findings/README.md](Findings/README.md), [Findings/gpu-stack.md](Findings/gpu-stack.md), and [Findings/Status.md](Findings/Status.md) for evidence, limits, and open gates.
 
 ## Legal & Non-Affiliation Notice
 
@@ -33,6 +33,17 @@ Forsaken World Explorer/
 - **One-time legacy migration:** If `<root>/settings/viewer-settings.txt` does not exist yet and an older `%LOCALAPPDATA%\ForsakenWorldExplorer\viewer-settings.txt` exists, it is imported once into `<root>/settings/viewer-settings.txt` and left untouched.
 - **Unwritable folder protection:** If `forsaken-world-explorer.exe` is placed in a read-only location (such as `Program Files`), the UI shows a clear banner and lets you choose a writable folder via the native folder picker.
 
+## Free-Flight Controls (World View)
+
+- `W` / `A` / `S` / `D` — Move forward, strafe left, backward, strafe right
+- `Space` / `E` — Ascend
+- `Q` / `Left Ctrl` — Descend
+- `Shift` — Fast flight speed boost
+- `Arrow keys` (or mouse drag) — Look around
+- `M` — Toggle the World Map placeholder overlay
+- `Escape` — Toggle the Explorer Menu overlay
+- **Resolution scale (`10%–200%`, default `100%`):** Configured under **Settings → Graphics**. The 3D terrain renders at the selected percentage of the viewport size and blits to the window while all `egui` menus and HUD overlays stay at native resolution.
+
 ## Current Status
 
 | Phase | Scope | Status |
@@ -40,7 +51,8 @@ Forsaken World Explorer/
 | Phase 0 | Build/CI skeleton, portable root (`settings/`, `logs/`, `cache/`), native folder picker, `--self-test`, `--smoke-launch`, Drive client inventory | `verified-cpu` |
 | Phase 1 | Client folder detection (`update/pem.exe`), verified `.pck`/`.pkx` archive reader, `pck-survey` tool | `verified-cpu` |
 | Phase 2 | CPU world decoders (`.trn2`, `.t2bk` v6, `.t2lm`/`.t2lm1`, `.t2mk`, `.ecwld`, `.ecbsd`, DDS `DXT1`/`DXT3`/`DXT5`), `cache/terrain-v1`, `terrain-survey`, `terrain-memory-check` | `verified-cpu` |
-| Phase 3–8 | GPU terrain rendering & free flight, static scenery, sky/water, SpeedTree bridge, effects/audio/maps, optional Modules | `not-started` |
+| Phase 3 | GPU terrain rendering (`wgpu`), camera-centered streaming (`cache/terrain-v1`), free-flight camera, `10%–200%` resolution scale, `naga` WGSL validator, Mesa `lavapipe` offscreen smoke test | `verified-cpu` / `not-verified-without-gpu` |
+| Phase 4–8 | Static scenery & buildings, sky/water, SpeedTree bridge, effects/audio/maps, optional Modules | `not-started` |
 
 See [Findings/Status.md](Findings/Status.md) for per-subsystem evidence and open gates.
 
@@ -64,9 +76,11 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo check --locked --bins
 ./tools/check-core.sh
+cargo run --locked --bin shader-validate
 cargo run --locked --bin forsaken-world-explorer -- --self-test
 cargo run --locked --bin forsaken-world-explorer -- --smoke-launch
 cargo run --locked --bin terrain-memory-check
+WGPU_BACKEND=vulkan cargo run --locked --bin terrain-render-smoke
 ```
 
 ### Local Client Survey Tools

@@ -6,12 +6,16 @@ license = "GPL-2.0-or-later"
 description = "Free-flight viewer for a user-owned Forsaken World client"
 
 [dependencies]
+bytemuck = { version = "1", features = ["derive"] }
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 encoding_rs = "0.8"
 flate2 = "1"
+glam = "0.29"
+naga = { version = "24", features = ["wgsl-in"] }
 pollster = "0.4"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 sha2 = "0.10"
+wgpu = "24"
 
 [profile.release]
 lto = "thin"
